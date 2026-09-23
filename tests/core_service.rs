@@ -272,7 +272,17 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
                     "is_error":false
                 }),
             },
-            evidence: MaskingEvidence::default(),
+            evidence: MaskingEvidence {
+                schema: json!({"columns":[
+                    {"name":"ФИО","sources":["Справочник.People.FullName"]},
+                    {"name":"api_key","sources":["Справочник.People.APIKey"]}
+                ]}),
+                lineage: vec![
+                    json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
+                    json!({"column":"api_key","source_path":"Справочник.People.APIKey"}),
+                ],
+                ..MaskingEvidence::default()
+            },
         })
         .await
         .unwrap();
@@ -296,6 +306,241 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
         Ok(())
     }).unwrap();
 }
+
+//++agent TASK-221 [23.09.2026 18:30:00]
+#[tokio::test]
+async fn canonical_api_key_alias_is_cut_from_every_copy_before_mapping() {
+    for mode in [DatabaseMode::Enabled, DatabaseMode::Disabled] {
+        let (state, database_id) = configured_state(mode).await;
+        let alias = "биг_ПроверкаМаскировки";
+        let raw = "synthetic-api-key-not-a-real-secret-221";
+        let call_id = Uuid::new_v4();
+        state
+            .masking
+            .set_policy_snapshot(
+                database_id,
+                PolicySnapshot {
+                    rules: vec![PolicyRule {
+                        selector: RuleSelector::Name,
+                        pattern: alias.to_owned(),
+                        action: RuleAction::Mask,
+                        category: "TEST".to_owned(),
+                        priority: 0,
+                    }],
+                    ..PolicySnapshot::default()
+                },
+            )
+            .await;
+        let response = state.masking.finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "synthetic-alias".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult { result: json!({
+                "content":[
+                    {"type":"text","text":format!("{{\"{alias}\":\"{raw}\"}}")},
+                    {"type":"json","json":{"data":[{alias:raw}]}}
+                ],
+                "structured_content":{"success":true,"data":[{alias:raw}]},
+                "is_error":false
+            })},
+            evidence: MaskingEvidence {
+                schema: json!({"columns":[{"name":alias,"types":["Строка"],"sources":["Справочник.big_MarketAccounts.APIKey"]}]}),
+                lineage: vec![json!({"column":alias,"source_path":"Справочник.big_MarketAccounts.APIKey","source_types":["Строка"],"secret_cut":false})],
+                degraded_reasons: Vec::new(),
+            },
+        }).await.unwrap();
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(!public.contains(raw));
+        assert!(!public.contains("[MASK:v1:"));
+        assert!(public.matches("[SECRET_REMOVED]").count() >= 3);
+        state.storage.with_connection(|connection| {
+            let (stored, mapping_batch): (String, Option<String>) = connection.query_row(
+                "SELECT public_result_json || report_json || mask_reasons_json, mapping_batch_id FROM history WHERE call_id=?1",
+                [call_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert!(!stored.contains(raw));
+            assert!(mapping_batch.is_none());
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn query_rows_with_missing_or_degraded_lineage_fail_closed() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let alias = "НейтральноеПоле";
+    let raw = "synthetic-api-key-not-a-real-secret-222";
+    for evidence in [
+        MaskingEvidence::default(),
+        MaskingEvidence {
+            schema: json!({"columns":[{"name":alias,"sources":["Справочник.Test.APIKey"]}]}),
+            lineage: vec![],
+            degraded_reasons: vec!["lineage_incomplete".to_owned()],
+        },
+        MaskingEvidence {
+            schema: json!({"columns":[{"name":alias,"sources":["Справочник.Test.APIKey"]}]}),
+            lineage: vec![json!({"column":"ДругаяКолонка","source_path":"Справочник.Test.APIKey"})],
+            degraded_reasons: vec![],
+        },
+    ] {
+        let call_id = Uuid::new_v4();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "synthetic-degraded".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "content":[{"type":"text","text":raw}],
+                        "structured_content":{"data":[{alias:raw}]},
+                        "is_error":false
+                    }),
+                },
+                evidence,
+            })
+            .await
+            .unwrap();
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(response.public_result["is_error"].as_bool().unwrap());
+        assert!(!public.contains(raw));
+        state.storage.with_connection(|connection| {
+            let stored: String = connection.query_row(
+                "SELECT public_result_json || report_json || mask_reasons_json FROM history WHERE call_id=?1",
+                [call_id.to_string()], |row| row.get(0),
+            )?;
+            assert!(!stored.contains(raw));
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn successful_query_requires_a_recognized_tabular_envelope() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let raw = "synthetic-unclassified-query-text-221";
+    for result in [
+        json!({"content":[{"type":"text","text":raw}],"is_error":false}),
+        json!({"content":[{"type":"json","json":{"message":raw}}],"is_error":false}),
+        json!({"content":[{"type":"text","text":raw}],"structured_content":{"success":true},"is_error":false}),
+    ] {
+        let call_id = Uuid::new_v4();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "query-envelope".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult { result },
+                evidence: MaskingEvidence::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.public_result["is_error"], true);
+        assert!(!serde_json::to_string(&response).unwrap().contains(raw));
+        state.storage.with_connection(|connection| {
+            let stored: String = connection.query_row(
+                "SELECT public_result_json || report_json || mask_reasons_json FROM history WHERE call_id=?1",
+                [call_id.to_string()], |row| row.get(0),
+            )?;
+            assert!(!stored.contains(raw));
+            assert!(stored.contains("service:query_lineage_incomplete"));
+            Ok(())
+        }).unwrap();
+    }
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "query-envelope".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "content":[{"type":"text","text":"0 rows"}],
+                    "structured_content":{"success":true,"data":[]},
+                    "is_error":false
+                }),
+            },
+            evidence: MaskingEvidence::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.public_result["is_error"], false);
+}
+
+#[tokio::test]
+async fn password_mode_metadata_cuts_neutral_alias_even_without_secret_flag() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let alias = "НейтральноеПоле";
+    let path = "Справочник.Test.OpaqueValue";
+    let raw = "synthetic-password-mode-only-221";
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                metadata_sources: vec![onec_masking_service::domain::FeedMetadataItem {
+                    source_path: path.to_owned(),
+                    field_name: "OpaqueValue".to_owned(),
+                    field_type: "Строка".to_owned(),
+                    password_mode: true,
+                }],
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let call_id = Uuid::new_v4();
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "synthetic-password-mode".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "content":[{"type":"text","text":format!("value={raw}")}],
+                    "structured_content":{"data":[{alias:raw}]},
+                    "is_error":false
+                }),
+            },
+            evidence: MaskingEvidence {
+                schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
+                lineage: vec![json!({"column":alias,"source_path":path,"secret_cut":false})],
+                ..MaskingEvidence::default()
+            },
+        })
+        .await
+        .unwrap();
+    let public = serde_json::to_string(&response.public_result).unwrap();
+    assert!(!public.contains(raw));
+    assert!(public.matches("[SECRET_REMOVED]").count() >= 2);
+    state.storage.with_connection(|connection| {
+        let (stored, mapping_batch): (String, Option<String>) = connection.query_row(
+            "SELECT public_result_json || report_json, mapping_batch_id FROM history WHERE call_id=?1",
+            [call_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(!stored.contains(raw));
+        assert!(mapping_batch.is_none());
+        Ok(())
+    }).unwrap();
+}
+//++agent TASK-221
 
 #[tokio::test]
 async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_raw_value() {
@@ -355,7 +600,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
             correlation_id: Uuid::new_v4(),
             database_id,
             chat_id: "chat-policy".to_owned(),
-            tool_name: "execute_query".to_owned(),
+            tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"content":[
                     {"type":"json","json":{"customer":raw_customer,"ФИО":raw_name}},
@@ -583,7 +828,25 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
         "get_access_rights",
         "get_link_of_object",
     ] {
-        state
+        let (result, evidence) = if tool_name == "execute_query" {
+            (
+                json!({"content":[{"type":"json","json":{"data":[{"ФИО":raw}]}}],
+                    "structured_content":{"success":true,"data":[{"ФИО":raw}]},"is_error":false}),
+                MaskingEvidence {
+                    schema: json!({"columns":[{"name":"ФИО","sources":["Справочник.People.FullName"]}]}),
+                    lineage: vec![
+                        json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
+                    ],
+                    ..MaskingEvidence::default()
+                },
+            )
+        } else {
+            (
+                json!({"content":[{"type":"json","json":{"ФИО":raw}}],"is_error":false}),
+                MaskingEvidence::default(),
+            )
+        };
+        let response = state
             .masking
             .finalize(FinalizeRequest {
                 schema_version: 1,
@@ -592,13 +855,12 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
                 database_id,
                 chat_id: "chat-six".to_owned(),
                 tool_name: tool_name.to_owned(),
-                outcome: FinalizeOutcome::ToolResult {
-                    result: json!({"content":[{"type":"json","json":{"ФИО":raw}}],"is_error":false}),
-                },
-                evidence: MaskingEvidence::default(),
+                outcome: FinalizeOutcome::ToolResult { result },
+                evidence,
             })
             .await
             .unwrap();
+        assert_eq!(response.public_result["is_error"], false);
     }
     state
         .storage
@@ -627,7 +889,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
         correlation_id,
         database_id,
         chat_id: "chat-a".to_owned(),
-        tool_name: "execute_query".to_owned(),
+        tool_name: "get_object_by_link".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
             result: json!({"content":[{"type":"json","json":{"ФИО":raw_name}}],"is_error":false}),
         },
@@ -697,7 +959,7 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
     let raw_name = "Орлов Олег Олегович";
     state.masking.finalize(FinalizeRequest {
         schema_version: 1, call_id, correlation_id: Uuid::new_v4(), database_id,
-        chat_id: "chat-reveal".to_owned(), tool_name: "execute_query".to_owned(),
+        chat_id: "chat-reveal".to_owned(), tool_name: "get_object_by_link".to_owned(),
         outcome: FinalizeOutcome::ToolResult { result: json!({
             "content":[{"type":"json","json":{"ФИО":raw_name,"password":"never-reveal"}}],"is_error":false
         })}, evidence: MaskingEvidence::default(),
@@ -767,7 +1029,7 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
         correlation_id: Uuid::new_v4(),
         database_id,
         chat_id: "chat-a".to_owned(),
-        tool_name: "execute_query".to_owned(),
+        tool_name: "find_references_to_object".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
             result: json!({"content":[{"type":"text","text":"ООО Ромашка, ИНН 7707083893"}],"is_error":false}),
         },
@@ -916,7 +1178,7 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
             correlation_id: Uuid::new_v4(),
             database_id,
             chat_id: "chat-feed".to_owned(),
-            tool_name: "execute_query".to_owned(),
+            tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
                     "content":[{"type":"text","text":"Контрагент ООО Вектор"}],"is_error":false
@@ -1018,7 +1280,7 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
             correlation_id: Uuid::new_v4(),
             database_id,
             chat_id: "chat-feed".to_owned(),
-            tool_name: "execute_query".to_owned(),
+            tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"content":[{"type":"text","text":"ООО Вектор / ООО Новый"}],"is_error":false}),
             },

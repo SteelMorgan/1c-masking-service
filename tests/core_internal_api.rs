@@ -465,7 +465,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                     "structured_content":{"rows":[{"ФИО":raw}]},
                     "is_error":false
                 }},
-                "evidence":{}
+                "evidence":{
+                    "schema":{"columns":[{"name":"ФИО","sources":["Справочник.People.FullName"]}]},
+                    "lineage":[{"column":"ФИО","source_path":"Справочник.People.FullName"}]
+                }
             }),
         ))
         .await

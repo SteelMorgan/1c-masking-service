@@ -890,10 +890,35 @@ impl MaskingService {
         }
         let evidence = serde_json::to_value(&request.evidence)
             .map_err(|_| ServiceError::new(ErrorCode::MaskingFailed, request.correlation_id))?;
+        if request.tool_name == "execute_query"
+            && matches!(&request.outcome, FinalizeOutcome::ToolResult { .. })
+            && logical_result.get("is_error") == Some(&Value::Bool(false))
+            && !valid_query_lineage(&logical_result, &request.evidence)
+        {
+            return self.persist_sanitized_failure(
+                &request,
+                &settings,
+                policy.version,
+                "sanitized_error",
+                "service:query_lineage_incomplete",
+            );
+        }
+        let cut_result = match self.engine.cut_secrets(&logical_result, &evidence, &policy) {
+            Ok(value) => value,
+            Err(_) => {
+                return self.persist_sanitized_failure(
+                    &request,
+                    &settings,
+                    policy.version,
+                    "sanitized_error",
+                    "service:result_limit_exceeded",
+                );
+            }
+        };
         let batch_id = Uuid::new_v4();
         let mut mappings = self.mappings.write().await;
         let masked = match self.engine.mask(
-            &logical_result,
+            &cut_result,
             request.database_id,
             &request.chat_id,
             batch_id,
@@ -932,9 +957,7 @@ impl MaskingService {
             if settings.mode == DatabaseMode::Enabled && class == ToolClass::DataMask {
                 fully_masked.clone()
             } else {
-                self.engine.cut_secrets(&logical_result).map_err(|_| {
-                    ServiceError::new(ErrorCode::ResultLimitExceeded, request.correlation_id)
-                })?
+                cut_result
             };
         let report = neutral_report(&fully_masked);
         let write = self
@@ -1434,6 +1457,118 @@ fn validate_tool_result(result: &Value) -> Result<(), ()> {
     }
     reject_unsafe_report_shapes(result, 0)
 }
+
+//++agent TASK-221 [23.09.2026 18:30:00]
+// Query rows require an unambiguous canonical source for every public column.
+// Other tools can return arbitrary text and use their remaining detectors.
+fn valid_query_lineage(result: &Value, evidence: &super::MaskingEvidence) -> bool {
+    let payloads: Vec<&Value> = result
+        .get("structured_content")
+        .into_iter()
+        .chain(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("json")),
+        )
+        .collect();
+    if payloads
+        .iter()
+        .any(|value| value.get("data").is_some_and(|data| !data.is_array()))
+    {
+        return false;
+    }
+    let has_query_envelope = payloads.iter().any(|value| {
+        value.get("data").and_then(Value::as_array).is_some()
+            || value.get("rows").and_then(Value::as_array).is_some()
+    });
+    if !has_query_envelope {
+        return false;
+    }
+    let row_sets: Vec<&Vec<Value>> = payloads
+        .into_iter()
+        .filter_map(|value| {
+            value.get("data").and_then(Value::as_array).or_else(|| {
+                value
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .filter(|rows| rows.iter().all(Value::is_object))
+            })
+        })
+        .filter(|rows| !rows.is_empty())
+        .collect();
+    if row_sets.is_empty() {
+        return true;
+    }
+    if !evidence.degraded_reasons.is_empty() {
+        return false;
+    }
+    let Some(columns) = evidence.schema.get("columns").and_then(Value::as_array) else {
+        return false;
+    };
+    if columns.is_empty() {
+        return false;
+    }
+    let mut sources_by_name = HashMap::new();
+    for column in columns {
+        let Some(name) = column.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(sources) = column.get("sources").and_then(Value::as_array) else {
+            return false;
+        };
+        if name.is_empty() || sources.is_empty() || sources_by_name.contains_key(name) {
+            return false;
+        }
+        let mut paths = std::collections::HashSet::new();
+        for source in sources {
+            let Some(path) = source.as_str().filter(|path| !path.is_empty()) else {
+                return false;
+            };
+            paths.insert(path);
+        }
+        sources_by_name.insert(name, paths);
+    }
+    let mut evidenced = HashMap::<&str, std::collections::HashSet<&str>>::new();
+    for item in &evidence.lineage {
+        let Some(name) = item
+            .get("column")
+            .or_else(|| item.get("result_name"))
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let Some(path) = item.get("source_path").and_then(Value::as_str) else {
+            return false;
+        };
+        if !sources_by_name
+            .get(name)
+            .is_some_and(|paths| paths.contains(path))
+        {
+            return false;
+        }
+        evidenced.entry(name).or_default().insert(path);
+    }
+    if sources_by_name
+        .iter()
+        .any(|(name, paths)| evidenced.get(name).is_none_or(|known| known != paths))
+    {
+        return false;
+    }
+    row_sets.into_iter().all(|rows| {
+        rows.iter().all(|row| {
+            row.as_object().is_some_and(|fields| {
+                fields
+                    .keys()
+                    .all(|name| sources_by_name.contains_key(name.as_str()))
+            })
+        })
+    })
+}
+//++agent TASK-221
 
 fn reject_unsafe_report_shapes(value: &Value, depth: usize) -> Result<(), ()> {
     if depth > 64 {

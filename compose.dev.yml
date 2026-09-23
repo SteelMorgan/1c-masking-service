@@ -59,7 +59,7 @@ services:
 volumes:
   masking-data:
     external: true
-    name: onec-masking-service-dev-data
+    name: onec-masking-service-dev-state
   shared-runtime:
     external: true
     name: agent-work-sandbox-1c

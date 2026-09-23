@@ -44,10 +44,13 @@ automation. DEV container packaging поставляется в `Dockerfile` и
 доказывает production-подключение к GBIG PAM.
 
 DEV Compose использует постоянное имя проекта `onec-masking-service-dev` и
-внешний volume `onec-masking-service-dev-data`. Перед первым запуском создайте
-volume командой `docker volume create onec-masking-service-dev-data`, затем
+внешний volume `onec-masking-service-dev-state`. Перед первым запуском создайте
+volume командой `docker volume create onec-masking-service-dev-state`, затем
 запускайте `docker compose -f compose.dev.yml up -d --build`. `down` не удаляет
 данные; номер задачи в имени контейнера не используется.
+Прежний DEV volume `onec-masking-service-dev-data` исключён из Compose после
+инцидента с alias и остаётся отдельно для контролируемого разбора; автоматически
+его не монтируйте, не переносите из него историю и не удаляйте.
 - Provenance граница сохраняется: ROCTUP `copied`/`adapted` units находятся в
   отдельном 1С-расширении TASK-221; donor source files в Rust-сервис не
   переносились. Trusted gateway остаётся только `concept`.

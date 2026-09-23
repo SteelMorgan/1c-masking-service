@@ -90,10 +90,19 @@ struct WalkContext<'a> {
     deadline: Instant,
 }
 
+struct CutContext<'a> {
+    strings: usize,
+    deadline: Instant,
+    secret_fields: &'a HashSet<String>,
+    literals: &'a HashSet<String>,
+}
+
 #[derive(Default, Clone)]
 struct FieldEvidence {
     source_path: Option<String>,
+    source_paths: Vec<String>,
     field_type: Option<String>,
+    secret_cut: bool,
 }
 
 impl MaskEngine {
@@ -169,7 +178,12 @@ impl MaskEngine {
         })
     }
 
-    pub fn cut_secrets(&self, input: &Value) -> Result<Value, ProcessingError> {
+    pub fn cut_secrets(
+        &self,
+        input: &Value,
+        evidence: &Value,
+        policy: &PolicySnapshot,
+    ) -> Result<Value, ProcessingError> {
         validate_value_bounds(
             input,
             self.max_depth,
@@ -178,14 +192,37 @@ impl MaskEngine {
             self.max_text_bytes,
         )
         .map_err(|_| ProcessingError)?;
-        self.cut_walk(
-            input,
-            None,
-            0,
-            &mut 0,
-            Instant::now() + self.processing_timeout,
-        )
-        .map_err(|_| ProcessingError)
+        let fields = parse_evidence(evidence);
+        let secret_fields: HashSet<String> = fields
+            .iter()
+            .filter(|(_, item)| self.is_secret_source(item, policy))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut literals = HashSet::new();
+        collect_secret_literals(input, &secret_fields, &mut literals, 0)
+            .map_err(|_| ProcessingError)?;
+        let mut context = CutContext {
+            strings: 0,
+            deadline: Instant::now() + self.processing_timeout,
+            secret_fields: &secret_fields,
+            literals: &literals,
+        };
+        self.cut_walk(input, None, 0, &mut context)
+            .map_err(|_| ProcessingError)
+    }
+
+    fn is_secret_source(&self, evidence: &FieldEvidence, policy: &PolicySnapshot) -> bool {
+        evidence.secret_cut
+            || evidence.source_paths.iter().any(|path| {
+                self.secret_name.is_match(path)
+                    || compact_secret_name(path)
+                    || policy.metadata_sources.iter().any(|item| {
+                        item.source_path.eq_ignore_ascii_case(path)
+                            && (item.password_mode
+                                || self.secret_name.is_match(&item.field_name)
+                                || compact_secret_name(&item.field_name))
+                    })
+            })
     }
 
     pub fn resolve_tokens(
@@ -302,6 +339,9 @@ impl MaskEngine {
         context: &mut WalkContext<'_>,
     ) -> Result<String, ()> {
         let field = field.unwrap_or("");
+        if text == SECRET_REMOVED {
+            return Ok(SECRET_REMOVED.to_owned());
+        }
         let normalized_field = field.to_lowercase();
         let evidence = context
             .evidence
@@ -444,11 +484,15 @@ impl MaskEngine {
         value: &Value,
         field: Option<&str>,
         depth: usize,
-        strings: &mut usize,
-        deadline: Instant,
+        context: &mut CutContext<'_>,
     ) -> Result<Value, ()> {
-        if depth > self.max_depth || Instant::now() > deadline {
+        if depth > self.max_depth || Instant::now() > context.deadline {
             return Err(());
+        }
+        if field.is_some_and(|name| {
+            self.secret_name.is_match(name) || context.secret_fields.contains(&name.to_lowercase())
+        }) {
+            return Ok(Value::String(SECRET_REMOVED.to_owned()));
         }
         match value {
             Value::Object(object) => object
@@ -456,30 +500,35 @@ impl MaskEngine {
                 .map(|(key, value)| {
                     Ok((
                         key.clone(),
-                        self.cut_walk(value, Some(key), depth + 1, strings, deadline)?,
+                        self.cut_walk(value, Some(key), depth + 1, context)?,
                     ))
                 })
                 .collect::<Result<Map<_, _>, _>>()
                 .map(Value::Object),
             Value::Array(array) => array
                 .iter()
-                .map(|value| self.cut_walk(value, field, depth + 1, strings, deadline))
+                .map(|value| self.cut_walk(value, field, depth + 1, context))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             Value::String(text) => {
-                *strings += 1;
-                if *strings > self.max_strings || text.len() > self.max_text_bytes {
+                context.strings += 1;
+                if context.strings > self.max_strings || text.len() > self.max_text_bytes {
                     return Err(());
                 }
-                if field.is_some_and(|name| self.secret_name.is_match(name)) {
-                    Ok(Value::String(SECRET_REMOVED.to_owned()))
-                } else {
-                    Ok(Value::String(
-                        self.secret_value
-                            .replace_all(text, SECRET_REMOVED)
-                            .into_owned(),
-                    ))
+                let mut cut = self
+                    .secret_value
+                    .replace_all(text, SECRET_REMOVED)
+                    .into_owned();
+                for literal in context.literals {
+                    if !literal.is_empty() {
+                        cut = cut.replace(literal, SECRET_REMOVED);
+                        let escaped = serde_json::to_string(literal).map_err(|_| ())?;
+                        if escaped.len() > 2 {
+                            cut = cut.replace(&escaped[1..escaped.len() - 1], SECRET_REMOVED);
+                        }
+                    }
                 }
+                Ok(Value::String(cut))
             }
             scalar => Ok(scalar.clone()),
         }
@@ -598,20 +647,32 @@ fn parse_evidence(value: &Value) -> HashMap<String, FieldEvidence> {
     if let Some(lineage) = object.get("lineage").and_then(Value::as_array) {
         for item in lineage {
             let name = item
-                .get("result_name")
+                .get("column")
+                .or_else(|| item.get("result_name"))
                 .or_else(|| item.get("name"))
                 .and_then(Value::as_str);
             if let Some(name) = name {
                 let entry = result
                     .entry(name.to_lowercase())
                     .or_insert_with(FieldEvidence::default);
-                entry.source_path = item
-                    .get("source_path")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                if let Some(path) = item.get("source_path").and_then(Value::as_str) {
+                    if entry.source_path.is_none() {
+                        entry.source_path = Some(path.to_owned());
+                    }
+                    if !entry.source_paths.iter().any(|known| known == path) {
+                        entry.source_paths.push(path.to_owned());
+                    }
+                    entry.secret_cut |= compact_secret_name(path);
+                }
+                entry.secret_cut |= item.get("secret_cut").and_then(Value::as_bool) == Some(true);
                 if entry.field_type.is_none() {
                     entry.field_type = item
                         .get("source_type")
+                        .or_else(|| {
+                            item.get("source_types")
+                                .and_then(Value::as_array)
+                                .and_then(|types| types.first())
+                        })
                         .and_then(Value::as_str)
                         .map(str::to_owned);
                 }
@@ -619,6 +680,66 @@ fn parse_evidence(value: &Value) -> HashMap<String, FieldEvidence> {
         }
     }
     result
+}
+
+fn compact_secret_name(name: &str) -> bool {
+    let compact: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "accesstoken",
+        "refreshtoken",
+        "apikey",
+        "privatekey",
+        "authorization",
+        "пароль",
+        "токен",
+        "секрет",
+        "приватныйключ",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
+fn collect_secret_literals(
+    value: &Value,
+    secret_fields: &HashSet<String>,
+    literals: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > 64 {
+        return Err(());
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if secret_fields.contains(&key.to_lowercase()) {
+                    if let Some(text) = child.as_str() {
+                        if !text.is_empty() && text != SECRET_REMOVED {
+                            literals.insert(text.to_owned());
+                        }
+                    } else if !child.is_null() {
+                        // Without a scalar literal, another serialized public copy
+                        // cannot be proven free of the same source value.
+                        return Err(());
+                    }
+                }
+                collect_secret_literals(child, secret_fields, literals, depth + 1)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_secret_literals(child, secret_fields, literals, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn collect_tokens(
