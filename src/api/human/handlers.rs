@@ -639,6 +639,12 @@ fn data_error(error: HumanDataError) -> ApiError {
             ApiError::conflict_code("MAPPING_UNAVAILABLE", "Соответствие недоступно")
         }
         HumanDataError::Conflict => ApiError::conflict(),
+        //++agent TASK-221 2026-09-23
+        HumanDataError::SecretPolicyUnsupported => ApiError::conflict_code(
+            "SECRET_POLICY_UNSUPPORTED",
+            "Secret-правила недоступны до включения предменеджерной защиты",
+        ),
+        //--agent TASK-221
         HumanDataError::Unavailable => ApiError::unavailable(),
     }
 }

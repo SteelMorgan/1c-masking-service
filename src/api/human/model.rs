@@ -158,6 +158,12 @@ pub enum HumanDataError {
     MappingUnavailable,
     #[error("request conflicts with current state")]
     Conflict,
+    //++agent TASK-221 2026-09-23
+    #[error(
+        "configurable secret policy is unsupported until pre-manager enforcement is available"
+    )]
+    SecretPolicyUnsupported,
+    //--agent TASK-221
     #[error("human data storage is unavailable")]
     Unavailable,
 }

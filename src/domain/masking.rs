@@ -87,6 +87,7 @@ struct WalkContext<'a> {
     strings_seen: usize,
     cells_seen: usize,
     evidence: HashMap<String, FieldEvidence>,
+    fio_literals: Vec<String>,
     deadline: Instant,
 }
 
@@ -99,9 +100,8 @@ struct CutContext<'a> {
 
 #[derive(Default, Clone)]
 struct FieldEvidence {
-    source_path: Option<String>,
     source_paths: Vec<String>,
-    field_type: Option<String>,
+    field_types: Vec<String>,
     secret_cut: bool,
 }
 
@@ -154,6 +154,17 @@ impl MaskEngine {
             self.max_text_bytes,
         )
         .map_err(|_| ProcessingError)?;
+        let evidence = parse_evidence(evidence);
+        let fio_fields: HashSet<String> = evidence
+            .iter()
+            .filter(|(_, item)| self.is_fio_source(item))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut fio_literals = HashSet::new();
+        collect_field_literals(input, &fio_fields, &mut fio_literals, 0)
+            .map_err(|_| ProcessingError)?;
+        let mut fio_literals: Vec<String> = fio_literals.into_iter().collect();
+        fio_literals.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let mut context = WalkContext {
             database_id,
             chat_id,
@@ -165,7 +176,8 @@ impl MaskEngine {
             reasons: HashSet::new(),
             strings_seen: 0,
             cells_seen: 0,
-            evidence: parse_evidence(evidence),
+            evidence,
+            fio_literals,
             deadline: Instant::now() + self.processing_timeout,
         };
         let value = self
@@ -223,6 +235,17 @@ impl MaskEngine {
                                 || compact_secret_name(&item.field_name))
                     })
             })
+    }
+
+    fn is_fio_source(&self, evidence: &FieldEvidence) -> bool {
+        evidence.source_paths.iter().any(|path| {
+            let name = path.rsplit('.').next().unwrap_or(path);
+            //++agent TASK-221 2026-09-23
+            // Полное имя может быть опубликовано под нейтральным псевдонимом;
+            // проверяем именно подтверждённый источник, а не имя колонки.
+            self.fio_name.is_match(name) || name.to_lowercase() == "наименованиеполное"
+            //--agent TASK-221
+        })
     }
 
     pub fn resolve_tokens(
@@ -375,19 +398,18 @@ impl MaskEngine {
                 }
             }
         }
-        let mut preprocessed = text.to_owned();
         for (known, category) in &context.policy.dictionary {
             if Instant::now() > context.deadline {
                 return Err(());
             }
             if !known.is_empty()
-                && preprocessed.contains(known)
+                && text.contains(known)
                 && strongest_dictionary_action(context.policy, category) == RuleAction::Secret
             {
                 context
                     .reasons
                     .insert(format!("dictionary:{category}:secret"));
-                preprocessed = preprocessed.replace(known, SECRET_REMOVED);
+                return Ok(SECRET_REMOVED.to_owned());
             }
         }
         for rule in context.policy.rules.iter().filter(|rule| {
@@ -397,25 +419,26 @@ impl MaskEngine {
                 return Err(());
             }
             let regex = Regex::new(&rule.pattern).map_err(|_| ())?;
-            if regex.is_match(&preprocessed) {
+            if regex.is_match(text) {
                 context
                     .reasons
                     .insert(rule_reason(RuleSelector::Regex, rule));
-                preprocessed = regex
-                    .replace_all(&preprocessed, SECRET_REMOVED)
-                    .into_owned();
+                return Ok(SECRET_REMOVED.to_owned());
             }
         }
 
-        if self.fio_name.is_match(field) && !text.is_empty() {
+        if (self.fio_name.is_match(field) || self.is_fio_source(&evidence)) && !text.is_empty() {
             context.reasons.insert("mandatory:fio:name".to_owned());
-            return if preprocessed == SECRET_REMOVED {
-                Ok(preprocessed)
-            } else {
-                plan(context, "FIO", &preprocessed)
-            };
+            return plan(context, "FIO", text);
         }
-        let mut rendered = preprocessed;
+        let mut rendered = text.to_owned();
+        for literal in context.fio_literals.clone() {
+            if rendered.contains(&literal) {
+                context.reasons.insert("mandatory:fio:source".to_owned());
+                let replacement = plan(context, "FIO", &literal)?;
+                rendered = rendered.replace(&literal, &replacement);
+            }
+        }
         if self.fio_value.is_match(&rendered) {
             context.reasons.insert("mandatory:fio:text".to_owned());
             rendered = replace_matches(&self.fio_value, &rendered, |matched| {
@@ -464,7 +487,7 @@ impl MaskEngine {
             if regex.is_match(&rendered) {
                 match rule.action {
                     RuleAction::Secret => {
-                        rendered = regex.replace_all(&rendered, SECRET_REMOVED).into_owned()
+                        return Ok(SECRET_REMOVED.to_owned());
                     }
                     RuleAction::Mask => {
                         rendered = replace_matches(&regex, &rendered, |matched| {
@@ -541,16 +564,30 @@ fn strongest_matching_rule<'a>(
     field: &str,
     evidence: &FieldEvidence,
 ) -> Result<Option<&'a PolicyRule>, ()> {
-    let target = match selector {
-        RuleSelector::SourcePath => evidence.source_path.as_deref().unwrap_or(""),
-        RuleSelector::Name => field,
-        RuleSelector::Type => evidence.field_type.as_deref().unwrap_or(""),
-        _ => return Ok(None),
-    };
     Ok(policy
         .rules
         .iter()
-        .filter(|rule| rule.selector == selector && wildcard_match(&rule.pattern, target))
+        .filter(|rule| {
+            rule.selector == selector
+                && match selector {
+                    RuleSelector::SourcePath => {
+                        //++agent TASK-221 2026-09-23
+                        // Для составной колонки более строгий источник не должен
+                        // проигрывать первому перечисленному источнику с Keep.
+                        evidence
+                            .source_paths
+                            .iter()
+                            .any(|path| wildcard_match(&rule.pattern, path))
+                        //--agent TASK-221
+                    }
+                    RuleSelector::Name => wildcard_match(&rule.pattern, field),
+                    RuleSelector::Type => evidence
+                        .field_types
+                        .iter()
+                        .any(|field_type| wildcard_match(&rule.pattern, field_type)),
+                    _ => false,
+                }
+        })
         // Restrictiveness is authoritative at one selector level; priority is
         // only a deterministic tie-breaker between equally restrictive rules.
         .max_by_key(|rule| (rule.action, rule.priority)))
@@ -636,11 +673,11 @@ fn parse_evidence(value: &Value) -> HashMap<String, FieldEvidence> {
                 result
                     .entry(name.to_lowercase())
                     .or_insert_with(FieldEvidence::default)
-                    .field_type = column
+                    .field_types = column
                     .get("type")
                     .or_else(|| column.get("types"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                    .map(parse_types)
+                    .unwrap_or_default();
             }
         }
     }
@@ -656,30 +693,69 @@ fn parse_evidence(value: &Value) -> HashMap<String, FieldEvidence> {
                     .entry(name.to_lowercase())
                     .or_insert_with(FieldEvidence::default);
                 if let Some(path) = item.get("source_path").and_then(Value::as_str) {
-                    if entry.source_path.is_none() {
-                        entry.source_path = Some(path.to_owned());
-                    }
                     if !entry.source_paths.iter().any(|known| known == path) {
                         entry.source_paths.push(path.to_owned());
                     }
                     entry.secret_cut |= compact_secret_name(path);
                 }
                 entry.secret_cut |= item.get("secret_cut").and_then(Value::as_bool) == Some(true);
-                if entry.field_type.is_none() {
-                    entry.field_type = item
+                if entry.field_types.is_empty() {
+                    entry.field_types = item
                         .get("source_type")
-                        .or_else(|| {
-                            item.get("source_types")
-                                .and_then(Value::as_array)
-                                .and_then(|types| types.first())
-                        })
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                        .or_else(|| item.get("source_types"))
+                        .map(parse_types)
+                        .unwrap_or_default();
                 }
             }
         }
     }
     result
+}
+
+fn parse_types(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_field_literals(
+    value: &Value,
+    fields: &HashSet<String>,
+    literals: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > 64 {
+        return Err(());
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if fields.contains(&key.to_lowercase()) {
+                    if let Some(text) = child.as_str() {
+                        if !text.is_empty() && text != SECRET_REMOVED {
+                            literals.insert(text.to_owned());
+                        }
+                    } else if !child.is_null() {
+                        return Err(());
+                    }
+                }
+                collect_field_literals(child, fields, literals, depth + 1)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_field_literals(child, fields, literals, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn compact_secret_name(name: &str) -> bool {

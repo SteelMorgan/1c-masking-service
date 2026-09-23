@@ -338,6 +338,9 @@ impl HumanDataStore for SqliteHumanDataStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), HumanDataError>> + Send + 'a>> {
         let actor_id = actor.user_id;
         Box::pin(async move {
+            //++agent TASK-221 2026-09-23
+            // Пока менеджер не получает версионированную политику до вызова 1С,
+            // произвольный Secret нельзя активировать без риска пропуска значения через него.
             let (version, rules) = self.storage.with_connection(|c| {
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let version: i64 = tx.query_row(
@@ -346,6 +349,9 @@ impl HumanDataStore for SqliteHumanDataStore {
                     |row| row.get(0),
                 )?;
                 let rules = load_rules(&tx, policy_id, database_id)?;
+                if rules.iter().any(|rule| rule.action == "secret") {
+                    return Ok(None);
+                }
                 let now = Utc::now().to_rfc3339();
                 tx.execute("UPDATE policies SET status='retired' WHERE database_id=?1 AND status='active'",[database_id.to_string()])?;
                 tx.execute("UPDATE policies SET status='active' WHERE id=?1 AND database_id=?2",params![policy_id.to_string(),database_id.to_string()])?;
@@ -353,8 +359,9 @@ impl HumanDataStore for SqliteHumanDataStore {
                 let principal=Principal{user_id:actor_id,role:crate::auth::Role::Admin,auth_epoch:0};
                 audit(&tx,&principal,"policy.activate",database_id,correlation_id,&now)?;
                 tx.commit()?;
-                Ok((version, rules))
-            }).map_err(sql_error)?;
+                Ok(Some((version, rules)))
+            }).map_err(sql_error)?.ok_or(HumanDataError::SecretPolicyUnsupported)?;
+            //--agent TASK-221
             self.masking
                 .set_policy_snapshot(
                     database_id,

@@ -472,6 +472,16 @@ impl MaskingService {
                     .ok_or_else(|| {
                         ServiceError::new(ErrorCode::PolicyInvalid, request.correlation_id)
                     })?;
+                //++agent TASK-221 2026-09-23
+                // Старые активные Secret-политики тоже не должны становиться ready
+                // до появления предменеджерного контракта для конфигурационных правил.
+                if rules.iter().any(|rule| rule.action == RuleAction::Secret) {
+                    return Err(ServiceError::new(
+                        ErrorCode::PolicyInvalid,
+                        request.correlation_id,
+                    ));
+                }
+                //--agent TASK-221
                 snapshot.version = version;
                 snapshot.rules = rules;
             }

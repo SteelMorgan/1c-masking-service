@@ -540,6 +540,410 @@ async fn password_mode_metadata_cuts_neutral_alias_even_without_secret_flag() {
         Ok(())
     }).unwrap();
 }
+
+#[tokio::test]
+async fn secret_dictionary_and_regex_rules_cut_entire_value_without_mapping() {
+    for (selector, pattern, dictionary) in [
+        (
+            RuleSelector::Dictionary,
+            "CREDENTIAL".to_owned(),
+            HashMap::from([(
+                "synthetic-credential-221".to_owned(),
+                "CREDENTIAL".to_owned(),
+            )]),
+        ),
+        (
+            RuleSelector::Regex,
+            "synthetic-credential-221".to_owned(),
+            HashMap::new(),
+        ),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        state
+            .masking
+            .set_policy_snapshot(
+                database_id,
+                PolicySnapshot {
+                    rules: vec![PolicyRule {
+                        selector,
+                        pattern,
+                        action: RuleAction::Secret,
+                        category: "CREDENTIAL".to_owned(),
+                        priority: 1,
+                    }],
+                    dictionary,
+                    ..PolicySnapshot::default()
+                },
+            )
+            .await;
+        let raw = "before synthetic-credential-221 after";
+        let call_id = Uuid::new_v4();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "synthetic-secret-rule".to_owned(),
+                tool_name: "find_references_to_object".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "content":[{"type":"text","text":raw},
+                            {"type":"json","json":{"НейтральноеПоле":raw}}],
+                        "is_error":false
+                    }),
+                },
+                evidence: MaskingEvidence::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            response.public_result["content"][0]["text"],
+            "[SECRET_REMOVED]"
+        );
+        assert_eq!(
+            response.public_result["content"][1]["json"]["НейтральноеПоле"],
+            "[SECRET_REMOVED]"
+        );
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(!public.contains(raw));
+        assert!(!public.contains("before "));
+        assert!(!public.contains(" after"));
+        assert!(!public.contains("[MASK:v1:"));
+        state.storage.with_connection(|connection| {
+            let (stored, mapping_batch): (String, Option<String>) = connection.query_row(
+                "SELECT public_result_json || report_json || mask_reasons_json, mapping_batch_id FROM history WHERE call_id=?1",
+                [call_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert!(!stored.contains(raw));
+            assert!(mapping_batch.is_none());
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn canonical_fio_source_overrides_keep_rule_and_missing_lineage_fails_closed() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let alias = "НейтральноеПоле";
+    let path = "Справочник.Клиенты.ФИО";
+    let raw = "Тестов Т.Т.";
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                rules: vec![PolicyRule {
+                    selector: RuleSelector::SourcePath,
+                    pattern: path.to_owned(),
+                    action: RuleAction::Keep,
+                    category: "KEEP".to_owned(),
+                    priority: 999,
+                }],
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    for (lineage, should_succeed) in [
+        (vec![json!({"column":alias,"source_path":path})], true),
+        (Vec::new(), false),
+    ] {
+        let call_id = Uuid::new_v4();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "synthetic-fio-source".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "content":[{"type":"json","json":{"data":[{alias:raw}]}},
+                            {"type":"text","text":format!("value={raw}")}],
+                        "structured_content":{"success":true,"data":[{alias:raw}]},
+                        "is_error":false
+                    }),
+                },
+                evidence: MaskingEvidence {
+                    schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
+                    lineage,
+                    ..MaskingEvidence::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.public_result["is_error"], !should_succeed);
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(!public.contains(raw));
+        if should_succeed {
+            assert!(public.contains("[MASK:v1:FIO:"));
+        }
+        state
+            .storage
+            .with_connection(|connection| {
+                let stored: String = connection.query_row(
+                    "SELECT public_result_json || report_json FROM history WHERE call_id=?1",
+                    [call_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                assert!(!stored.contains(raw));
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+//++agent TASK-221 2026-09-23
+#[tokio::test]
+async fn canonical_full_name_source_masks_initials_despite_neutral_alias_and_keep() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let alias = "НейтральноеПоле";
+    let path = "Справочник.Клиенты.НаименованиеПолное";
+    let raw = "Тестов Т.Т.";
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                rules: vec![PolicyRule {
+                    selector: RuleSelector::SourcePath,
+                    pattern: path.to_owned(),
+                    action: RuleAction::Keep,
+                    category: "KEEP".to_owned(),
+                    priority: 999,
+                }],
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "synthetic-full-name".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "content":[{"type":"json","json":{"data":[{alias:raw}]}},
+                        {"type":"text","text":format!("value={raw}")}],
+                    "structured_content":{"success":true,"data":[{alias:raw}]},
+                    "is_error":false
+                }),
+            },
+            evidence: MaskingEvidence {
+                schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
+                lineage: vec![json!({"column":alias,"source_path":path})],
+                ..MaskingEvidence::default()
+            },
+        })
+        .await
+        .unwrap();
+    let public = serde_json::to_string(&response.public_result).unwrap();
+    assert!(!public.contains(raw));
+    assert!(public.contains("[MASK:v1:FIO:"));
+}
+
+#[tokio::test]
+async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
+    for (action, expected) in [
+        (RuleAction::Mask, "[MASK:v1:STRICT:"),
+        (RuleAction::Secret, "[SECRET_REMOVED]"),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        let alias = "НейтральноеПоле";
+        let public_source = "Справочник.Клиенты.ОбщееПоле";
+        let strict_source = "Справочник.Клиенты.ВторойИсточник";
+        let raw = "synthetic-multisource-221";
+        state
+            .masking
+            .set_policy_snapshot(
+                database_id,
+                PolicySnapshot {
+                    rules: vec![
+                        PolicyRule {
+                            selector: RuleSelector::SourcePath,
+                            pattern: public_source.to_owned(),
+                            action: RuleAction::Keep,
+                            category: "KEEP".to_owned(),
+                            priority: 999,
+                        },
+                        PolicyRule {
+                            selector: RuleSelector::SourcePath,
+                            pattern: strict_source.to_owned(),
+                            action,
+                            category: "STRICT".to_owned(),
+                            priority: 0,
+                        },
+                    ],
+                    ..PolicySnapshot::default()
+                },
+            )
+            .await;
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id: Uuid::new_v4(),
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "synthetic-multisource".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "content":[{"type":"json","json":{"data":[{alias:raw}]}}],
+                        "structured_content":{"success":true,"data":[{alias:raw}]},
+                        "is_error":false
+                    }),
+                },
+                evidence: MaskingEvidence {
+                    schema: json!({"columns":[{"name":alias,
+                    "sources":[public_source,strict_source]}]}),
+                    lineage: vec![
+                        json!({"column":alias,"source_path":public_source}),
+                        json!({"column":alias,"source_path":strict_source}),
+                    ],
+                    ..MaskingEvidence::default()
+                },
+            })
+            .await
+            .unwrap();
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(!public.contains(raw));
+        assert!(public.contains(expected));
+    }
+}
+//--agent TASK-221
+
+#[tokio::test]
+async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
+    for types in [json!(["Число", "Строка"]), json!("Строка")] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        state
+            .masking
+            .set_policy_snapshot(
+                database_id,
+                PolicySnapshot {
+                    rules: vec![PolicyRule {
+                        selector: RuleSelector::Type,
+                        pattern: "Строка".to_owned(),
+                        action: RuleAction::Mask,
+                        category: "TYPE".to_owned(),
+                        priority: 0,
+                    }],
+                    ..PolicySnapshot::default()
+                },
+            )
+            .await;
+        let raw = "synthetic-type-value-221";
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id: Uuid::new_v4(),
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "synthetic-type-array".to_owned(),
+                tool_name: "get_object_by_link".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "content":[{"type":"json","json":{"НейтральноеПоле":raw}}],
+                        "is_error":false
+                    }),
+                },
+                evidence: MaskingEvidence {
+                    schema: json!({"columns":[{"name":"НейтральноеПоле","types":types}]}),
+                    ..MaskingEvidence::default()
+                },
+            })
+            .await
+            .unwrap();
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(!public.contains(raw));
+        assert!(public.contains("[MASK:v1:TYPE:"));
+    }
+}
+
+#[tokio::test]
+async fn legacy_active_secret_policy_cannot_publish_ready_feed() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    let policy_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap();
+    storage.with_connection(|connection| {
+        let now = chrono::Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO policies(id,database_id,version,status,created_at) VALUES (?1,?2,1,'active',?3)",
+            rusqlite::params![policy_id.to_string(), database_id.to_string(), now],
+        )?;
+        connection.execute(
+            "INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,action,category,priority,enabled,created_at) VALUES (?1,?2,'regex','synthetic-pattern','secret','SECRET',1,1,?3)",
+            rusqlite::params![Uuid::new_v4().to_string(), policy_id.to_string(), now],
+        )?;
+        connection.execute(
+            "UPDATE databases SET active_policy_id=?1 WHERE id=?2",
+            rusqlite::params![policy_id.to_string(), database_id.to_string()],
+        )?;
+        Ok(())
+    }).unwrap();
+    let job_id = storage.enqueue_feed_job(database_id, 1).unwrap();
+    let job = state
+        .masking
+        .pending_feed_jobs(10, Uuid::new_v4())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    let payload = onec_masking_service::domain::FeedPayload {
+        selection_id: None,
+        page_index: 0,
+        metadata: Vec::new(),
+        dictionary_values: Vec::new(),
+        final_chunk: true,
+    };
+    let digest = digest_payload(&serde_json::to_value(&payload).unwrap());
+    state
+        .masking
+        .upload_feed_chunk(
+            job.job_id,
+            0,
+            onec_masking_service::domain::FeedChunkRequest {
+                schema_version: SCHEMA_VERSION,
+                correlation_id: Uuid::new_v4(),
+                chunk_digest: hex(&digest),
+                payload,
+            },
+        )
+        .unwrap();
+    let aggregate: [u8; 32] = Sha256::digest(digest).into();
+    let error = state
+        .masking
+        .activate_feed(
+            job.job_id,
+            onec_masking_service::domain::FeedActivateRequest {
+                schema_version: SCHEMA_VERSION,
+                correlation_id: Uuid::new_v4(),
+                expected_chunks: 1,
+                expected_metadata_count: 0,
+                expected_dictionary_count: 0,
+                aggregate_digest: hex(&aggregate),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::PolicyInvalid);
+    assert!(!state.masking.database_ready(database_id).await);
+}
 //++agent TASK-221
 
 #[tokio::test]

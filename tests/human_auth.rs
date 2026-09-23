@@ -7,8 +7,8 @@ use axum::{
 use chrono::Utc;
 use onec_masking_service::{
     api::human::{
-        self, CreatePolicyRequest, DictionaryConfig, DictionarySelectorConfig, HumanDataStore,
-        HumanState, PolicyRuleInput, SqliteHumanDataStore, ToolClassificationPatch,
+        self, CreatePolicyRequest, DictionaryConfig, DictionarySelectorConfig, HumanDataError,
+        HumanDataStore, HumanState, PolicyRuleInput, SqliteHumanDataStore, ToolClassificationPatch,
     },
     auth::{
         AuthProvider, AuthStore, ChangePasswordError, LocalAuthProvider, LoginError, Role,
@@ -684,3 +684,110 @@ async fn activating_policy_before_first_feed_does_not_make_enabled_database_read
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ServiceNotReady);
 }
+
+//++agent TASK-221 2026-09-23
+#[tokio::test]
+async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    let masking = Arc::new(MaskingService::new(storage.clone()));
+    let data = SqliteHumanDataStore::new(storage, masking);
+    let actor = onec_masking_service::auth::Principal {
+        user_id: Uuid::new_v4(),
+        role: Role::Admin,
+        auth_epoch: 1,
+    };
+    for (selector_kind, selector_value) in [
+        ("source_path", "Catalog.Person.Secret"),
+        ("name", "Secret"),
+        ("type", "String"),
+        ("dictionary", "FIO"),
+        ("regex", "synthetic-secret"),
+    ] {
+        let policy = data
+            .create_policy(
+                &actor,
+                database_id,
+                CreatePolicyRequest {
+                    rules: vec![PolicyRuleInput {
+                        selector_kind: selector_kind.into(),
+                        selector_value: selector_value.into(),
+                        action: "secret".into(),
+                        category: "SECRET".into(),
+                        priority: 1,
+                    }],
+                },
+                Uuid::new_v4(),
+            )
+            .unwrap();
+        assert!(matches!(
+            data.activate_policy(&actor, database_id, policy.id, Uuid::new_v4())
+                .await,
+            Err(HumanDataError::SecretPolicyUnsupported)
+        ));
+        assert_eq!(
+            data.list_policies(database_id)
+                .unwrap()
+                .iter()
+                .find(|item| item.id == policy.id)
+                .unwrap()
+                .status,
+            "draft"
+        );
+    }
+}
+
+#[tokio::test]
+async fn secret_policy_activation_http_returns_stable_conflict_code() {
+    let (storage, auth, sessions) = auth_fixture();
+    auth.initialize().unwrap();
+    auth.bootstrap_admin_password(ADMIN_PASSWORD).unwrap();
+    let actor = auth
+        .authenticate("synthetic-policy-admin", "admin", ADMIN_PASSWORD)
+        .unwrap();
+    let session = sessions.issue(actor.clone(), Utc::now()).unwrap();
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    let masking = Arc::new(MaskingService::new(storage.clone()));
+    let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
+    let policy = data
+        .create_policy(
+            &actor,
+            database_id,
+            CreatePolicyRequest {
+                rules: vec![PolicyRuleInput {
+                    selector_kind: "regex".into(),
+                    selector_value: "synthetic-pattern".into(),
+                    action: "secret".into(),
+                    category: "SECRET".into(),
+                    priority: 1,
+                }],
+            },
+            Uuid::new_v4(),
+        )
+        .unwrap();
+    let app = human::router(Arc::new(HumanState {
+        auth,
+        sessions,
+        data,
+        expected_origin: ORIGIN.to_owned(),
+    }));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/admin/databases/{database_id}/policies/{}/activate",
+            policy.id
+        ))
+        .header("origin", ORIGIN)
+        .header("cookie", format!("__Host-mask_session={}", session.token))
+        .header("x-csrf-token", &session.csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"]["code"], "SECRET_POLICY_UNSUPPORTED");
+}
+//--agent TASK-221
