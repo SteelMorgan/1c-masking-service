@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Администрирование masking service</title>
+  <link rel="stylesheet" href="/human.css">
+</head>
+<body data-page="admin">
+  <header><h1>Администрирование</h1><button id="logout">Выйти</button></header>
+  <main>
+    <section>
+      <h2>Сменить мой пароль</h2>
+      <form id="change-password" autocomplete="off">
+        <label>Текущий пароль <input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+        <label>Новый пароль <input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+        <label>Повторите новый пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+        <button type="submit">Сменить пароль</button>
+      </form>
+    </section>
+    <section>
+      <h2>Пользователи</h2>
+      <form id="create-user"><label>Логин <input name="login" required maxlength="128"></label><label>Роль <select name="role"><option>Viewer</option><option>Admin</option></select></label><button type="submit">Создать</button></form>
+      <p id="activation" class="sensitive"></p>
+      <div id="users"></div>
+    </section>
+    <section>
+      <h2>Настройки баз</h2>
+      <p>Policy, rules, dictionaries, tool classes, TTL и refresh доступны только в этой Admin-области.</p>
+      <div id="admin-databases"></div>
+    </section>
+  </main>
+  <p id="status" role="status"></p>
+  <script src="/human.js" defer></script>
+</body>
+</html>

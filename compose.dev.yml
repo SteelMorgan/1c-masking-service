@@ -1,0 +1,65 @@
+name: onec-masking-service-dev
+
+# Rollout prerequisite (do not replace with a workspace bind mount):
+# docker exec -u 1000:1000 1c-ai-sandbox \
+#   install -d -m 0700 /workspaces/work/run/1c-masking
+
+services:
+  masking-service:
+    image: onec-masking-service:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "1000:1000"
+    init: true
+    restart: unless-stopped
+    environment:
+      MASKING_EXPECTED_ORIGIN: "${MASKING_EXPECTED_ORIGIN:-http://127.0.0.1:18787}"
+      MASKING_DATABASE_PATH: /var/lib/1c-masking/service.sqlite3
+      MASKING_SOCKET_PATH: /run/1c-masking/service.sock
+      MASKING_CONTROL_SOCKET_PATH: /run/1c-masking/control.sock
+      MASKING_HUMAN_BIND: 0.0.0.0:8787
+      MASKING_MANAGER_UID: "1000"
+      RUST_LOG: "${MASKING_RUST_LOG:-info}"
+    ports:
+      - "127.0.0.1:${MASKING_HUMAN_PORT:-18787}:8787"
+    volumes:
+      - type: volume
+        source: masking-data
+        target: /var/lib/1c-masking
+      - type: volume
+        source: shared-runtime
+        target: /run/1c-masking
+        volume:
+          nocopy: true
+          subpath: run/1c-masking
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - --unix-socket
+        - /run/1c-masking/service.sock
+        - http://localhost/internal/v1/health/live
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  masking-data:
+    external: true
+    name: onec-masking-service-dev-data
+  shared-runtime:
+    external: true
+    name: agent-work-sandbox-1c

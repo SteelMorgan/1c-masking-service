@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>1C Masking Service</title>
+  <link rel="stylesheet" href="/human.css">
+</head>
+<body data-page="login">
+  <main class="narrow">
+    <h1>1C Masking Service</h1>
+    <form id="login-form">
+      <label>Логин <input name="login" autocomplete="username" required maxlength="128"></label>
+      <label>Пароль <input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+      <button type="submit">Войти</button>
+    </form>
+    <p id="status" role="status"></p>
+  </main>
+  <script src="/human.js" defer></script>
+</body>
+</html>

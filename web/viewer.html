@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Просмотр маскированной истории</title>
+  <link rel="stylesheet" href="/human.css">
+</head>
+<body data-page="viewer">
+  <header><h1>Маскированная история</h1><button id="logout">Выйти</button></header>
+  <main class="layout">
+    <nav><h2>Базы</h2><div id="databases"></div><h2>Чаты</h2><div id="chats"></div></nav>
+    <div>
+      <section>
+        <h2>Сменить мой пароль</h2>
+        <form id="change-password" autocomplete="off">
+          <label>Текущий пароль <input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+          <label>Новый пароль <input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+          <label>Повторите новый пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+          <button type="submit">Сменить пароль</button>
+        </form>
+      </section>
+      <section><h2>Последние сообщения</h2><p>История доступна только для чтения.</p><div id="history"></div><h2>Просмотр</h2><div id="report"></div></section>
+    </div>
+  </main>
+  <p id="status" role="status"></p>
+  <script src="/human.js" defer></script>
+</body>
+</html>

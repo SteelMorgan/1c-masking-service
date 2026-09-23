@@ -1,0 +1,59 @@
+# ++agent TASK-221 [23.09.2026]
+name: onec-v8sm-dev-tunnel
+
+services:
+  reverse-tunnel:
+    image: "${ONEC_V8SM_TUNNEL_IMAGE:-sandbox1c_devcontainer-agent:latest}"
+    container_name: onec-v8sm-dev-tunnel
+    user: "1000:1000"
+    init: true
+    restart: unless-stopped
+    network_mode: "container:1c-ai-sandbox"
+    read_only: true
+    # Образ используется как носитель OpenSSH; его init-скрипт пишет в /etc и несовместим с read-only rootfs.
+    entrypoint:
+      - /usr/bin/ssh
+    command:
+      - -F
+      - /dev/null
+      - -i
+      - /run/onec-v8sm-dev/id_ed25519
+      - -o
+      - IdentitiesOnly=yes
+      - -o
+      - UserKnownHostsFile=/run/onec-v8sm-dev/known_hosts
+      - -o
+      - StrictHostKeyChecking=yes
+      - -o
+      - ExitOnForwardFailure=yes
+      - -o
+      - ServerAliveInterval=15
+      - -o
+      - ServerAliveCountMax=3
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=10
+      - -N
+      - -T
+      - -R
+      - 127.0.0.1:4000:127.0.0.1:4000
+      - onec-v8sm-dev-tunnel@192.168.250.2
+    volumes:
+      - type: volume
+        source: tunnel-secrets
+        target: /run/onec-v8sm-dev
+        read_only: true
+    tmpfs:
+      - /tmp:size=4m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+
+volumes:
+  tunnel-secrets:
+    external: true
+    name: onec-v8sm-dev-tunnel-secrets
+# --agent TASK-221

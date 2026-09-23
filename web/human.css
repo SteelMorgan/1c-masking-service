@@ -1,0 +1,22 @@
+:root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+body { margin: 0; padding: 1rem 2rem; }
+header { display: flex; align-items: center; justify-content: space-between; }
+main { max-width: 90rem; margin: 1rem auto; }
+.narrow { max-width: 28rem; }
+.layout { display: grid; grid-template-columns: minmax(14rem, 22rem) 1fr; gap: 2rem; }
+label { display: block; margin: .75rem 0; }
+input, select, button, textarea { box-sizing: border-box; font: inherit; padding: .45rem .65rem; max-width: 100%; }
+button { cursor: pointer; margin: .2rem; }
+table { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+th, td { border: 1px solid currentColor; padding: .35rem .5rem; text-align: left; vertical-align: top; }
+.item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
+.sensitive { overflow-wrap: anywhere; }
+.admin-db { border: 1px solid currentColor; border-radius: .4rem; margin: 1rem 0; padding: 1rem; }
+.settings-grid { display: flex; flex-wrap: wrap; align-items: end; gap: .5rem 1rem; }
+.inline-card, .stack-card, .selector-row, .rule-row { border: 1px solid color-mix(in srgb, currentColor 35%, transparent); border-radius: .3rem; margin: .5rem 0; padding: .6rem; }
+.inline-card { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; }
+.stack-card { display: block; }
+.selector-row, .rule-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .4rem 1rem; }
+.selector-row textarea { width: 100%; }
+#status { min-height: 1.5rem; }
+@media (max-width: 50rem) { .layout { grid-template-columns: 1fr; } body { padding: .75rem; } }

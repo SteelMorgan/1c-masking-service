@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Активация пользователя</title>
+  <link rel="stylesheet" href="/human.css">
+</head>
+<body data-page="activate">
+  <main class="narrow">
+    <h1>Установка пароля</h1>
+    <form id="activate-form">
+      <label>Новый пароль <input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+      <label>Повторите пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+      <button type="submit">Активировать</button>
+    </form>
+    <p id="status" role="status"></p>
+  </main>
+  <script src="/human.js" defer></script>
+</body>
+</html>

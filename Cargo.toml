@@ -1,0 +1,39 @@
+[package]
+name = "onec-masking-service"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "onec_masking_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "masking-service"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+argon2 = "0.5"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
+http = "1"
+libc = "0.2"
+rand = "0.8"
+regex = "1"
+rpassword = "7"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
