@@ -1,68 +1,144 @@
 # 1c-masking-service
 
-Внешний сервис маскирования для доверенного менеджера 1С. Репозиторий содержит
-локальную реализацию на Rust/Axum (`onec-masking-service` 0.1.0): SQLite storage,
-внутренний Unix API, human Viewer/Admin API и минимальный статический UI.
-Production deployment и live manager+1С E2E пока не подтверждены.
+Внешний сервис маскирования ответов 1С-инструментов для ИИ-агента. Реализация —
+`onec-masking-service` 0.1.0 (Rust/Axum): SQLite-хранилище, internal API на
+Unix socket, human API/UI на отдельном TCP-listener.
 
-## Назначение и границы приватности
+Сервис получает результат вызова инструмента до его отдачи агенту: ФИО и
+значения из словаря/правил заменяются обратимыми токенами вида
+`[MASK:v1:<CAT>:<token>]`. Секреты вырезаются ещё в 1С на границе данных и
+доезжают до сервиса как `[SECRET_REMOVED]` — это нормальное значение, не
+сигнал. Раскрытие исходных значений возможно только человеку с ролью `Viewer`
+через UI; агент и `Admin` раскрытия не получают. В историю и логи пишется
+только замаскированная форма.
 
-Сервис предназначен для обработки результата вызова выбранного инструмента 1С
-до его публикации агенту: применения настроенной policy, маскирования
-чувствительных значений и автоматического сохранения только маскированной
-истории. Human viewer/admin и agent/service principal являются разными
-идентичностями. Сервис не заменяет бизнес-права 1С и не должен использоваться
-как механизм выдачи таких прав.
+## Зависимости
 
-Целевой внешний контракт для агента сохраняет имя инструмента и обычную форму
-ответа. Управление masking, раскрытие, receipts и внутренние history ID не
-являются частью agent payload. Исходные значения не должны попадать в логи,
-ошибки, preview или маскированную history; раскрытие допускается только
-аутентифицированному человеку и не сохраняется обратно в history. Полный
-административный доступ агента к инфраструктуре всё равно разрушает эту
-границу — сервис не заявляет абсолютную изоляцию от такого доступа.
+Сервис не самодостаточен: managed-поток проходит через
+[v8-session-manager](https://github.com/1c-neurofish/v8-session-manager), а
+граница данных и внутренние feed-инструменты живут в расширении 1С
+[1c-mcp-tools](https://github.com/SteelMorgan/1c-mcp-tools).
 
-Фактический прототип принимает internal-вызовы только через Unix socket и
-human HTTP-вызовы через отдельный TCP listener. TLS в бинарник не встроен:
-human listener предназначен для localhost или доверенного HTTPS reverse proxy.
-Эта документация описывает текущий код, но не выдаёт его за production-ready
-развёртывание.
+### v8-session-manager — шлюз
 
-## Текущий статус
+- На каждый managed-вызов агента (`masking.managed_tools`) вызывает сервис:
+  `preflight` → tool.call в 1С → `finalize` по UDS `masking.socket_path`
+  (service.sock); идемпотентные терминальные события — `terminal`.
+- Поднимает UDS-listener `masking.internal_listen_path` (manager.sock) с
+  единственным маршрутом `POST /internal/v1/tools/call`
+  `{database_id, name, arguments}` — через него сервис загружает метаданные и
+  словарь. Доступ ограничен peer UID `masking.service_expected_uid`.
+- Скрывает internal-инструменты от агента: имена из `masking.internal_tools`
+  не попадают в `tools/list`, `tools/call` от агента отклоняется.
+- Сопоставляет сессию с базой сервиса по имени: `masking.identity_bindings`
+  (`session` → `database_id`, база = сервер+имя).
+- Отдельно проверяет conversation-assertions агента (ключи `broker_*`) — на
+  стороне сервиса криптографии агента нет.
 
-- Реализованы internal `preflight`/`finalize`, pull-загрузка
-  metadata/dictionary через internal tools менеджера по Unix socket,
-  автоматическая masked history, online human reveal и SQLite-backed policy,
-  database/tool/dictionary configuration.
-- Есть локальная human authentication с ровно двумя ролями `Admin` и `Viewer`,
-  Argon2id password hashes, activation capabilities, revocable sessions,
-  CSRF и Origin checks. Обе роли могут сменить собственный пароль с проверкой
-  текущего; успешная смена отзывает остальные сеансы и ротирует текущий.
-- Не реализованы в этом репозитории 1С-адаптер/manager, production reverse
-  proxy, systemd unit, backup/rotation policy и production deployment
-automation. DEV container packaging поставляется в `Dockerfile` и
-`compose.dev.yml`, но наличие internal API или DEV image само по себе не
-доказывает production-подключение к GBIG PAM.
+### 1c-mcp-tools — расширение 1С
 
-DEV Compose использует постоянное имя проекта `onec-masking-service-dev` и
-внешний volume `onec-masking-service-dev-state`. Перед первым запуском создайте
-volume командой `docker volume create onec-masking-service-dev-state`, затем
-запускайте `docker compose -f compose.dev.yml up -d --build`. `down` не удаляет
-данные; номер задачи в имени контейнера не используется.
-Прежний DEV volume `onec-masking-service-dev-data` исключён из Compose после
-инцидента с alias и остаётся отдельно для контролируемого разбора; автоматически
-его не монтируйте, не переносите из него историю и не удаляйте.
-- Provenance граница сохраняется: ROCTUP `copied`/`adapted` units находятся в
-  отдельном 1С-расширении TASK-221; donor source files в Rust-сервис не
-  переносились. Trusted gateway остаётся только `concept`.
+- ROCTUP-инструменты с границей данных: секреты вырезаются **всегда**
+  (без флагов), ответ — конверт
+  `{schema_version:1, result:<бизнес-JSON>, field_sources:{schema, lineage}}`,
+  сериализованный в `content[0].text`.
+- Внутренние инструменты `mcp_internal_masking_metadata_feed` и
+  `mcp_internal_masking_dictionary_feed`: аргументы `{selector, cursor}`,
+  страница `{success, metadata | dictionary_values, next_cursor, final_chunk}`.
 
-## Локальная сборка и запуск
+### Транспорт 1С ↔ менеджер
 
-Нужны Rust stable с Cargo и Unix-подобная ОС: runtime использует Unix sockets,
-peer credentials и Unix file permissions. SQLite поставляется через bundled
-feature `rusqlite`, отдельный системный SQLite для сборки не требуется.
+wt-mcp-adapter + web-transport-addin используются как есть; сервис от них
+напрямую не зависит.
 
-Из каталога репозитория:
+## Поток данных
+
+**Вызов агента:**
+
+```
+агент → manager /mcp
+      → POST service.sock /internal/v1/calls/preflight   (разрешение MASK-токенов в аргументах)
+      → 1С tool.call → граница вырезает секреты ([SECRET_REMOVED])
+      → конверт {schema_version:1, result, field_sources{schema,lineage}}
+      → POST service.sock /internal/v1/calls/finalize    (маскирование, запись masked history)
+      → агент получает замаскированный result в content[0].text
+```
+
+Недоступность сервиса или отказ границы — fail-closed: агенту возвращается
+нейтральная ошибка, сырые данные наружу не выходят.
+
+**Загрузка метаданных/словаря (pull, инициирует сервис):**
+
+```
+pull worker (тик MASKING_PULL_INTERVAL_SECONDS) → durable-очередь v2_refresh_intents
+→ POST manager.sock /internal/v1/tools/call {database_id, name, arguments:{selector,cursor}}
+→ 1С internal feed → страницы до final_chunk
+→ PolicySnapshot + строка cache_generations → атомарная замена RAM-снапшота → intent снят
+```
+
+Снапшот публикуется только после полного успешного прогона; при сбое остаётся
+прежний активный. `cache_generations` — журнал прогонов (version, digest,
+счётчики), `v2_refresh_intents` — durable-очередь «нужен refresh» (старое имя
+таблицы сохранено). На старте сервис ставит intent на каждую enabled-базу,
+Admin-мутации добавляют свои.
+
+## Internal API (UDS `MASKING_SOCKET_PATH`)
+
+Не публикуется TCP, не для браузера; каждый peer проверяется по UID
+(`MASKING_MANAGER_UID`). Лимит JSON body — `MASKING_MAX_BODY_BYTES`
+(8 МиБ по умолчанию).
+
+- `POST /internal/v1/calls/preflight` — readiness базы/инструмента, резолв
+  ранее выданных mask-токенов в аргументах;
+- `POST /internal/v1/calls/finalize` — `outcome`:
+  `{kind:"tool_result", result:<Value>}` (непрозрачный бизнес-JSON; сервис
+  маскирует его и сам оборачивает в публичную форму
+  `{content:[{type:"text",text}], is_error}`) или
+  `{kind:"transport_error", error}` (нейтральный sanitized-ответ);
+  опциональный `field_sources` для маскирования по source_path;
+- `POST /internal/v1/calls/terminal` — идемпотентный ledger терминальных
+  событий (`scope.kind`: `verified`/`unverified`);
+- `GET /internal/v1/health/live`, `GET /internal/v1/health/ready?database_id=`.
+
+Неизвестная база создаётся в режиме `unconfigured` (`ACTION_REQUIRED`);
+неизвестный инструмент — `deny-pending-review`. Стартовая классификация
+(сидится при открытии БД): `data-mask` — `execute_query`,
+`find_references_to_object`, `get_object_by_link`; `metadata-bypass` —
+`get_metadata`, `get_access_rights`, `get_link_of_object`.
+
+## Конфигурация (ENV)
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `MASKING_DATABASE_PATH` | `/var/lib/1c-masking/service.sqlite3` | SQLite (WAL, foreign keys, mode `0600`) |
+| `MASKING_SOCKET_PATH` | `/run/1c-masking/service.sock` | internal API, mode `0660` |
+| `MASKING_CONTROL_SOCKET_PATH` | `/run/1c-masking/control.sock` | bootstrap первого Admin, mode `0600` |
+| `MASKING_HUMAN_BIND` | `127.0.0.1:8787` | TCP listener human API/UI |
+| `MASKING_EXPECTED_ORIGIN` | обязательна | точный Origin human API (буквальное сравнение) |
+| `MASKING_MANAGER_UID` | euid процесса | ожидаемый peer UID на `service.sock` и при подключении к `manager.sock` |
+| `MASKING_MANAGER_SOCKET_PATH` | обязательна | UDS-listener менеджера (`POST /internal/v1/tools/call`) — путь pull worker-а |
+| `MASKING_PULL_INTERVAL_SECONDS` | `10` (1–300) | период тика pull worker; за тик до 10 intents |
+| `MASKING_MANAGER_CALL_TIMEOUT_SECONDS` | `30` (1–120) | дедлайн одного tool.call к менеджеру |
+| `MASKING_MAX_BODY_BYTES` | `8388608` (1 КиБ–64 МиБ) | лимит JSON body internal API |
+| `MASKING_PREFLIGHT_TIMEOUT_SECONDS` | `3` (1–60) | дедлайн preflight |
+| `MASKING_FINALIZE_TIMEOUT_SECONDS` | `15` (1–300) | дедлайн finalize |
+| `MASKING_MAX_IN_FLIGHT` | `80` (1–10000) | admission-семафор finalize |
+| `MASKING_WORKERS` | `16` (1–1000) | пул worker-ов finalize |
+| `MASKING_PER_DATABASE_WORKERS` | `4` (1–100) | concurrent workers на базу |
+| `MASKING_MAX_DEPTH` | `64` (8–128) | глубина обхода JSON |
+| `MASKING_MAX_CELLS` | `200000` (1000–1e6) | строковых значений на вызов |
+| `MASKING_MAX_ROWS` | `10000` (100–100000) | строк таблицы на вызов |
+| `MASKING_MAX_TEXT_BYTES` | `2097152` (1 КиБ–8 МиБ) | размер одного текстового значения |
+| `MASKING_ENGINE_TIMEOUT_MS` | `10000` (100–300000) | дедлайн движка маскирования |
+| `RUST_LOG` | `info` | фильтр `tracing`, compact без timestamp |
+
+Родительские каталоги сокетов и БД создаются процессом. Если
+`MASKING_MANAGER_UID` не задан, gate доверяет UID самого сервиса — это не
+замена отдельному service account.
+
+## Сборка и запуск
+
+Нужны Rust stable + Cargo и Unix-подобная ОС (UDS, peer credentials, file
+permissions). SQLite идёт через bundled `rusqlite`.
 
 ```sh
 cargo fmt --check
@@ -70,175 +146,100 @@ cargo build --release
 cargo test --all-targets
 ```
 
-Бинарник после успешной сборки — `target/release/masking-service`. При первом
-старте SQLite migration применяется автоматически, создаётся локальный
-пользователь `Admin` с ролью `Admin` и unset password. Такой пользователь не
-может войти до bootstrap.
+Бинарник — `target/release/masking-service`. Миграции применяются при старте;
+создаётся пользователь `Admin` без пароля — войти нельзя до bootstrap.
 
-Для разработки без прав на системные `/var/lib` и `/run` задайте локальные
-пути. Human listener всё равно следует публиковать через HTTPS reverse proxy:
+DEV-запуск — через `Dockerfile` + `compose.dev.yml` (проект
+`onec-masking-service-dev`, внешние volumes `onec-masking-service-dev-state`
+и shared `agent-work-sandbox-1c` с `/run/1c-masking`):
 
 ```sh
-mkdir -p .local/data .local/run
-export MASKING_DATABASE_PATH="$PWD/.local/data/service.sqlite3"
-export MASKING_SOCKET_PATH="$PWD/.local/run/service.sock"
+docker volume create onec-masking-service-dev-state
+docker compose -f compose.dev.yml up -d --build
+```
+
+`down` данных не удаляет. Локально (без прав на `/var/lib`, `/run`) — свои
+пути через ENV, затем bootstrap первого Admin в интерактивном TTY:
+
+```sh
 export MASKING_CONTROL_SOCKET_PATH="$PWD/.local/run/control.sock"
-export MASKING_HUMAN_BIND="127.0.0.1:8787"
-export MASKING_EXPECTED_ORIGIN="https://masking.local"
-export MASKING_MANAGER_SOCKET_PATH="$PWD/.local/run/manager.sock"
-export RUST_LOG=info
-cargo run
+cargo run -- admin bootstrap        # пароль 12–1024, спрашивается дважды
 ```
 
-`MASKING_EXPECTED_ORIGIN` сравнивается с заголовком `Origin` буквально.
-Значение должно совпадать с публичным HTTPS origin reverse proxy; trailing
-slash и другой порт меняют строку и будут отклонены. Прямой HTTP-доступ из
-браузера не является рабочей human-схемой: session cookie имеет `Secure`.
-
-В отдельном интерактивном TTY, пока сервер запущен, установите пароль первого
-Admin через mode-0600 control socket:
-
-```sh
-MASKING_CONTROL_SOCKET_PATH="$PWD/.local/run/control.sock" \
-  cargo run -- admin bootstrap
-```
-
-Команда запрашивает пароль дважды, принимает 12–1024 символа и не принимает
-неинтерактивный stdin/stderr. Bootstrap не имеет HTTP route, хранит только
-Argon2id hash и после успеха необратимо закрывается. Для release binary
-используется та же команда с `./target/release/masking-service`.
-
-## Runtime configuration
-
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `MASKING_DATABASE_PATH` | `/var/lib/1c-masking/service.sqlite3` | SQLite database; при открытии включаются WAL и foreign keys, файл переводится в mode `0600` |
-| `MASKING_SOCKET_PATH` | `/run/1c-masking/service.sock` | internal manager API; после bind mode `0660` |
-| `MASKING_CONTROL_SOCKET_PATH` | `/run/1c-masking/control.sock` | только первый Admin bootstrap; mode `0600` |
-| `MASKING_HUMAN_BIND` | `127.0.0.1:8787` | plain TCP listener для human reverse proxy |
-| `MASKING_EXPECTED_ORIGIN` | обязательна | точный публичный origin human API; пустое значение отклоняется |
-| `MASKING_MANAGER_UID` | effective UID процесса | ожидаемый Unix peer UID для internal API; задайте UID доверенного manager явно |
-| `MASKING_MANAGER_SOCKET_PATH` | обязательна | UDS internal listener менеджера (`POST /internal/v1/tools/call`); pull worker загружает через него metadata/dictionary |
-| `MASKING_PULL_INTERVAL_SECONDS` | `10` | период тика pull worker (1–300); durable refresh intents обрабатываются каждый тик |
-| `MASKING_MANAGER_CALL_TIMEOUT_SECONDS` | `30` | дедлайн одного internal tool.call к менеджеру (1–120) |
-| `RUST_LOG` | `info` | фильтр `tracing`; формат compact без timestamp |
-
-Родительские каталоги создаются самим процессом. Системные defaults требуют
-подходящих прав; для локального запуска используйте writable paths, как в
-примере выше. Если `MASKING_MANAGER_UID` не задан, socket gate доверяет UID,
-под которым запущен сервис, поэтому это не замена отдельному service account и
-изоляции ОС.
-
-## Internal API и поток данных
-
-Internal API не публикуется TCP listener-ом и не предназначен для браузера:
-
-- `POST /internal/v1/calls/preflight` — проверка database/tool readiness и
-  разрешение ранее выданных mask tokens в аргументах;
-- `POST /internal/v1/calls/finalize` — обработка tool result или transport error,
-  возврат того же public result contract и automatic masked history;
-- `GET /internal/v1/health/live` и `GET /internal/v1/health/ready` — liveness и
-  database-specific readiness;
-- `POST /internal/v1/calls/terminal` — idempotent terminal event ledger.
-
-Metadata и dictionary сервис загружает сам (pull-модель TASK-222): durable
-refresh intents (`v2_refresh_intents`) дрейнит pull worker, вызывая
-`mcp_internal_masking_metadata_feed` и `mcp_internal_masking_dictionary_feed`
-на `MASKING_MANAGER_SOCKET_PATH`. Страницы собираются по opaque cursor до
-`final_chunk`; snapshot публикуется атомарно только после полного успешного
-прогона, при сбое остаётся прежний активный snapshot. Успешный прогон
-журналируется в `cache_generations`.
-
-JSON body limit internal API — 8 MiB. При заданном `MASKING_MANAGER_UID`
-каждый Unix peer проверяется до маршрута. Неизвестный database identity
-создаётся в режиме `unconfigured` и получает `ACTION_REQUIRED`; неизвестный
-tool получает `deny-pending-review`. Шесть начальных классификаций:
-
-- `data-mask`: `execute_query`, `find_references_to_object`,
-  `get_object_by_link`;
-- `metadata-bypass`: `get_metadata`, `get_access_rights`, `get_link_of_object`;
-- любой неизвестный tool — `deny-pending-review` до явной проверки Admin.
-
-Для enabled `data-mask` базы preflight/finalize требуют `policy.ready`; после
-появления active cache generation readiness зависит от загруженного snapshot.
-`disabled` и metadata-bypass режимы не отменяют secret cut. Transport errors
-превращаются в нейтральный sanitized error; raw errors, raw preview и binary/
-HTML/script/formatter result формы не принимаются.
+Bootstrap работает только через control socket; HTTP route у него нет,
+после успеха он необратимо закрывается. Human listener рассчитан на localhost
+или HTTPS reverse proxy: session cookie — `Secure`, поэтому прямой HTTP из
+браузера не является рабочей схемой.
 
 ## Human UI и API
 
-Контракт подробно описан в [web/API.md](web/API.md). UI доступен маршрутами
-`/`, `/viewer`, `/admin`, `/activate/{token}`; статические `human.js` и
-`human.css` отдаются самим сервисом.
+Контракт — [web/API.md](web/API.md). UI: `/`, `/viewer`, `/admin`,
+`/activate/{token}`; статика `human.js`/`human.css` отдаётся сервисом.
+Аутентификация локальная: ровно две роли `Admin`/`Viewer`, Argon2id,
+activation-токены (15 минут), отзываемые сессии (30 мин idle / 8 ч absolute),
+CSRF + точный Origin, cookie `__Host-mask_session` (Secure, HttpOnly,
+SameSite=Strict). Login/bootstrap rate limit — 5/мин и 20/час на ключ.
 
-Viewer видит базы → чаты → последние 30–50 masked reports и может отдельно
-запросить online reveal конкретного history ID. Reveal требует роль `Viewer`,
-точный database/chat scope, выдаёт только neutral report v1 (`text`/`table`),
-отдаётся с `Cache-Control: no-store` и не записывается обратно. `Admin` reveal
-не разрешён автоматически.
+- `Viewer`: базы → чаты → последние 30–50 masked reports; online reveal
+  конкретного history ID в своём database/chat scope — neutral report v1
+  (`text`/`table`), `Cache-Control: no-store`, не записывается обратно,
+  аудируется. `Admin` reveal не получает.
+- `Admin`: пользователи, режим базы и оба TTL, refresh, классификация
+  инструментов, dictionary selectors (до 100, только configuration с
+  `filter_ast` — не raw values), immutable policy versions.
 
-Admin управляет пользователями, режимом базы и обоими TTL, refresh, tool
-classification, dictionary selectors и immutable policy versions. Dictionary API
-сохраняет только configuration (до 100 selectors и ограниченный filter AST), а
-не raw dictionary values. Одноразовый activation token нового пользователя
-живёт 15 минут и возвращается в ответе создания пользователя; его нельзя
-логировать или передавать через agent API.
+Mapping токенов живёт только в RAM: scope = database+chat, reverse key —
+HMAC-SHA-256 с process-local ключом. Рестарт сохраняет masked history, но
+reveal старых токенов становится недоступным; pull worker заново поднимает
+снапшоты enabled-баз через менеджер.
 
-На страницах обеих ролей есть форма смены собственного пароля. Новый пароль
-должен содержать 12–1024 символа и отличаться от текущего. Пароли не выводятся
-в UI и не включаются в audit; после успеха браузер получает новую session cookie
-и CSRF token, а все ранее выданные сеансы этого пользователя становятся
-недействительными.
+## Лимиты обработки
 
-## Реализованные privacy/processing limits
+- Превышение любого лимита — fail-closed (ошибка, а не частичный результат).
+- Mapping: до 100 000 записей всего, 20 000 на базу, 10 000 на чат; до
+  10 000 кандидатов маскирования на вызов. Maintenance-тик каждые 300 с:
+  до 2 000 mapping, 500 history, 500 unscoped terminal, 500 audit записей.
+  TTL mapping и history задаются на базу (по умолчанию 86 400 с).
+- Pull: до 10 000 страниц на поток, до 1 000 000 значений словаря / 1 ГиБ,
+  до 100 source paths и 100 selectors, cursor ≤ 1 МиБ, значение ≤ 2 МиБ.
+- Движок не делает NER/морфологию: FIO — по именам полей, source-literals из
+  `field_sources` и ограниченному regex (`Фамилия Имя [Отчество]`), словарь —
+  по точным строкам. Склонения, опечатки и перестановки не гарантируются —
+  администратор задаёт явные правила под фактические данные.
+- Значение `[SECRET_REMOVED]`, пришедшее от 1С, сохраняется как есть;
+  `cut_secrets` в сервисе — defence-in-depth поверх 1С-границы (имена полей,
+  secret-паттерны, `Secret`-правила, `password_mode` source paths).
 
-- Mapping хранится только в RAM процесса; token scope связан с database и chat,
-  reverse key — HMAC-SHA-256 с process-local key. Перезапуск оставляет masked
-  history, но делает reveal старых tokens недоступным.
-- Mapping TTL и history retention независимы; defaults обоих — 86 400 секунд.
-  Cleanup запускается каждые 300 секунд; один tick ограничен 2 000 mapping,
-  500 history и 500 audit rows.
-- Секреты режутся необратимо до обратимого tokenization: чувствительные имена
-  (`password`, token/key/authorization и русские варианты) и известные secret
-  value patterns получают `[SECRET_REMOVED]`. FIO, field/name/type/source-path,
-  dictionary и regex detectors применяются рекурсивно.
-- Сервис не реализует NER или морфологический анализ. FIO detector основан на
-  именах полей и ограниченном regex, dictionary detector — на точных известных
-  строках. Склонения, опечатки, перестановки частей имени и все возможные
-  свободнотекстовые варианты не гарантируются; администратор должен задавать
-  явные source/name/type/dictionary/regex rules для фактических данных базы.
-- Bounded engine: depth 64, до 200 000 string values, до 2 MiB на text value,
-  до 10 000 mask candidates/call; mapping capacity — 100 000 service, 20 000
-  database и 10 000 chat entries. Exceeding a limit fails closed.
-- Finalize ограничен admission 80, worker pool 16 и четырьмя concurrent workers
-  на database. Login/bootstrap rate limit — 5 попыток/минуту и 20/час на key;
-  human session — 30 минут idle и 8 часов absolute TTL.
+## Миграции
 
-## Ограничения и статус проверки
+`migrations/0001`–`0008`, применяются автоматически при старте:
 
-Это WIP-реализация для локальной DEV-проверки, а не production release. В частности:
+| Миграция | Содержимое |
+|---|---|
+| `0001_core` | schema_migrations, databases, policies, policy_rules, tool_classifications, dictionary_configs, cache_generations, history, audit_events, users, activation_capabilities, sessions, service_state |
+| `0002_terminal_history` | `unscoped_terminal_events` |
+| `0003`–`0006` | таблицы отменённого feed/lease-протокола (v2 receipts/snapshots/leases) — исторические |
+| `0007_v2_refresh_intents` | durable-очередь refresh + `cache_generations.selectors_json` — используется pull worker-ом |
+| `0008_drop_v2_feed` | `DROP` feed_jobs и v2-таблиц 0003–0006 |
 
-- TLS, reverse-proxy hardening, OS service account, backup/restore, SQLite
-  encryption, monitoring and log retention deployment не поставляются;
-- service trusts the manager boundary and supplied stable `database_id`; local
-  peer UID gate не заменяет 1С business authorization или audited production
-  identity binding;
-- raw non-secret result может кратковременно находиться в bounded process-local
-  retry cache для `disabled`/bypass projection, но не записывается в history;
-- mapping, RAM policy snapshot/manifest и retry cache теряются при restart —
-  startup pull intents заново загружают enabled-базы через менеджер;
-- 1С extension, manager route closure, production direct-route inventory и
-  live manager+1С E2E в рамках этого репозитория не проверялись.
+## Тесты и статус
 
-На снимке 23.09.2026 `cargo fmt --check` проходит, `cargo test --all-targets`
-проходит (33/33), `cargo build --release` проходит. DEV-only runtime smoke для
-bootstrap, feed и finalize также пройден. Это проверка локального service-only
-пути; она не является доказательством live manager+1С E2E или production
-deployment.
+`cargo test --all-targets` — интеграционные файлы `tests/` (core service,
+internal API, mapping, human auth) плюс unit-тесты. `cargo fmt --check` и
+`cargo build --release` — обязательные gate-ы.
+
+Проверено: локальный service-only путь и DEV E2E с менеджером и 1С (pull
+словаря через `manager.sock`, маскирование ФИО, fail-closed при остановке,
+Viewer reveal, фильтры словаря `part`/`filter_ast`).
+
+Не поставляется: TLS в бинарнике, reverse proxy, systemd unit, OS service
+account, backup/rotation, SQLite-шифрование, мониторинг. Сервис доверяет
+границе менеджера и `database_id` из его конфигурации; peer-UID gate не
+заменяет бизнес-авторизацию 1С. Production deployment не заявляется.
 
 ## Благодарности/Происхождение
 
-Подробный поединичный реестр находится в [THIRD_PARTY.md](THIRD_PARTY.md).
+Подробный поединичный реестр — [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ### ROCTUP/1c-mcp-toolkit
 
@@ -271,8 +272,7 @@ policy, forced field names, contextual regex, masked-column UX и идентиф
 Для границы между 1С-переносом и новым сервисом следует сверять:
 
 - спецификацию TASK-221 `tasks/221-roctup-mcp-tools-port/masking-service-spec.md`, §8 и MUST-28/29/34, в рабочем checkout GBIG PAM;
-- evidence TASK-221 `copy-provenance.md` и `.context/copy-provenance.md` в
-  рабочем репозитории GBIG PAM;
+- документы provenance TASK-221 `copy-provenance.md` и `.context/copy-provenance.md` в рабочем репозитории GBIG PAM;
 - этот реестр, где для каждого донора отдельно указаны `copied`, `adapted` и
   `concept`.
 
