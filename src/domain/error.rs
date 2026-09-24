@@ -25,6 +25,7 @@ pub enum ErrorCode {
     HistoryUnavailable,
     MappingUnavailable,
     TerminalAlreadyRecorded,
+    CallConflict,
 }
 
 impl ErrorCode {
@@ -42,6 +43,7 @@ impl ErrorCode {
             Self::HistoryUnavailable => "HISTORY_UNAVAILABLE",
             Self::MappingUnavailable => "MAPPING_UNAVAILABLE",
             Self::TerminalAlreadyRecorded => "TERMINAL_ALREADY_RECORDED",
+            Self::CallConflict => "CALL_CONFLICT",
         }
     }
 }
@@ -60,6 +62,7 @@ impl ServiceError {
             ErrorCode::ActionRequired
             | ErrorCode::ToolPendingReview
             | ErrorCode::MaskTokenInvalid
+            | ErrorCode::CallConflict
             | ErrorCode::TerminalAlreadyRecorded => (StatusCode::CONFLICT, false),
             ErrorCode::DatabaseIdentityUnverified => (StatusCode::BAD_REQUEST, false),
             ErrorCode::PolicyInvalid => (StatusCode::UNPROCESSABLE_ENTITY, false),

@@ -19,6 +19,11 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 hmac = "0.12"
 http = "1"
+# UDS HTTP/1 клиент к v8-session-manager (POST /internal/v1/tools/call).
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 rand = "0.8"
 regex = "1"

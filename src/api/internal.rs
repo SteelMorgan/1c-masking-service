@@ -4,7 +4,7 @@ use axum::{
     extract::{
         connect_info::{ConnectInfo, Connected},
         rejection::JsonRejection,
-        DefaultBodyLimit, Path, Query, Request, State,
+        DefaultBodyLimit, Query, Request, State,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,9 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        FeedActivateRequest, FeedChunkRequest, FeedFailRequest, FinalizeRequest, FinalizeResponse,
-        PreflightRequest, PreflightResponse, ServiceError, TerminalEventRequest,
-        TerminalEventResponse,
+        FinalizeRequest, FinalizeResponse, PreflightRequest, PreflightResponse, ServiceError,
+        TerminalEventRequest, TerminalEventResponse,
     },
     AppState,
 };
@@ -33,16 +32,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/calls/terminal", post(terminal))
         .route("/internal/v1/health/live", get(live))
         .route("/internal/v1/health/ready", get(ready))
-        .route("/internal/v1/feed/jobs", get(feed_jobs))
-        .route(
-            "/internal/v1/feed/jobs/{job_id}/chunks/{index}",
-            post(feed_chunk),
-        )
-        .route(
-            "/internal/v1/feed/jobs/{job_id}/activate",
-            post(feed_activate),
-        )
-        .route("/internal/v1/feed/jobs/{job_id}/fail", post(feed_fail))
         .layer(DefaultBodyLimit::max(bounded_env_usize(
             "MASKING_MAX_BODY_BYTES",
             8 * 1024 * 1024,
@@ -75,62 +64,16 @@ impl Connected<axum::serve::IncomingStream<'_, UnixListener>> for UdsConnectInfo
 
 async fn peer_uid_gate(
     State(expected): State<Option<u32>>,
-    ConnectInfo(peer): ConnectInfo<UdsConnectInfo>,
     request: Request,
     next: Next,
 ) -> Response {
+    let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<UdsConnectInfo>>() else {
+        return ServiceError::unauthorized(Uuid::nil()).into_response();
+    };
     if expected.is_some_and(|uid| peer.uid != Some(uid)) {
         return ServiceError::unauthorized(Uuid::nil()).into_response();
     }
     next.run(request).await
-}
-
-#[derive(Deserialize)]
-struct FeedJobsQuery {
-    limit: Option<usize>,
-}
-
-async fn feed_jobs(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<FeedJobsQuery>,
-) -> Result<Json<Value>, ServiceError> {
-    let jobs = state
-        .masking
-        .pending_feed_jobs(query.limit.unwrap_or(10), Uuid::new_v4())
-        .await?;
-    Ok(Json(json!({"schema_version":1,"jobs":jobs})))
-}
-
-async fn feed_chunk(
-    State(state): State<Arc<AppState>>,
-    Path((job_id, index)): Path<(Uuid, u32)>,
-    payload: Result<Json<FeedChunkRequest>, JsonRejection>,
-) -> Result<Json<Value>, ServiceError> {
-    let Json(request) = bounded_json(payload)?;
-    let accepted = state.masking.upload_feed_chunk(job_id, index, request)?;
-    Ok(Json(json!({"schema_version":1,"accepted_index":accepted})))
-}
-
-async fn feed_activate(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<Uuid>,
-    payload: Result<Json<FeedActivateRequest>, JsonRejection>,
-) -> Result<Json<Value>, ServiceError> {
-    let Json(request) = bounded_json(payload)?;
-    let version = state.masking.activate_feed(job_id, request).await?;
-    Ok(Json(
-        json!({"schema_version":1,"cache_version":version,"status":"active"}),
-    ))
-}
-
-async fn feed_fail(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<Uuid>,
-    payload: Result<Json<FeedFailRequest>, JsonRejection>,
-) -> Result<Json<Value>, ServiceError> {
-    let Json(request) = bounded_json(payload)?;
-    state.masking.fail_feed(job_id, request)?;
-    Ok(Json(json!({"schema_version":1,"status":"failed"})))
 }
 
 async fn preflight(

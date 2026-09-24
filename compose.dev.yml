@@ -20,6 +20,9 @@ services:
       MASKING_CONTROL_SOCKET_PATH: /run/1c-masking/control.sock
       MASKING_HUMAN_BIND: 0.0.0.0:8787
       MASKING_MANAGER_UID: "1000"
+      # TASK-222: internal listener менеджера (service → manager tool.call)
+      # на общем shared-runtime volume.
+      MASKING_MANAGER_SOCKET_PATH: /run/1c-masking/manager.sock
       RUST_LOG: "${MASKING_RUST_LOG:-info}"
     ports:
       - "127.0.0.1:${MASKING_HUMAN_PORT:-18787}:8787"

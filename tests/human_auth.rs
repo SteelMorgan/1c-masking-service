@@ -632,7 +632,7 @@ async fn admin_configuration_is_typed_validated_and_audited() {
 }
 
 #[tokio::test]
-async fn activating_policy_before_first_feed_does_not_make_enabled_database_ready() {
+async fn activating_policy_before_first_pull_does_not_make_enabled_database_ready() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
@@ -676,7 +676,7 @@ async fn activating_policy_before_first_feed_does_not_make_enabled_database_read
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             database_id,
-            chat_id: "policy-before-feed".to_owned(),
+            chat_id: "policy-before-pull".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: serde_json::json!({"query":"SELECT 1"}),
         })

@@ -122,15 +122,19 @@ pub enum FinalizeOutcome {
     TransportError { error: Value },
 }
 
+//++agent TASK-222 [05.10.2026]
+// Конверт P1 (contract.md): 1С отдаёт ровно {schema_version, result,
+// field_sources}; `secret_cut_applied` и прочего `evidence` нет и не
+// проверяется. `field_sources` — только сведения о происхождении полей,
+// нужные сервису для маскирования по source_path.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct MaskingEvidence {
+pub struct FieldSources {
     #[serde(default)]
     pub schema: Value,
     #[serde(default)]
     pub lineage: Vec<Value>,
-    #[serde(default)]
-    pub degraded_reasons: Vec<String>,
 }
+//++agent TASK-222
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,7 +147,7 @@ pub struct FinalizeRequest {
     pub tool_name: String,
     pub outcome: FinalizeOutcome,
     #[serde(default)]
-    pub evidence: MaskingEvidence,
+    pub field_sources: FieldSources,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -173,17 +177,6 @@ pub struct HistoryForReveal {
     pub mapping_batch_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct FeedJob {
-    pub job_id: Uuid,
-    pub database_id: Uuid,
-    pub target_version: u64,
-    pub max_chunk_bytes: usize,
-    pub metadata_selector: Value,
-    pub dictionary_selectors: Vec<Value>,
-    pub hard_limits: Value,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeedMetadataItem {
@@ -201,43 +194,14 @@ pub struct FeedDictionaryValue {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedPayload {
-    #[serde(default)]
-    pub selection_id: Option<Uuid>,
-    pub page_index: u32,
-    #[serde(default)]
-    pub metadata: Vec<FeedMetadataItem>,
-    #[serde(default)]
-    pub dictionary_values: Vec<FeedDictionaryValue>,
-    pub final_chunk: bool,
+//++agent TASK-222 [05.10.2026]
+/// Строка durable-очереди pull refresh (`v2_refresh_intents`, фаза всегда
+/// 'full' — читаемые legacy-значения фазы игнорируются).
+#[derive(Debug, Clone)]
+pub struct RefreshIntent {
+    pub database_id: Uuid,
+    pub reason: Option<String>,
+    pub actor_id: Option<Uuid>,
+    pub created_at: String,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedChunkRequest {
-    pub schema_version: u32,
-    pub correlation_id: Uuid,
-    pub chunk_digest: String,
-    pub payload: FeedPayload,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedActivateRequest {
-    pub schema_version: u32,
-    pub correlation_id: Uuid,
-    pub expected_chunks: u32,
-    pub expected_metadata_count: u64,
-    pub expected_dictionary_count: u64,
-    pub aggregate_digest: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedFailRequest {
-    pub schema_version: u32,
-    pub correlation_id: Uuid,
-    pub reason_code: String,
-}
+//++agent TASK-222

@@ -1,15 +1,23 @@
-use std::{collections::HashMap, sync::Arc};
+mod common;
+
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use onec_masking_service::{
     domain::{
-        DatabaseMode, ErrorCode, FinalizeOutcome, FinalizeRequest, MaskingEvidence, PolicyRule,
+        DatabaseMode, ErrorCode, FieldSources, FinalizeOutcome, FinalizeRequest, PolicyRule,
         PolicySnapshot, PreflightRequest, RuleAction, RuleSelector, SCHEMA_VERSION,
     },
+    manager_client::ManagerClient,
     AppState, SqliteStorage,
 };
-use serde_json::json;
-use sha2::{Digest, Sha256};
+use serde_json::{json, Value};
 use uuid::Uuid;
+
+use common::{
+    dictionary_page, dictionary_value, empty_feed_responder, enqueue_refresh_intent, failed_page,
+    metadata_item, metadata_page, pending_intent_count, pull_empty_cache, FakeManager,
+    DICTIONARY_TOOL, METADATA_TOOL,
+};
 
 fn request_ids() -> (Uuid, Uuid, Uuid) {
     (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
@@ -22,127 +30,9 @@ async fn configured_state(mode: DatabaseMode) -> (Arc<AppState>, Uuid) {
     storage.ensure_database(database_id).unwrap();
     assert!(storage.set_database_mode(database_id, mode).unwrap());
     if mode == DatabaseMode::Enabled {
-        activate_empty_test_cache(&state, database_id).await;
+        pull_empty_cache(&state, database_id).await;
     }
     (state, database_id)
-}
-
-async fn activate_empty_test_cache(state: &AppState, database_id: Uuid) {
-    let job_id = state.storage.enqueue_feed_job(database_id, 1).unwrap();
-    let job = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|job| job.job_id == job_id)
-        .unwrap();
-    let payload = onec_masking_service::domain::FeedPayload {
-        selection_id: None,
-        page_index: 0,
-        metadata: Vec::new(),
-        dictionary_values: Vec::new(),
-        final_chunk: true,
-    };
-    let digest = digest_payload(&serde_json::to_value(&payload).unwrap());
-    state
-        .masking
-        .upload_feed_chunk(
-            job.job_id,
-            0,
-            onec_masking_service::domain::FeedChunkRequest {
-                schema_version: SCHEMA_VERSION,
-                correlation_id: Uuid::new_v4(),
-                chunk_digest: hex(&digest),
-                payload,
-            },
-        )
-        .unwrap();
-    let aggregate: [u8; 32] = Sha256::digest(digest).into();
-    state
-        .masking
-        .activate_feed(
-            job.job_id,
-            onec_masking_service::domain::FeedActivateRequest {
-                schema_version: SCHEMA_VERSION,
-                correlation_id: Uuid::new_v4(),
-                expected_chunks: 1,
-                expected_metadata_count: 0,
-                expected_dictionary_count: 0,
-                aggregate_digest: hex(&aggregate),
-            },
-        )
-        .await
-        .unwrap();
-    state
-        .storage
-        .with_connection(|connection| {
-            connection.execute(
-                "DELETE FROM feed_jobs WHERE id=?1",
-                [job.job_id.to_string()],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-}
-
-#[test]
-fn feed_activation_rejects_stale_state_without_replacing_active_generation() {
-    let storage = SqliteStorage::in_memory().unwrap();
-    let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
-
-    let first_job_id = storage.enqueue_feed_job(database_id, 1).unwrap();
-    let first_job = storage
-        .pending_feed_jobs(10)
-        .unwrap()
-        .into_iter()
-        .find(|job| job.job_id == first_job_id)
-        .unwrap();
-    assert!(storage.mark_feed_receiving(first_job_id).unwrap());
-    storage
-        .activate_feed_job(&first_job, "digest-v1", 3, 2)
-        .unwrap();
-
-    let stale_job_id = storage.enqueue_feed_job(database_id, 2).unwrap();
-    let stale_job = storage
-        .pending_feed_jobs(10)
-        .unwrap()
-        .into_iter()
-        .find(|job| job.job_id == stale_job_id)
-        .unwrap();
-    assert!(storage.mark_feed_receiving(stale_job_id).unwrap());
-    assert!(storage
-        .fail_feed_job(stale_job_id, "CANCELLED", Uuid::new_v4())
-        .unwrap());
-
-    assert!(storage
-        .activate_feed_job(&stale_job, "must-not-publish", 100, 100)
-        .is_err());
-    storage
-        .with_connection(|connection| {
-            let (active_version, stale_generations, stale_state): (i64, i64, String) = connection
-                .query_row(
-                "SELECT d.active_cache_version,
-                            (SELECT COUNT(*) FROM cache_generations
-                             WHERE database_id=d.id AND version=2),
-                            (SELECT state FROM feed_jobs WHERE id=?2)
-                     FROM databases d WHERE d.id=?1",
-                rusqlite::params![database_id.to_string(), stale_job_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            assert_eq!(active_version, 1);
-            assert_eq!(stale_generations, 0);
-            assert_eq!(stale_state, "failed");
-            let first_status: String = connection.query_row(
-                "SELECT status FROM cache_generations WHERE database_id=?1 AND version=1",
-                [database_id.to_string()],
-                |row| row.get(0),
-            )?;
-            assert_eq!(first_status, "active");
-            Ok(())
-        })
-        .unwrap();
 }
 
 #[test]
@@ -263,16 +153,18 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
+                // Контракт Р2: непрозрачный бизнес-result; сырое значение
+                // проверяется во всех копиях (data + произвольные поля).
+                // Колонки data-строк должны быть объявлены в field_sources —
+                // незадекларированная колонка закрывает выдачу (fail-closed).
                 result: json!({
-                    "content": [
-                        {"type":"text", "text":format!("Владелец: {raw_name}")},
-                        {"type":"json", "json":{"ФИО":raw_name,"password":raw_secret}}
-                    ],
-                    "structured_content":{"rows":[{"ФИО":raw_name,"api_key":raw_secret}]},
-                    "is_error":false
+                    "success": true,
+                    "data": [{"ФИО":raw_name,"api_key":raw_secret}],
+                    "note": format!("Владелец: {raw_name}"),
+                    "creds": {"password":raw_secret}
                 }),
             },
-            evidence: MaskingEvidence {
+            field_sources: FieldSources {
                 schema: json!({"columns":[
                     {"name":"ФИО","sources":["Справочник.People.FullName"]},
                     {"name":"api_key","sources":["Справочник.People.APIKey"]}
@@ -281,7 +173,6 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
                     json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
                     json!({"column":"api_key","source_path":"Справочник.People.APIKey"}),
                 ],
-                ..MaskingEvidence::default()
             },
         })
         .await
@@ -291,6 +182,21 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
     assert!(!public.contains(raw_secret));
     assert!(public.contains("[MASK:v1:FIO:"));
     assert!(public.contains("[SECRET_REMOVED]"));
+
+    // Контракт Р2: секрет вырезается и внутри строки data (api_key —
+    // объявленная колонка), и в произвольном объекте (password).
+    let masked: Value = serde_json::from_str(
+        response.public_result["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(masked["data"][0]["api_key"], "[SECRET_REMOVED]");
+    assert_eq!(masked["creds"]["password"], "[SECRET_REMOVED]");
+    assert!(masked["data"][0]["ФИО"]
+        .as_str()
+        .unwrap()
+        .starts_with("[MASK:v1:FIO:"));
 
     state.storage.with_connection(|connection| {
         let (stored_public, report): (String, String) = connection.query_row(
@@ -339,17 +245,14 @@ async fn canonical_api_key_alias_is_cut_from_every_copy_before_mapping() {
             chat_id: "synthetic-alias".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result: json!({
-                "content":[
-                    {"type":"text","text":format!("{{\"{alias}\":\"{raw}\"}}")},
-                    {"type":"json","json":{"data":[{alias:raw}]}}
-                ],
-                "structured_content":{"success":true,"data":[{alias:raw}]},
-                "is_error":false
+                "success": true,
+                "data": [{alias: raw}],
+                "note": format!("{{\"{alias}\":\"{raw}\"}}"),
+                "copy": {alias: raw}
             })},
-            evidence: MaskingEvidence {
+            field_sources: FieldSources {
                 schema: json!({"columns":[{"name":alias,"types":["Строка"],"sources":["Справочник.big_MarketAccounts.APIKey"]}]}),
                 lineage: vec![json!({"column":alias,"source_path":"Справочник.big_MarketAccounts.APIKey","source_types":["Строка"],"secret_cut":false})],
-                degraded_reasons: Vec::new(),
             },
         }).await.unwrap();
         let public = serde_json::to_string(&response.public_result).unwrap();
@@ -374,17 +277,15 @@ async fn query_rows_with_missing_or_degraded_lineage_fail_closed() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let alias = "НейтральноеПоле";
     let raw = "synthetic-api-key-not-a-real-secret-222";
-    for evidence in [
-        MaskingEvidence::default(),
-        MaskingEvidence {
+    for field_sources in [
+        FieldSources::default(),
+        FieldSources {
             schema: json!({"columns":[{"name":alias,"sources":["Справочник.Test.APIKey"]}]}),
             lineage: vec![],
-            degraded_reasons: vec!["lineage_incomplete".to_owned()],
         },
-        MaskingEvidence {
+        FieldSources {
             schema: json!({"columns":[{"name":alias,"sources":["Справочник.Test.APIKey"]}]}),
             lineage: vec![json!({"column":"ДругаяКолонка","source_path":"Справочник.Test.APIKey"})],
-            degraded_reasons: vec![],
         },
     ] {
         let call_id = Uuid::new_v4();
@@ -399,12 +300,12 @@ async fn query_rows_with_missing_or_degraded_lineage_fail_closed() {
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
-                        "content":[{"type":"text","text":raw}],
-                        "structured_content":{"data":[{alias:raw}]},
-                        "is_error":false
+                        "success": true,
+                        "data": [{alias: raw}],
+                        "note": raw
                     }),
                 },
-                evidence,
+                field_sources,
             })
             .await
             .unwrap();
@@ -427,9 +328,9 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let raw = "synthetic-unclassified-query-text-221";
     for result in [
-        json!({"content":[{"type":"text","text":raw}],"is_error":false}),
-        json!({"content":[{"type":"json","json":{"message":raw}}],"is_error":false}),
-        json!({"content":[{"type":"text","text":raw}],"structured_content":{"success":true},"is_error":false}),
+        json!({"success":true,"message":raw}),
+        json!({"success":true,"data":"not-an-array"}),
+        json!({"message":raw}),
     ] {
         let call_id = Uuid::new_v4();
         let response = state
@@ -442,7 +343,7 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
                 chat_id: "query-envelope".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
-                evidence: MaskingEvidence::default(),
+                field_sources: FieldSources::default(),
             })
             .await
             .unwrap();
@@ -468,13 +369,9 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
             chat_id: "query-envelope".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
-                result: json!({
-                    "content":[{"type":"text","text":"0 rows"}],
-                    "structured_content":{"success":true,"data":[]},
-                    "is_error":false
-                }),
+                result: json!({"success":true,"data":[]}),
             },
-            evidence: MaskingEvidence::default(),
+            field_sources: FieldSources::default(),
         })
         .await
         .unwrap();
@@ -514,15 +411,14 @@ async fn password_mode_metadata_cuts_neutral_alias_even_without_secret_flag() {
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
-                    "content":[{"type":"text","text":format!("value={raw}")}],
-                    "structured_content":{"data":[{alias:raw}]},
-                    "is_error":false
+                    "success": true,
+                    "data": [{alias: raw}],
+                    "note": format!("value={raw}")
                 }),
             },
-            evidence: MaskingEvidence {
+            field_sources: FieldSources {
                 schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
                 lineage: vec![json!({"column":alias,"source_path":path,"secret_cut":false})],
-                ..MaskingEvidence::default()
             },
         })
         .await
@@ -589,23 +485,24 @@ async fn secret_dictionary_and_regex_rules_cut_entire_value_without_mapping() {
                 tool_name: "find_references_to_object".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
-                        "content":[{"type":"text","text":raw},
-                            {"type":"json","json":{"НейтральноеПоле":raw}}],
-                        "is_error":false
+                        "success": true,
+                        "note": raw,
+                        "НейтральноеПоле": raw
                     }),
                 },
-                evidence: MaskingEvidence::default(),
+                field_sources: FieldSources::default(),
             })
             .await
             .unwrap();
-        assert_eq!(
-            response.public_result["content"][0]["text"],
-            "[SECRET_REMOVED]"
-        );
-        assert_eq!(
-            response.public_result["content"][1]["json"]["НейтральноеПоле"],
-            "[SECRET_REMOVED]"
-        );
+        // Контракт Р2: замаскированный бизнес-result живёт в content[0].text.
+        let masked: Value = serde_json::from_str(
+            response.public_result["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(masked["note"], "[SECRET_REMOVED]");
+        assert_eq!(masked["НейтральноеПоле"], "[SECRET_REMOVED]");
         let public = serde_json::to_string(&response.public_result).unwrap();
         assert!(!public.contains(raw));
         assert!(!public.contains("before "));
@@ -661,16 +558,14 @@ async fn canonical_fio_source_overrides_keep_rule_and_missing_lineage_fails_clos
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
-                        "content":[{"type":"json","json":{"data":[{alias:raw}]}},
-                            {"type":"text","text":format!("value={raw}")}],
-                        "structured_content":{"success":true,"data":[{alias:raw}]},
-                        "is_error":false
+                        "success": true,
+                        "data": [{alias: raw}],
+                        "note": format!("value={raw}")
                     }),
                 },
-                evidence: MaskingEvidence {
+                field_sources: FieldSources {
                     schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
                     lineage,
-                    ..MaskingEvidence::default()
                 },
             })
             .await
@@ -730,16 +625,14 @@ async fn canonical_full_name_source_masks_initials_despite_neutral_alias_and_kee
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
-                    "content":[{"type":"json","json":{"data":[{alias:raw}]}},
-                        {"type":"text","text":format!("value={raw}")}],
-                    "structured_content":{"success":true,"data":[{alias:raw}]},
-                    "is_error":false
+                    "success": true,
+                    "data": [{alias: raw}],
+                    "note": format!("value={raw}")
                 }),
             },
-            evidence: MaskingEvidence {
+            field_sources: FieldSources {
                 schema: json!({"columns":[{"name":alias,"sources":[path]}]}),
                 lineage: vec![json!({"column":alias,"source_path":path})],
-                ..MaskingEvidence::default()
             },
         })
         .await
@@ -796,19 +689,18 @@ async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
-                        "content":[{"type":"json","json":{"data":[{alias:raw}]}}],
-                        "structured_content":{"success":true,"data":[{alias:raw}]},
-                        "is_error":false
+                        "success": true,
+                        "data": [{alias: raw}],
+                        "copy": [{alias: raw}]
                     }),
                 },
-                evidence: MaskingEvidence {
+                field_sources: FieldSources {
                     schema: json!({"columns":[{"name":alias,
                     "sources":[public_source,strict_source]}]}),
                     lineage: vec![
                         json!({"column":alias,"source_path":public_source}),
                         json!({"column":alias,"source_path":strict_source}),
                     ],
-                    ..MaskingEvidence::default()
                 },
             })
             .await
@@ -851,14 +743,11 @@ async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
                 chat_id: "synthetic-type-array".to_owned(),
                 tool_name: "get_object_by_link".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
-                    result: json!({
-                        "content":[{"type":"json","json":{"НейтральноеПоле":raw}}],
-                        "is_error":false
-                    }),
+                    result: json!({"success":true,"НейтральноеПоле":raw}),
                 },
-                evidence: MaskingEvidence {
+                field_sources: FieldSources {
                     schema: json!({"columns":[{"name":"НейтральноеПоле","types":types}]}),
-                    ..MaskingEvidence::default()
+                    lineage: vec![],
                 },
             })
             .await
@@ -869,82 +758,57 @@ async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
     }
 }
 
+//++agent TASK-222 [05.10.2026]
+// Активная SECRET-политика — детерминированная ошибка конфигурации:
+// pull не публикует ready-снапшот, intent снимается (повтор бесполезен).
 #[tokio::test]
-async fn legacy_active_secret_policy_cannot_publish_ready_feed() {
+async fn active_secret_policy_cannot_publish_ready_pull() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    let policy_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
-    storage.with_connection(|connection| {
-        let now = chrono::Utc::now().to_rfc3339();
-        connection.execute(
-            "INSERT INTO policies(id,database_id,version,status,created_at) VALUES (?1,?2,1,'active',?3)",
-            rusqlite::params![policy_id.to_string(), database_id.to_string(), now],
-        )?;
-        connection.execute(
-            "INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,action,category,priority,enabled,created_at) VALUES (?1,?2,'regex','synthetic-pattern','secret','SECRET',1,1,?3)",
-            rusqlite::params![Uuid::new_v4().to_string(), policy_id.to_string(), now],
-        )?;
-        connection.execute(
-            "UPDATE databases SET active_policy_id=?1 WHERE id=?2",
-            rusqlite::params![policy_id.to_string(), database_id.to_string()],
-        )?;
-        Ok(())
-    }).unwrap();
-    let job_id = storage.enqueue_feed_job(database_id, 1).unwrap();
-    let job = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|job| job.job_id == job_id)
-        .unwrap();
-    let payload = onec_masking_service::domain::FeedPayload {
-        selection_id: None,
-        page_index: 0,
-        metadata: Vec::new(),
-        dictionary_values: Vec::new(),
-        final_chunk: true,
-    };
-    let digest = digest_payload(&serde_json::to_value(&payload).unwrap());
-    state
-        .masking
-        .upload_feed_chunk(
-            job.job_id,
-            0,
-            onec_masking_service::domain::FeedChunkRequest {
-                schema_version: SCHEMA_VERSION,
-                correlation_id: Uuid::new_v4(),
-                chunk_digest: hex(&digest),
-                payload,
-            },
+    storage
+        .install_policy(
+            database_id,
+            1,
+            &[PolicyRule {
+                selector: RuleSelector::Regex,
+                pattern: "synthetic-pattern".to_owned(),
+                action: RuleAction::Secret,
+                category: "SECRET".to_owned(),
+                priority: 1,
+            }],
         )
         .unwrap();
-    let aggregate: [u8; 32] = Sha256::digest(digest).into();
-    let error = state
-        .masking
-        .activate_feed(
-            job.job_id,
-            onec_masking_service::domain::FeedActivateRequest {
-                schema_version: SCHEMA_VERSION,
-                correlation_id: Uuid::new_v4(),
-                expected_chunks: 1,
-                expected_metadata_count: 0,
-                expected_dictionary_count: 0,
-                aggregate_digest: hex(&aggregate),
-            },
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::PolicyInvalid);
+
+    let fake = FakeManager::spawn(empty_feed_responder);
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(!state.masking.database_ready(database_id).await);
+    assert_eq!(pending_intent_count(&storage, database_id), 0);
+    let failures: i64 = storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM audit_events
+                 WHERE action='feed.pull' AND database_id=?1 AND code='POLICY_INVALID'",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(failures, 1);
 }
-//++agent TASK-221
+//++agent TASK-222
 
 #[tokio::test]
 async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_raw_value() {
@@ -1006,14 +870,16 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
             chat_id: "chat-policy".to_owned(),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
-                result: json!({"content":[
-                    {"type":"json","json":{"customer":raw_customer,"ФИО":raw_name}},
-                    {"type":"text","text":"Петров Петр Петрович"}
-                ],"is_error":false}),
+                result: json!({
+                    "success": true,
+                    "customer": raw_customer,
+                    "ФИО": raw_name,
+                    "note": "Петров Петр Петрович"
+                }),
             },
-            evidence: MaskingEvidence {
+            field_sources: FieldSources {
+                schema: json!({}),
                 lineage: vec![json!({"result_name":"ФИО","source_path":"Catalog.People.FullName"})],
-                ..MaskingEvidence::default()
             },
         })
         .await
@@ -1061,7 +927,7 @@ async fn transport_errors_are_sanitized_before_history_and_unknown_tools_fail_cl
             outcome: FinalizeOutcome::TransportError {
                 error: json!({"message":raw_error}),
             },
-            evidence: MaskingEvidence::default(),
+            field_sources: FieldSources::default(),
         })
         .await
         .unwrap();
@@ -1121,12 +987,12 @@ async fn oversized_or_malformed_completed_calls_store_idempotent_sanitized_histo
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     for (result, forbidden, expected_reason) in [
         (
-            json!({"content":[{"type":"json","json":{"rows":vec!["oversized-raw"; 10_001]}}],"is_error":false}),
+            json!({"success":true,"rows":vec!["oversized-raw"; 10_001]}),
             "oversized-raw",
             "service:result_limit_exceeded",
         ),
         (
-            json!({"content":[{"type":"json","json":{"nested":{"html":"<script>raw-secret()</script>"}}}],"is_error":false}),
+            json!({"success":true,"nested":{"html":"<script>raw-secret()</script>"}}),
             "raw-secret",
             "service:result_invalid",
         ),
@@ -1138,9 +1004,9 @@ async fn oversized_or_malformed_completed_calls_store_idempotent_sanitized_histo
             correlation_id: Uuid::new_v4(),
             database_id,
             chat_id: "chat-bounds".to_owned(),
-            tool_name: "execute_query".to_owned(),
+            tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result },
-            evidence: MaskingEvidence::default(),
+            field_sources: FieldSources::default(),
         };
         let response = state.masking.finalize(request.clone()).await.unwrap();
         assert_eq!(response.public_result["is_error"], true);
@@ -1183,12 +1049,9 @@ async fn disabled_public_projection_is_raw_but_history_is_always_masked() {
         chat_id: "chat-a".to_owned(),
         tool_name: "get_metadata".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
-            result: json!({
-                "content":[{"type":"json","json":{"ФИО":raw_name,"access_token":raw_secret}}],
-                "is_error":false
-            }),
+            result: json!({"success":true,"ФИО":raw_name,"access_token":raw_secret}),
         },
-        evidence: MaskingEvidence::default(),
+        field_sources: FieldSources::default(),
     };
     let first = state.masking.finalize(request.clone()).await.unwrap();
     let first_json = serde_json::to_string(&first.public_result).unwrap();
@@ -1232,23 +1095,18 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
         "get_access_rights",
         "get_link_of_object",
     ] {
-        let (result, evidence) = if tool_name == "execute_query" {
+        let (result, field_sources) = if tool_name == "execute_query" {
             (
-                json!({"content":[{"type":"json","json":{"data":[{"ФИО":raw}]}}],
-                    "structured_content":{"success":true,"data":[{"ФИО":raw}]},"is_error":false}),
-                MaskingEvidence {
+                json!({"success":true,"data":[{"ФИО":raw}]}),
+                FieldSources {
                     schema: json!({"columns":[{"name":"ФИО","sources":["Справочник.People.FullName"]}]}),
                     lineage: vec![
                         json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
                     ],
-                    ..MaskingEvidence::default()
                 },
             )
         } else {
-            (
-                json!({"content":[{"type":"json","json":{"ФИО":raw}}],"is_error":false}),
-                MaskingEvidence::default(),
-            )
+            (json!({"success":true,"ФИО":raw}), FieldSources::default())
         };
         let response = state
             .masking
@@ -1260,7 +1118,7 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
                 chat_id: "chat-six".to_owned(),
                 tool_name: tool_name.to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
-                evidence,
+                field_sources,
             })
             .await
             .unwrap();
@@ -1287,18 +1145,22 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let (_, call_id, correlation_id) = request_ids();
     let raw_name = "Сидоров Сидор Сидорович";
-    let finalized = state.masking.finalize(FinalizeRequest {
-        schema_version: 1,
-        call_id,
-        correlation_id,
-        database_id,
-        chat_id: "chat-a".to_owned(),
-        tool_name: "get_object_by_link".to_owned(),
-        outcome: FinalizeOutcome::ToolResult {
-            result: json!({"content":[{"type":"json","json":{"ФИО":raw_name}}],"is_error":false}),
-        },
-        evidence: MaskingEvidence::default(),
-    }).await.unwrap();
+    let finalized = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: 1,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "get_object_by_link".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success":true,"ФИО":raw_name}),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
     let serialized = serde_json::to_string(&finalized.public_result).unwrap();
     let start = serialized.find("[MASK:v1:FIO:").unwrap();
     let end = serialized[start..].find(']').unwrap() + start + 1;
@@ -1361,13 +1223,24 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let call_id = Uuid::new_v4();
     let raw_name = "Орлов Олег Олегович";
-    state.masking.finalize(FinalizeRequest {
-        schema_version: 1, call_id, correlation_id: Uuid::new_v4(), database_id,
-        chat_id: "chat-reveal".to_owned(), tool_name: "get_object_by_link".to_owned(),
-        outcome: FinalizeOutcome::ToolResult { result: json!({
-            "content":[{"type":"json","json":{"ФИО":raw_name,"password":"never-reveal"}}],"is_error":false
-        })}, evidence: MaskingEvidence::default(),
-    }).await.unwrap();
+    state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: 1,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-reveal".to_owned(),
+            tool_name: "get_object_by_link".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success":true,"ФИО":raw_name,"password":"never-reveal"
+                }),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
     let history_id = state
         .storage
         .with_connection(|connection| {
@@ -1427,18 +1300,22 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
             },
         )
         .await;
-    let response = state.masking.finalize(FinalizeRequest {
-        schema_version: 1,
-        call_id: Uuid::new_v4(),
-        correlation_id: Uuid::new_v4(),
-        database_id,
-        chat_id: "chat-a".to_owned(),
-        tool_name: "find_references_to_object".to_owned(),
-        outcome: FinalizeOutcome::ToolResult {
-            result: json!({"content":[{"type":"text","text":"ООО Ромашка, ИНН 7707083893"}],"is_error":false}),
-        },
-        evidence: MaskingEvidence::default(),
-    }).await.unwrap();
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: 1,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "find_references_to_object".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success":true,"note":"ООО Ромашка, ИНН 7707083893"}),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
     let text = serde_json::to_string(&response.public_result).unwrap();
     assert!(!text.contains("ООО Ромашка"));
     assert!(!text.contains("7707083893"));
@@ -1485,87 +1362,66 @@ fn dictionary_filter_ast_matches_manager_identifier_and_node_bounds() {
         .is_err());
 }
 
+//++agent TASK-222 [05.10.2026]
+// Pull-модель: снапшот публикуется атомарно после полного прогона, а
+// неуспешный pull (страничный отказ) оставляет прежний ready-снапшот и
+// durable intent для повтора.
 #[tokio::test]
-async fn feed_is_staged_in_ram_and_activated_atomically() {
+async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
-    let job_id = Uuid::new_v4();
-    state.storage.with_connection(|connection| {
-        let now = chrono::Utc::now().to_rfc3339();
-        connection.execute(
-            "INSERT INTO dictionary_configs(id,database_id,mode,source_paths_json,filter_ast_json,updated_at)
-             VALUES (?1,?2,'part',?3,NULL,?4)",
-            rusqlite::params![Uuid::new_v4().to_string(), database_id.to_string(),
-                r#"[{"source_path":"Catalog.Organizations.Description","category":"ORG","filter_ast":{"op":"eq","field":"DeletionMark","value":false}}]"#, now],
-        )?;
-        connection.execute(
-            "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at)
-             VALUES (?1,?2,2,'pending',?3,?3)",
-            rusqlite::params![job_id.to_string(), database_id.to_string(), now],
-        )?;
-        Ok(())
-    }).unwrap();
-    let job = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap()
-        .remove(0);
-    let selection_id = Uuid::parse_str(
-        job.dictionary_selectors[0]["selection_id"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    state
+        .storage
+        .set_dictionary_config(
+            database_id,
+            "part",
+            &[
+                json!({"source_path":"Catalog.Organizations.Description","category":"ORG",
+                     "filter_ast":{"op":"eq","field":"DeletionMark","value":false}}),
+            ],
+        )
+        .unwrap();
+
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Organizations.Description",
+                "Description",
+                "String",
+                false,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(
+            vec![dictionary_value(
+                "Catalog.Organizations.Description",
+                "ORG",
+                "ООО Вектор",
+            )],
+            None,
+            true,
+        )),
+    });
+    enqueue_refresh_intent(&state.storage, database_id);
     assert_eq!(
-        job.dictionary_selectors[0]["filter_ast"],
-        json!({"op":"eq","field":"DeletionMark","value":false})
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
     );
-    let payload = onec_masking_service::domain::FeedPayload {
-        selection_id: Some(selection_id),
-        page_index: 0,
-        metadata: vec![onec_masking_service::domain::FeedMetadataItem {
-            source_path: "Catalog.Organizations.Description".to_owned(),
-            field_name: "Description".to_owned(),
-            field_type: "String".to_owned(),
-            password_mode: false,
-        }],
-        dictionary_values: vec![onec_masking_service::domain::FeedDictionaryValue {
-            source_path: "Catalog.Organizations.Description".to_owned(),
-            category: "ORG".to_owned(),
-            value: "ООО Вектор".to_owned(),
-        }],
-        final_chunk: true,
-    };
-    let digest = digest_payload(&serde_json::to_value(&payload).unwrap());
-    state
-        .masking
-        .upload_feed_chunk(
-            job_id,
-            0,
-            onec_masking_service::domain::FeedChunkRequest {
-                schema_version: 1,
-                correlation_id: Uuid::new_v4(),
-                chunk_digest: hex(&digest),
-                payload,
-            },
-        )
-        .unwrap();
-    let aggregate: [u8; 32] = Sha256::digest(digest).into();
-    state
-        .masking
-        .activate_feed(
-            job_id,
-            onec_masking_service::domain::FeedActivateRequest {
-                schema_version: 1,
-                correlation_id: Uuid::new_v4(),
-                expected_chunks: 1,
-                expected_metadata_count: 1,
-                expected_dictionary_count: 1,
-                aggregate_digest: hex(&aggregate),
-            },
-        )
-        .await
-        .unwrap();
+
+    // Селектор, ушедший в manager, несёт filter_ast из durable-конфигурации.
+    let dictionary_calls = fake.calls_for(DICTIONARY_TOOL);
+    assert_eq!(dictionary_calls.len(), 1);
+    assert_eq!(
+        dictionary_calls[0]["selector"],
+        json!({"source_path":"Catalog.Organizations.Description","category":"ORG",
+               "filter_ast":{"op":"eq","field":"DeletionMark","value":false},"page_size":1000})
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 0);
+
     let history_count: i64 = state
         .storage
         .with_connection(|connection| {
@@ -1584,11 +1440,9 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
             chat_id: "chat-feed".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
-                result: json!({
-                    "content":[{"type":"text","text":"Контрагент ООО Вектор"}],"is_error":false
-                }),
+                result: json!({"success":true,"note":"Контрагент ООО Вектор"}),
             },
-            evidence: MaskingEvidence::default(),
+            field_sources: FieldSources::default(),
         })
         .await
         .unwrap();
@@ -1596,75 +1450,20 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
     assert!(!rendered.contains("ООО Вектор"));
     assert!(rendered.contains("[MASK:v1:ORG:"));
 
-    let failed_job_id = Uuid::new_v4();
-    state
-        .storage
-        .with_connection(|connection| {
-            let now = chrono::Utc::now().to_rfc3339();
-            connection.execute(
-                "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at)
-                 VALUES (?1,?2,3,'pending',?3,?3)",
-                rusqlite::params![failed_job_id.to_string(), database_id.to_string(), now],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    let failed_job = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|job| job.job_id == failed_job_id)
-        .unwrap();
-    let failed_selection_id = Uuid::parse_str(
-        failed_job.dictionary_selectors[0]["selection_id"]
-            .as_str()
+    // Страничный отказ — transient: intent остаётся на retry, активная
+    // генерация и RAM-снапшот не тронуты.
+    let failing = FakeManager::spawn(|_, _| Ok(failed_page("FEED_UNAVAILABLE")));
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&failing.client(), 10)
+            .await
             .unwrap(),
-    )
-    .unwrap();
-    let failed_payload = onec_masking_service::domain::FeedPayload {
-        selection_id: Some(failed_selection_id),
-        page_index: 0,
-        metadata: vec![],
-        dictionary_values: vec![onec_masking_service::domain::FeedDictionaryValue {
-            source_path: "Catalog.Organizations.Description".to_owned(),
-            category: "ORG".to_owned(),
-            value: "ООО Новый".to_owned(),
-        }],
-        final_chunk: true,
-    };
-    let failed_digest = digest_payload(&serde_json::to_value(&failed_payload).unwrap());
-    state
-        .masking
-        .upload_feed_chunk(
-            failed_job_id,
-            0,
-            onec_masking_service::domain::FeedChunkRequest {
-                schema_version: 1,
-                correlation_id: Uuid::new_v4(),
-                chunk_digest: hex(&failed_digest),
-                payload: failed_payload,
-            },
-        )
-        .unwrap();
-    let failed = state
-        .masking
-        .activate_feed(
-            failed_job_id,
-            onec_masking_service::domain::FeedActivateRequest {
-                schema_version: 1,
-                correlation_id: Uuid::new_v4(),
-                expected_chunks: 1,
-                expected_metadata_count: 0,
-                expected_dictionary_count: 1,
-                aggregate_digest: "invalid".to_owned(),
-            },
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(failed.code, ErrorCode::PolicyInvalid);
+        0
+    );
     assert!(state.masking.database_ready(database_id).await);
+    assert_eq!(pending_intent_count(&state.storage, database_id), 1);
     let active_version: i64 = state
         .storage
         .with_connection(|connection| {
@@ -1686,9 +1485,9 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
             chat_id: "chat-feed".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
-                result: json!({"content":[{"type":"text","text":"ООО Вектор / ООО Новый"}],"is_error":false}),
+                result: json!({"success":true,"note":"ООО Вектор / ООО Новый"}),
             },
-            evidence: MaskingEvidence::default(),
+            field_sources: FieldSources::default(),
         })
         .await
         .unwrap();
@@ -1696,27 +1495,412 @@ async fn feed_is_staged_in_ram_and_activated_atomically() {
     assert!(!rendered.contains("ООО Вектор"));
     assert!(rendered.contains("ООО Новый"));
 
+    // Restart: RAM-снапшот потерян, durable intent уже стоит (его не
+    // перезаписывает startup-rewarm), pull поднимает готовность снова.
     let restarted = AppState::new(state.storage.clone(), "https://masking.test");
     assert!(!restarted.masking.database_ready(database_id).await);
-    let refresh = restarted
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap();
-    assert!(refresh
-        .iter()
-        .any(|job| job.database_id == database_id && job.target_version == 3));
+    assert_eq!(pending_intent_count(&state.storage, database_id), 1);
+    let recovered = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Organizations.Description",
+                "Description",
+                "String",
+                false,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(
+            vec![dictionary_value(
+                "Catalog.Organizations.Description",
+                "ORG",
+                "ООО Вектор",
+            )],
+            None,
+            true,
+        )),
+    });
+    assert_eq!(
+        restarted
+            .masking
+            .refresh_due_intents(&recovered.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(restarted.masking.database_ready(database_id).await);
 }
 
 #[tokio::test]
-async fn metadata_feed_accepts_large_composite_type_and_rejects_payload_over_chunk_limit() {
+async fn pull_follows_opaque_cursor_until_final_chunk() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
-    let job_id = state.storage.enqueue_feed_job(database_id, 2).unwrap();
     state
+        .storage
+        .set_dictionary_config(
+            database_id,
+            "part",
+            &[json!({"source_path":"Catalog.Organizations.Description","category":"ORG","filter_ast":null})],
+        )
+        .unwrap();
+    let fake = FakeManager::spawn(|name, arguments| {
+        let cursor = arguments["cursor"].as_str();
+        match (name, cursor) {
+            (METADATA_TOOL, None) => Ok(metadata_page(
+                vec![metadata_item(
+                    "Catalog.Organizations.Description",
+                    "Description",
+                    "String",
+                    false,
+                )],
+                Some("m-page-2"),
+                false,
+            )),
+            (METADATA_TOOL, Some("m-page-2")) => Ok(metadata_page(
+                vec![metadata_item(
+                    "Catalog.Organizations.Code",
+                    "Code",
+                    "Number",
+                    false,
+                )],
+                None,
+                true,
+            )),
+            (DICTIONARY_TOOL, None) => Ok(dictionary_page(
+                vec![dictionary_value(
+                    "Catalog.Organizations.Description",
+                    "ORG",
+                    "ООО Первый",
+                )],
+                Some("d-page-2"),
+                false,
+            )),
+            (DICTIONARY_TOOL, Some("d-page-2")) => Ok(dictionary_page(
+                vec![dictionary_value(
+                    "Catalog.Organizations.Description",
+                    "ORG",
+                    "ООО Второй",
+                )],
+                None,
+                true,
+            )),
+            _ => Ok(dictionary_page(Vec::new(), None, true)),
+        }
+    });
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(state.masking.database_ready(database_id).await);
+
+    // Курсор opaque: сервис возвращает его в manager дословно, до
+    // final_chunk; значения обеих страниц собраны в один снапшот.
+    let metadata_calls = fake.calls_for(METADATA_TOOL);
+    assert_eq!(metadata_calls.len(), 2);
+    assert!(metadata_calls[0]["cursor"].is_null());
+    assert_eq!(metadata_calls[1]["cursor"], "m-page-2");
+    let dictionary_calls = fake.calls_for(DICTIONARY_TOOL);
+    assert_eq!(dictionary_calls.len(), 2);
+    assert_eq!(dictionary_calls[1]["cursor"], "d-page-2");
+
+    let result = state
         .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
+        .finalize(FinalizeRequest {
+            schema_version: 1,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-pages".to_owned(),
+            tool_name: "find_references_to_object".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success":true,"note":"ООО Первый и ООО Второй"}),
+            },
+            field_sources: FieldSources::default(),
+        })
         .await
         .unwrap();
+    let rendered = serde_json::to_string(&result.public_result).unwrap();
+    assert!(!rendered.contains("ООО Первый"));
+    assert!(!rendered.contains("ООО Второй"));
+    assert_eq!(rendered.matches("[MASK:v1:ORG:").count(), 2);
+}
+
+#[tokio::test]
+async fn unavailable_manager_and_call_rejection_keep_durable_intent() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+
+    // Несуществующий сокет — transport failure.
+    let dead = ManagerClient::new(PathBuf::from("/nonexistent/manager.sock"), None);
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state.masking.refresh_due_intents(&dead, 10).await.unwrap(),
+        0
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 1);
+    assert!(state.masking.database_ready(database_id).await);
+
+    // Отказ уровня /internal/v1/tools/call (success:false в конверте).
+    let rejecting = FakeManager::spawn(|_, _| Err("INTERNAL_TOOL_FORBIDDEN".to_owned()));
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&rejecting.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 1);
+    let (unavailable, rejected): (i64, i64) = state
+        .storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT SUM(code='MANAGER_UNAVAILABLE'), SUM(code='INTERNAL_TOOL_FAILED')
+                 FROM audit_events WHERE action='feed.pull' AND database_id=?1",
+                [database_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!((unavailable, rejected), (1, 1));
+
+    // Битая форма страницы — детерминированная ошибка: intent снимается.
+    let malformed = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(json!({
+            "success": true,
+            "metadata": [],
+            "dictionary_values": [],
+            "next_cursor": "still-more",
+            "final_chunk": true,
+            "manifest_digest": "d"
+        })),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&malformed.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 0);
+}
+
+// Р1 решение (а): producer manifest_digest необязателен и ни на что не
+// влияет — страницы без digest и с произвольными разными digest собираются
+// в один прогон, журнальный digest сервис считает сам.
+#[tokio::test]
+async fn producer_manifest_digest_is_optional_and_never_verified() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let fake = FakeManager::spawn(|name, arguments| {
+        let cursor = arguments["cursor"].as_str();
+        match (name, cursor) {
+            (METADATA_TOOL, None) => Ok(json!({
+                "success": true,
+                "metadata": [metadata_item("Catalog.A.F","F","String",false)],
+                "dictionary_values": [],
+                "next_cursor": "page-2",
+                "final_chunk": false
+            })),
+            (METADATA_TOOL, Some("page-2")) => Ok(json!({
+                "success": true,
+                "metadata": [metadata_item("Catalog.B.F","F","String",false)],
+                "dictionary_values": [],
+                "next_cursor": null,
+                "final_chunk": true,
+                "manifest_digest": "unrelated-producer-digest"
+            })),
+            _ => Ok(dictionary_page(Vec::new(), None, true)),
+        }
+    });
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 0);
+    assert!(state.masking.database_ready(database_id).await);
+}
+
+#[tokio::test]
+async fn dictionary_value_from_unrequested_source_is_rejected() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .storage
+        .set_dictionary_config(
+            database_id,
+            "part",
+            &[json!({"source_path":"Catalog.Organizations.Description","category":"ORG","filter_ast":null})],
+        )
+        .unwrap();
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Organizations.Description",
+                "Description",
+                "String",
+                false,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(
+            vec![dictionary_value(
+                "Catalog.Organizations.Other",
+                "ORG",
+                "ООО Чужой",
+            )],
+            None,
+            true,
+        )),
+    });
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 0);
+}
+
+#[tokio::test]
+async fn secret_source_can_never_arrive_via_dictionary_pull() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .storage
+        .set_dictionary_config(
+            database_id,
+            "part",
+            &[json!({"source_path":"Catalog.Keys.ApiKey","category":"ORG","filter_ast":null})],
+        )
+        .unwrap();
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Keys.ApiKey",
+                "ApiKey",
+                "String",
+                true,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(
+            vec![dictionary_value(
+                "Catalog.Keys.ApiKey",
+                "ORG",
+                "synthetic-api-key",
+            )],
+            None,
+            true,
+        )),
+    });
+    enqueue_refresh_intent(&state.storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(pending_intent_count(&state.storage, database_id), 0);
+    let forbidden: i64 = state
+        .storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action='feed.pull'
+                 AND database_id=?1 AND code='FEED_SECRET_SOURCE_FORBIDDEN'",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(forbidden, 1);
+}
+
+#[tokio::test]
+async fn durable_intents_drain_per_database_and_isolate_failures() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let mut ready_databases = Vec::new();
+    for _ in 0..2 {
+        let database_id = Uuid::new_v4();
+        storage.ensure_database(database_id).unwrap();
+        storage
+            .set_database_mode(database_id, DatabaseMode::Enabled)
+            .unwrap();
+        enqueue_refresh_intent(&storage, database_id);
+        ready_databases.push(database_id);
+    }
+    let broken = Uuid::new_v4();
+    storage.ensure_database(broken).unwrap();
+    storage
+        .set_database_mode(broken, DatabaseMode::Enabled)
+        .unwrap();
+    storage
+        .install_policy(
+            broken,
+            1,
+            &[PolicyRule {
+                selector: RuleSelector::Regex,
+                pattern: "x".to_owned(),
+                action: RuleAction::Secret,
+                category: "SECRET".to_owned(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+    enqueue_refresh_intent(&storage, broken);
+
+    let fake = FakeManager::spawn(empty_feed_responder);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        2
+    );
+    for database_id in ready_databases {
+        assert!(state.masking.database_ready(database_id).await);
+        assert_eq!(pending_intent_count(&storage, database_id), 0);
+    }
+    assert!(!state.masking.database_ready(broken).await);
+    assert_eq!(pending_intent_count(&storage, broken), 0);
+}
+
+#[tokio::test]
+async fn startup_rewires_enabled_databases_with_durable_intent() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap();
+    // AppState::new → MaskingService::new ставит 'full' intent для
+    // каждой enabled-базы (RAM-снапшоты restart не переживают).
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    assert_eq!(pending_intent_count(&storage, database_id), 1);
+    assert!(!state.masking.database_ready(database_id).await);
+}
+
+#[tokio::test]
+async fn pull_accepts_large_composite_type_and_rejects_oversized_field_type() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
 
     let component =
         "Строка(100), СправочникСсылка.Номенклатура, СправочникСсылка.ХарактеристикиНоменклатуры";
@@ -1725,197 +1909,285 @@ async fn metadata_feed_accepts_large_composite_type_and_rejects_payload_over_chu
         .join(", ");
     composite_type.push_str(&"X".repeat(17_242 - composite_type.len()));
     assert_eq!(composite_type.len(), 17_242);
-    let accepted = onec_masking_service::domain::FeedPayload {
-        selection_id: None,
-        page_index: 0,
-        metadata: vec![onec_masking_service::domain::FeedMetadataItem {
-            source_path: "Catalog.Products.CompositeAttribute".to_owned(),
-            field_name: "CompositeAttribute".to_owned(),
-            field_type: composite_type.clone(),
-            password_mode: false,
-        }],
-        dictionary_values: Vec::new(),
-        final_chunk: false,
-    };
-    let accepted_digest = digest_payload(&serde_json::to_value(&accepted).unwrap());
+    let accepted_db = Uuid::new_v4();
+    storage.ensure_database(accepted_db).unwrap();
+    storage
+        .set_database_mode(accepted_db, DatabaseMode::Enabled)
+        .unwrap();
+    let accepted_type = composite_type.clone();
+    let fake_ok = FakeManager::spawn(move |name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Products.CompositeAttribute",
+                "CompositeAttribute",
+                &accepted_type,
+                false,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, accepted_db);
     assert_eq!(
         state
             .masking
-            .upload_feed_chunk(
-                job_id,
-                0,
-                onec_masking_service::domain::FeedChunkRequest {
-                    schema_version: SCHEMA_VERSION,
-                    correlation_id: Uuid::new_v4(),
-                    chunk_digest: hex(&accepted_digest),
-                    payload: accepted,
-                },
-            )
+            .refresh_due_intents(&fake_ok.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(state.masking.database_ready(accepted_db).await);
+
+    let oversized_type = "T".repeat(1024 * 1024 + 1);
+    let rejected_db = Uuid::new_v4();
+    storage.ensure_database(rejected_db).unwrap();
+    storage
+        .set_database_mode(rejected_db, DatabaseMode::Enabled)
+        .unwrap();
+    let fake_big = FakeManager::spawn(move |name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Catalog.Products.OversizedAttribute",
+                "OversizedAttribute",
+                &oversized_type,
+                false,
+            )],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, rejected_db);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake_big.client(), 10)
+            .await
             .unwrap(),
         0
     );
-
-    let oversized_type = "T".repeat(1024 * 1024);
-    let rejected = onec_masking_service::domain::FeedPayload {
-        selection_id: None,
-        page_index: 1,
-        metadata: vec![onec_masking_service::domain::FeedMetadataItem {
-            source_path: "Catalog.Products.OversizedAttribute".to_owned(),
-            field_name: "OversizedAttribute".to_owned(),
-            field_type: oversized_type,
-            password_mode: false,
-        }],
-        dictionary_values: Vec::new(),
-        final_chunk: true,
-    };
-    let rejected_digest = digest_payload(&serde_json::to_value(&rejected).unwrap());
-    let error = state
-        .masking
-        .upload_feed_chunk(
-            job_id,
-            1,
-            onec_masking_service::domain::FeedChunkRequest {
-                schema_version: SCHEMA_VERSION,
-                correlation_id: Uuid::new_v4(),
-                chunk_digest: hex(&rejected_digest),
-                payload: rejected,
-            },
-        )
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::ResultLimitExceeded);
+    assert!(!state.masking.database_ready(rejected_db).await);
+    assert_eq!(pending_intent_count(&storage, rejected_db), 0);
 }
 
 #[tokio::test]
 async fn all_dictionary_mode_expands_only_safe_catalog_string_fields() {
-    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
-    let job_id = insert_all_feed_job(&state, database_id);
-    let cold_jobs = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
-    let cold_job = cold_jobs.iter().find(|job| job.job_id == job_id).unwrap();
-    assert!(cold_job.dictionary_selectors.is_empty());
-
-    state
-        .masking
-        .set_policy_snapshot(
+    storage
+        .install_policy(
             database_id,
-            PolicySnapshot {
-                rules: vec![
-                    source_mask_rule("Catalog.Organizations.Description"),
-                    source_mask_rule("Catalog.Keys.ApiKey"),
-                ],
-                metadata_sources: vec![
-                    feed_metadata(
-                        "Catalog.Organizations.Description",
-                        "Description",
-                        "String",
-                        false,
-                    ),
-                    feed_metadata("Catalog.Users.Password", "Password", "String", true),
-                    feed_metadata("Catalog.Keys.ApiKey", "ApiKey", "String", false),
-                    feed_metadata("Catalog.Organizations.Code", "Code", "Number", false),
-                    feed_metadata("Document.Sales.Comment", "Comment", "String", false),
-                ],
-                ..PolicySnapshot::default()
-            },
+            1,
+            &[
+                source_mask_rule("Catalog.Organizations.Description"),
+                source_mask_rule("Catalog.Keys.ApiKey"),
+            ],
         )
-        .await;
-    let jobs = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
         .unwrap();
-    let job = jobs.iter().find(|job| job.job_id == job_id).unwrap();
-    assert_eq!(job.dictionary_selectors.len(), 1);
-    let selector = &job.dictionary_selectors[0];
-    assert_eq!(selector["source_path"], "Catalog.Organizations.Description");
-    assert_eq!(selector["category"], "ORG");
-    assert_ne!(selector["source_path"], "*");
+    storage
+        .set_dictionary_config(
+            database_id,
+            "all",
+            &[json!({"source_path":"*","category":"ORG","filter_ast":null})],
+        )
+        .unwrap();
+
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![
+                metadata_item(
+                    "Catalog.Organizations.Description",
+                    "Description",
+                    "String",
+                    false,
+                ),
+                metadata_item("Catalog.Users.Password", "Password", "String", true),
+                metadata_item("Catalog.Keys.ApiKey", "ApiKey", "String", false),
+                metadata_item("Catalog.Organizations.Code", "Code", "Number", false),
+                metadata_item("Document.Sales.Comment", "Comment", "String", false),
+            ],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let calls = fake.calls_for(DICTIONARY_TOOL);
+    let paths: Vec<&str> = calls
+        .iter()
+        .filter_map(|arguments| arguments["selector"]["source_path"].as_str())
+        .collect();
+    // Password/secret-поля, нестроковые типы и не-Catalog классы не
+    // expand-ятся даже при явном Mask-allowlist.
+    assert_eq!(paths, ["Catalog.Organizations.Description"]);
+    assert!(calls
+        .iter()
+        .all(|arguments| arguments["selector"]["category"] == "ORG"));
 }
 
 #[tokio::test]
 async fn all_dictionary_mode_fails_when_explicit_allowlist_exceeds_hard_cap() {
-    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
-    insert_all_feed_job(&state, database_id);
-    let metadata_sources: Vec<_> = (0..101)
-        .map(|index| {
-            feed_metadata(
-                &format!("Catalog.Items.Field{index}"),
-                &format!("Field{index}"),
-                "String",
-                false,
-            )
-        })
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap();
+    let rules: Vec<_> = (0..101)
+        .map(|index| source_mask_rule(&format!("Catalog.Items.Field{index}")))
         .collect();
-    let rules = metadata_sources
-        .iter()
-        .map(|item| source_mask_rule(&item.source_path))
-        .collect();
-    state
-        .masking
-        .set_policy_snapshot(
+    storage.install_policy(database_id, 1, &rules).unwrap();
+    storage
+        .set_dictionary_config(
             database_id,
-            PolicySnapshot {
-                rules,
-                metadata_sources,
-                ..PolicySnapshot::default()
-            },
+            "all",
+            &[json!({"source_path":"*","category":"ORG","filter_ast":null})],
         )
-        .await;
-    let error = state
-        .masking
-        .pending_feed_jobs(10, Uuid::new_v4())
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::ResultLimitExceeded);
-    let state_value: String = state
-        .storage
+        .unwrap();
+
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            (0..101)
+                .map(|index| {
+                    metadata_item(
+                        &format!("Catalog.Items.Field{index}"),
+                        &format!("Field{index}"),
+                        "String",
+                        false,
+                    )
+                })
+                .collect(),
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!state.masking.database_ready(database_id).await);
+    assert_eq!(pending_intent_count(&storage, database_id), 0);
+    let exceeded: i64 = storage
         .with_connection(|connection| {
             connection.query_row(
-                "SELECT state FROM feed_jobs WHERE database_id=?1",
+                "SELECT COUNT(*) FROM audit_events WHERE action='feed.pull'
+                 AND database_id=?1 AND code='FEED_LIMIT_EXCEEDED'",
                 [database_id.to_string()],
                 |row| row.get(0),
             )
         })
         .unwrap();
-    assert_eq!(state_value, "failed");
+    assert_eq!(exceeded, 1);
 }
 
-fn insert_all_feed_job(state: &Arc<AppState>, database_id: Uuid) -> Uuid {
-    let job_id = Uuid::new_v4();
-    state.storage.with_connection(|connection| {
-        let now = chrono::Utc::now().to_rfc3339();
-        connection.execute(
-            "INSERT INTO dictionary_configs(id,database_id,mode,source_paths_json,filter_ast_json,updated_at)
-             VALUES (?1,?2,'all',?3,NULL,?4)",
-            rusqlite::params![Uuid::new_v4().to_string(), database_id.to_string(),
-                r#"[{"source_path":"*","category":"ORG","filter_ast":null}]"#, now],
-        )?;
-        connection.execute(
-            "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at)
-             VALUES (?1,?2,2,'pending',?3,?3)",
-            rusqlite::params![job_id.to_string(), database_id.to_string(), now],
-        )?;
-        Ok(())
-    }).unwrap();
-    job_id
-}
+//++agent TASK-221 [24.09.2026 10:05:00]
+/// MUST-16 All live дефект (DEV 09:38Z): trusted manifest от BSL
+/// `ПолноеИмя()` отдаёт `Справочник.*` source_path — All-expansion обязана
+/// принимать русский класс справочника наравне с `Catalog.*`; прочие
+/// классы и secret-поля исключаются, даже если allowlist их содержит.
+#[tokio::test]
+async fn all_dictionary_mode_expands_ru_catalog_prefix() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap();
+    storage
+        .install_policy(
+            database_id,
+            1,
+            &[
+                source_mask_rule("Справочник.Клиенты.НаименованиеПолное"),
+                source_mask_rule("Catalog.Organizations.Description"),
+                source_mask_rule("Документ.Продажи.Комментарий"),
+                source_mask_rule("Справочник.Клиенты.СекретныйКлюч"),
+            ],
+        )
+        .unwrap();
+    storage
+        .set_dictionary_config(
+            database_id,
+            "all",
+            &[json!({"source_path":"*","category":"ORG","filter_ast":null})],
+        )
+        .unwrap();
 
-fn feed_metadata(
-    source_path: &str,
-    field_name: &str,
-    field_type: &str,
-    password_mode: bool,
-) -> onec_masking_service::domain::FeedMetadataItem {
-    onec_masking_service::domain::FeedMetadataItem {
-        source_path: source_path.to_owned(),
-        field_name: field_name.to_owned(),
-        field_type: field_type.to_owned(),
-        password_mode,
-    }
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![
+                metadata_item(
+                    "Справочник.Клиенты.НаименованиеПолное",
+                    "НаименованиеПолное",
+                    "Строка",
+                    false,
+                ),
+                metadata_item(
+                    "Catalog.Organizations.Description",
+                    "Description",
+                    "String",
+                    false,
+                ),
+                metadata_item(
+                    "Документ.Продажи.Комментарий",
+                    "Комментарий",
+                    "Строка",
+                    false,
+                ),
+                metadata_item(
+                    "Справочник.Клиенты.СекретныйКлюч",
+                    "СекретныйКлюч",
+                    "Строка",
+                    false,
+                ),
+            ],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let calls = fake.calls_for(DICTIONARY_TOOL);
+    let paths: Vec<&str> = calls
+        .iter()
+        .filter_map(|arguments| arguments["selector"]["source_path"].as_str())
+        .collect();
+    assert_eq!(paths.len(), 2);
+    assert!(paths.contains(&"Справочник.Клиенты.НаименованиеПолное"));
+    assert!(paths.contains(&"Catalog.Organizations.Description"));
 }
+//++agent TASK-221
+//++agent TASK-222
 
 fn source_mask_rule(source_path: &str) -> onec_masking_service::domain::PolicyRule {
     onec_masking_service::domain::PolicyRule {
@@ -1925,27 +2197,4 @@ fn source_mask_rule(source_path: &str) -> onec_masking_service::domain::PolicyRu
         category: "DATA".to_owned(),
         priority: 0,
     }
-}
-
-fn digest_payload(value: &serde_json::Value) -> [u8; 32] {
-    fn sort(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(object) => {
-                let sorted: std::collections::BTreeMap<_, _> = object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), sort(value)))
-                    .collect();
-                serde_json::to_value(sorted).unwrap()
-            }
-            serde_json::Value::Array(array) => {
-                serde_json::Value::Array(array.iter().map(sort).collect())
-            }
-            other => other.clone(),
-        }
-    }
-    Sha256::digest(serde_json::to_vec(&sort(value)).unwrap()).into()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

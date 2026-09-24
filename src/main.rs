@@ -8,7 +8,9 @@ use std::{
 
 use onec_masking_service::{
     auth::{AuthStore, LocalAuthProvider},
-    human_app, internal_app, AppState, SqliteStorage,
+    human_app, internal_app,
+    manager_client::ManagerClient,
+    AppState, SqliteStorage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -74,6 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         // SAFETY: geteuid has no arguments, does not dereference memory, and has no failure mode.
         .unwrap_or_else(|| unsafe { libc::geteuid() });
+    //++agent TASK-222 [05.10.2026]
+    // Pull-модель: metadata/dictionary сервис загружает сам, вызывая internal
+    // tools через UDS менеджера. Переменная обязательна — без неё durable
+    // intents некому выполнять, enabled-базы остались бы not-ready навсегда.
+    let manager_socket_path = PathBuf::from(
+        env::var("MASKING_MANAGER_SOCKET_PATH")
+            .map_err(|_| "MASKING_MANAGER_SOCKET_PATH is required for metadata pull")?,
+    );
+    //++agent TASK-222
     let state = AppState::new_with_peer_uid(storage.clone(), expected_origin, manager_uid);
     let auth_store: Arc<dyn AuthStore> = storage.clone();
     let control_auth = Arc::new(LocalAuthProvider::new(auth_store)?);
@@ -92,6 +103,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = maintenance.maintenance_tick().await;
         }
     });
+    //++agent TASK-222 [05.10.2026]
+    // Pull worker: короткий тик дрейнит durable v2_refresh_intents — startup
+    // intents ставятся конструктором сервиса, Admin-мутации дополняют очередь.
+    // Сбой одного pull не останавливает цикл (transient intent переживает тик).
+    let pull_service = state.masking.clone();
+    let manager_client = ManagerClient::new(manager_socket_path, Some(manager_uid));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(bounded_env(
+            "MASKING_PULL_INTERVAL_SECONDS",
+            10,
+            1,
+            300,
+        )));
+        loop {
+            interval.tick().await;
+            let _ = pull_service.refresh_due_intents(&manager_client, 10).await;
+        }
+    });
+    //++agent TASK-222
     tracing::info!(event = "service_started");
     let internal = axum::serve(
         listener,
@@ -164,6 +194,16 @@ async fn serve_control(listener: UnixListener, auth: Arc<LocalAuthProvider>) {
         });
     }
 }
+
+//++agent TASK-222 [05.10.2026]
+fn bounded_env(name: &str, default: u64, minimum: u64, maximum: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (*value >= minimum) && (*value <= maximum))
+        .unwrap_or(default)
+}
+//++agent TASK-222
 
 fn prepare_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {

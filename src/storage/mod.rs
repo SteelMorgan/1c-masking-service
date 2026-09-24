@@ -1,3 +1,4 @@
+mod intents;
 mod sqlite;
 
 pub(crate) use sqlite::valid_filter_ast;

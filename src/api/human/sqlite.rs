@@ -33,8 +33,18 @@ impl SqliteHumanDataStore {
 impl HumanDataStore for SqliteHumanDataStore {
     fn list_databases(&self) -> Result<Vec<DatabaseSummary>, HumanDataError> {
         self.storage.with_connection(|connection| {
+            //++agent TASK-222 [05.10.2026]
+            // refresh_stage: живой durable intent ('full') — pull в работе;
+            // иначе 'active' при активной cache_generations строке; NULL —
+            // snapshot ещё не собран. Stage label без feed данных.
             let mut statement = connection.prepare(
-                "SELECT id,COALESCE(display_label,id),mode,mapping_ttl_seconds,history_ttl_seconds FROM databases ORDER BY COALESCE(display_label,id)",
+                "SELECT d.id,COALESCE(d.display_label,d.id),d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
+                        COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END)
+                 FROM databases d
+                 LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
+                 LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
+                        ON a.database_id=d.id
+                 ORDER BY COALESCE(d.display_label,d.id)",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DatabaseSummary {
@@ -43,8 +53,10 @@ impl HumanDataStore for SqliteHumanDataStore {
                     mode: row.get(2)?,
                     mapping_ttl_seconds: row.get::<_, i64>(3)?.max(1) as u64,
                     history_ttl_seconds: row.get::<_, i64>(4)?.max(1) as u64,
+                    refresh_stage: row.get(5)?,
                 })
             })?.collect();
+            //++agent TASK-222
             rows
         }).map_err(|_| HumanDataError::Unavailable)
     }
@@ -164,8 +176,18 @@ impl HumanDataStore for SqliteHumanDataStore {
             .map(DatabaseMode::try_from)
             .transpose()
             .map_err(|_| HumanDataError::Conflict)?;
+        //++agent TASK-222 [05.10.2026]
+        // Pull-модель: мутация — чисто durable tx (config + intent + audit
+        // атомарно). RAM snapshot пересобирается pull worker по intent;
+        // TTL режим не затрагивает содержимое snapshot (читается per-call),
+        // поэтому intent ставится только при переходе в enabled.
         self.storage.with_connection(|connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let previous_mode: String = transaction.query_row(
+                "SELECT mode FROM databases WHERE id=?1",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )?;
             let changed = transaction.execute(
                 "UPDATE databases SET mode=COALESCE(?1,mode),mapping_ttl_seconds=COALESCE(?2,mapping_ttl_seconds),history_ttl_seconds=COALESCE(?3,history_ttl_seconds),updated_at=?4 WHERE id=?5",
                 params![mode.map(DatabaseMode::as_str), patch.mapping_ttl_seconds.map(|value| value as i64), patch.history_ttl_seconds.map(|value| value as i64), Utc::now().to_rfc3339(), database_id.to_string()],
@@ -173,13 +195,26 @@ impl HumanDataStore for SqliteHumanDataStore {
             if changed != 1 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
+            let now = Utc::now().to_rfc3339();
+            let effective_mode = mode.map(DatabaseMode::as_str).unwrap_or(&previous_mode);
+            if effective_mode == "enabled" && previous_mode != "enabled" {
+                upsert_intent_tx(&transaction, database_id, "admin_enable", Some(actor.user_id), &now)?;
+            } else if effective_mode != "enabled" {
+                // Disabled/unconfigured: pull пропускает такие базы — висящий
+                // intent снимаем, чтобы не крутить Skipped-циклы.
+                transaction.execute(
+                    "DELETE FROM v2_refresh_intents WHERE database_id=?1",
+                    [database_id.to_string()],
+                )?;
+            }
             transaction.execute(
                 "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,outcome,correlation_id,created_at)
                  VALUES ('human',?1,'database.update',?2,'success',?3,?4)",
-                params![actor.user_id.to_string(), database_id.to_string(), correlation_id.to_string(), Utc::now().to_rfc3339()],
+                params![actor.user_id.to_string(), database_id.to_string(), correlation_id.to_string(), now],
             )?;
             transaction.commit()
         }).map_err(|error| if matches!(error, rusqlite::Error::QueryReturnedNoRows) { HumanDataError::NotFound } else { HumanDataError::Unavailable })
+        //++agent TASK-222
     }
 
     fn refresh_database(
@@ -188,20 +223,26 @@ impl HumanDataStore for SqliteHumanDataStore {
         database_id: Uuid,
         correlation_id: Uuid,
     ) -> Result<(), HumanDataError> {
+        //++agent TASK-222 [05.10.2026]
+        // Refresh = durable intent 'full' + audit в одной tx — pull worker
+        // пересобирает metadata+dictionary snapshot через manager UDS.
         self.storage.with_connection(|connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let target_version: Option<i64> = transaction.query_row(
-                "SELECT COALESCE(active_cache_version,0)+1 FROM databases WHERE id=?1",
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM databases WHERE id=?1)",
                 [database_id.to_string()],
                 |row| row.get(0),
-            ).optional()?;
-            let Some(target_version) = target_version else {
+            )?;
+            if !exists {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
-            };
+            }
             let now = Utc::now().to_rfc3339();
-            transaction.execute(
-                "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at) VALUES (?1,?2,?3,'pending',?4,?4)",
-                params![Uuid::new_v4().to_string(), database_id.to_string(), target_version, now],
+            upsert_intent_tx(
+                &transaction,
+                database_id,
+                "admin_refresh",
+                Some(actor.user_id),
+                &now,
             )?;
             transaction.execute(
                 "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,outcome,correlation_id,created_at)
@@ -210,6 +251,7 @@ impl HumanDataStore for SqliteHumanDataStore {
             )?;
             transaction.commit()
         }).map_err(|error| if matches!(error, rusqlite::Error::QueryReturnedNoRows) { HumanDataError::NotFound } else { HumanDataError::Unavailable })
+        //++agent TASK-222
     }
 
     fn list_tool_classifications(
@@ -233,7 +275,11 @@ impl HumanDataStore for SqliteHumanDataStore {
         {
             return Err(HumanDataError::Conflict);
         }
+        //++agent TASK-222 [05.10.2026]
+        // Tool class читается из durable-хранилища на каждый вызов — RAM
+        // snapshot его не содержит, refresh intent не нужен.
         self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at",params![database_id.to_string(),tool_name,patch.class,actor.user_id.to_string(),now])?; audit(&tx,actor,"tool.update",database_id,correlation_id,&now)?; tx.commit() }).map_err(sql_error)
+        //++agent TASK-222
     }
 
     fn list_dictionary_configs(
@@ -294,6 +340,10 @@ impl HumanDataStore for SqliteHumanDataStore {
         }
         let selectors =
             serde_json::to_string(&config.selectors).map_err(|_| HumanDataError::Conflict)?;
+        //++agent TASK-222 [05.10.2026]
+        // Config и intent коммитятся атомарно: следующий pull видит
+        // согласованную пару. Refresh всегда 'full' — manifest устаревает
+        // вместе с остальным содержимым snapshot.
         self.storage.with_connection(|connection| {
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now=Utc::now().to_rfc3339();
@@ -302,9 +352,17 @@ impl HumanDataStore for SqliteHumanDataStore {
                  ON CONFLICT(database_id) DO UPDATE SET id=excluded.id,mode=excluded.mode,source_paths_json=excluded.source_paths_json,filter_ast_json=NULL,updated_at=excluded.updated_at",
                 params![config.id.to_string(),database_id.to_string(),config.mode,selectors,now],
             )?;
+            upsert_intent_tx(
+                &transaction,
+                database_id,
+                "dictionary_config",
+                Some(actor.user_id),
+                &now,
+            )?;
             audit(&transaction,actor,"dictionary.update",database_id,correlation_id,&now)?;
             transaction.commit()
         }).map_err(sql_error)
+        //++agent TASK-222
     }
 
     fn list_policies(&self, database_id: Uuid) -> Result<Vec<PolicySummary>, HumanDataError> {
@@ -356,6 +414,17 @@ impl HumanDataStore for SqliteHumanDataStore {
                 tx.execute("UPDATE policies SET status='retired' WHERE database_id=?1 AND status='active'",[database_id.to_string()])?;
                 tx.execute("UPDATE policies SET status='active' WHERE id=?1 AND database_id=?2",params![policy_id.to_string(),database_id.to_string()])?;
                 tx.execute("UPDATE databases SET active_policy_id=?1,updated_at=?2 WHERE id=?3",params![policy_id.to_string(),now,database_id.to_string()])?;
+                //++agent TASK-222 [05.10.2026]
+                // Смена policy меняет Mask allowlist All-expansion и правила
+                // snapshot — intent 'full' в той же tx, pull пересоберёт.
+                upsert_intent_tx(
+                    &tx,
+                    database_id,
+                    "policy_activate",
+                    Some(actor_id),
+                    &now,
+                )?;
+                //++agent TASK-222
                 let principal=Principal{user_id:actor_id,role:crate::auth::Role::Admin,auth_epoch:0};
                 audit(&tx,&principal,"policy.activate",database_id,correlation_id,&now)?;
                 tx.commit()?;
@@ -394,6 +463,7 @@ fn sql_error(e: rusqlite::Error) -> HumanDataError {
         HumanDataError::Unavailable
     }
 }
+
 fn audit(
     tx: &rusqlite::Transaction<'_>,
     a: &Principal,
@@ -405,6 +475,34 @@ fn audit(
     tx.execute("INSERT INTO audit_events(actor_kind,actor_id,action,database_id,outcome,correlation_id,created_at) VALUES ('human',?1,?2,?3,'success',?4,?5)",params![a.user_id.to_string(),action,db.to_string(),corr.to_string(),now])?;
     Ok(())
 }
+
+//++agent TASK-222 [05.10.2026]
+/// Tx-scoped durable refresh intent: phase всегда 'full' — pull refresh
+/// пересобирает snapshot целиком. Upsert перезаписывает `created_at`, поэтому
+/// конкурентная мутация во время in-flight pull не теряется: условное
+/// удаление intent после успешного pull промахивается, и свежая мутация
+/// получает свой refresh следующим тиком.
+fn upsert_intent_tx(
+    tx: &rusqlite::Transaction<'_>,
+    database_id: Uuid,
+    reason: &str,
+    actor_id: Option<Uuid>,
+    now: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO v2_refresh_intents(database_id,phase,reason,actor_id,created_at)
+         VALUES (?1,'full',?2,?3,?4) ON CONFLICT(database_id) DO UPDATE SET
+         phase='full',reason=excluded.reason,actor_id=excluded.actor_id,created_at=excluded.created_at",
+        params![
+            database_id.to_string(),
+            reason,
+            actor_id.map(|id| id.to_string()),
+            now
+        ],
+    )?;
+    Ok(())
+}
+//++agent TASK-222
 fn valid_rule(r: &PolicyRuleInput) -> bool {
     matches!(
         r.selector_kind.as_str(),

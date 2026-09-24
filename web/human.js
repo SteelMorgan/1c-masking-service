@@ -218,6 +218,16 @@ async function adminPage() {
         try { await request(`/api/v1/admin/databases/${encodeURIComponent(database.id)}/refresh`, { method: 'POST' }); status('Обновление принято'); }
         catch (error) { status(error.message); }
       }));
+      //++agent TASK-222 [05.10.2026]
+      // v2/feed-управление удалено: pull-модель не имеет enable/disable —
+      // refresh ставит durable intent, а worker сам догружает через менеджер.
+      // Статус показываем по refresh_stage из ответа списка баз.
+      if (database.refresh_stage) {
+        const refreshLine = document.createElement('div');
+        refreshLine.textContent = `refresh: ${database.refresh_stage}`;
+        settings.append(refreshLine);
+      }
+      //--agent TASK-222
       settings.addEventListener('submit', async event => {
         event.preventDefault(); const values = new FormData(settings);
         try {

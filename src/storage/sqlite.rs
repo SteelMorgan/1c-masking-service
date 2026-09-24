@@ -6,12 +6,26 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domain::{
-    DatabaseMode, DatabaseSettings, FeedJob, HistoryForReveal, PolicyRule, RuleAction,
-    RuleSelector, StoredHistory, ToolClass,
+    DatabaseMode, DatabaseSettings, HistoryForReveal, PolicyRule, RuleAction, RuleSelector,
+    StoredHistory, ToolClass,
 };
 
 const MIGRATION: &str = include_str!("../../migrations/0001_core.sql");
 const TERMINAL_HISTORY_MIGRATION: &str = include_str!("../../migrations/0002_terminal_history.sql");
+//++agent TASK-221 [23.09.2026 20:15:00]
+// Исторические миграции применяются для upgrade path существующих баз;
+// созданные ими v2-таблицы удаляются миграцией 0008 (TASK-222).
+const V2_CALL_MIGRATION: &str = include_str!("../../migrations/0003_v2_call_receipts.sql");
+const V2_ACTIVATION_MIGRATION: &str = include_str!("../../migrations/0004_v2_active_snapshots.sql");
+const V2_FEED_MIGRATION: &str = include_str!("../../migrations/0005_v2_feed_leases.sql");
+const V2_FEED_PROOF_MIGRATION: &str =
+    include_str!("../../migrations/0006_v2_feed_completion_proof.sql");
+const V2_REFRESH_INTENTS_MIGRATION: &str =
+    include_str!("../../migrations/0007_v2_refresh_intents.sql");
+//++agent TASK-221
+//++agent TASK-222 [05.10.2026]
+const DROP_V2_FEED_MIGRATION: &str = include_str!("../../migrations/0008_drop_v2_feed.sql");
+//++agent TASK-222
 
 pub enum HistoryWrite {
     Inserted(Uuid),
@@ -46,6 +60,61 @@ impl SqliteStorage {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(MIGRATION)?;
         transaction.execute_batch(TERMINAL_HISTORY_MIGRATION)?;
+        //++agent TASK-221 [23.09.2026 20:15:00]
+        transaction.execute_batch(V2_CALL_MIGRATION)?;
+        transaction.execute_batch(V2_ACTIVATION_MIGRATION)?;
+        transaction.execute_batch(V2_FEED_MIGRATION)?;
+        let has_feed_proof: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_feed_proof {
+            transaction.execute_batch(V2_FEED_PROOF_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        let has_refresh_intents: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_refresh_intents {
+            transaction.execute_batch(V2_REFRESH_INTENTS_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        //++agent TASK-222 [05.10.2026]
+        let has_v2_drop: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_v2_drop {
+            transaction.execute_batch(DROP_V2_FEED_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        //++agent TASK-222
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        //++agent TASK-221
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
             [Utc::now().to_rfc3339()],
@@ -654,199 +723,6 @@ impl SqliteStorage {
                 .optional()
         })
     }
-
-    pub fn pending_feed_jobs(&self, limit: usize) -> rusqlite::Result<Vec<FeedJob>> {
-        self.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT j.id,j.database_id,j.target_version,c.mode,c.source_paths_json,c.filter_ast_json
-                 FROM feed_jobs j LEFT JOIN dictionary_configs c ON c.database_id=j.database_id
-                 WHERE j.state IN ('pending','receiving') ORDER BY j.created_at LIMIT ?1",
-            )?;
-            let rows = statement.query_map([limit.clamp(1, 10) as i64], |row| {
-                let job_id = parse_uuid(row.get::<_, String>(0)?)?;
-                let database_id = parse_uuid(row.get::<_, String>(1)?)?;
-                let mode: Option<String> = row.get(3)?;
-                let configured: Vec<Value> = serde_json::from_str(&row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "[]".to_owned()))
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                let filter: Option<Value> = row.get::<_, Option<String>>(5)?
-                    .map(|json| serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?;
-                if filter.is_some() || configured.len() > 100 {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                let selectors = configured.into_iter().enumerate().map(|(index, mut value)| {
-                    let object = value.as_object_mut().ok_or(rusqlite::Error::InvalidQuery)?;
-                    if !object.keys().all(|key| matches!(key.as_str(), "source_path" | "category" | "filter_ast")) {
-                        return Err(rusqlite::Error::InvalidQuery);
-                    }
-                    let source = object.get("source_path").and_then(Value::as_str).ok_or(rusqlite::Error::InvalidQuery)?;
-                    let category = object.get("category").and_then(Value::as_str).ok_or(rusqlite::Error::InvalidQuery)?;
-                    if source.is_empty() || source.len() > 512 || category.is_empty() || category.len() > 32 {
-                        return Err(rusqlite::Error::InvalidQuery);
-                    }
-                    object.entry("filter_ast").or_insert(Value::Null);
-                    if object
-                        .get("filter_ast")
-                        .is_some_and(|filter| !filter.is_null() && !valid_filter_ast(filter))
-                    {
-                        return Err(rusqlite::Error::InvalidQuery);
-                    }
-                    object.insert("selection_id".to_owned(), Value::String(Uuid::from_u128(job_id.as_u128() ^ ((index + 1) as u128)).to_string()));
-                    object.insert("page_size".to_owned(), Value::from(1000));
-                    Ok(value)
-                }).collect::<rusqlite::Result<Vec<_>>>()?;
-                match mode.as_deref() {
-                    None if selectors.is_empty() => {}
-                    Some("all") if selectors.len() == 1
-                        && selectors[0].get("source_path").and_then(Value::as_str) == Some("*") => {}
-                    Some("part") if selectors.iter().all(|selector| selector.get("source_path").and_then(Value::as_str) != Some("*")) => {}
-                    _ => return Err(rusqlite::Error::InvalidQuery),
-                }
-                Ok(FeedJob {
-                    job_id, database_id, target_version: row.get::<_, i64>(2)?.max(0) as u64,
-                    max_chunk_bytes: 1024 * 1024,
-                    metadata_selector: serde_json::json!({"mode":"all","page_size":1000}),
-                    dictionary_selectors: selectors,
-                    hard_limits: serde_json::json!({"max_source_paths":100,"max_total_values":1_000_000}),
-                })
-            })?;
-            rows.collect()
-        })
-    }
-
-    pub fn enqueue_startup_refresh_jobs(&self) -> rusqlite::Result<usize> {
-        self.with_connection(|connection| {
-            let now = Utc::now().to_rfc3339();
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Receiving chunks live only in RAM and cannot be resumed after a
-            // process restart. Retire those jobs before queueing a generation.
-            transaction.execute(
-                "UPDATE feed_jobs SET state='failed',updated_at=?1 WHERE state='receiving'",
-                [&now],
-            )?;
-            let inserted = transaction.execute(
-                "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at)
-                 SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
-                        substr(lower(hex(randomblob(2))),2) || '-' ||
-                        substr('89ab',abs(random()) % 4 + 1,1) ||
-                        substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
-                        d.id,d.active_cache_version + 1,'pending',?1,?1
-                 FROM databases d
-                 WHERE d.mode='enabled' AND d.active_cache_version IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM feed_jobs j
-                       WHERE j.database_id=d.id AND j.state='pending'
-                   )",
-                [&now],
-            )?;
-            transaction.commit()?;
-            Ok(inserted)
-        })
-    }
-
-    pub fn enqueue_feed_job(
-        &self,
-        database_id: Uuid,
-        target_version: u64,
-    ) -> rusqlite::Result<Uuid> {
-        let job_id = Uuid::new_v4();
-        self.with_connection(|connection| {
-            let now = Utc::now().to_rfc3339();
-            connection.execute(
-                "INSERT INTO feed_jobs(id,database_id,target_version,state,created_at,updated_at)
-                 VALUES (?1,?2,?3,'pending',?4,?4)",
-                params![
-                    job_id.to_string(),
-                    database_id.to_string(),
-                    target_version.min(i64::MAX as u64) as i64,
-                    now
-                ],
-            )?;
-            Ok(job_id)
-        })
-    }
-
-    pub fn feed_job(&self, job_id: Uuid) -> rusqlite::Result<Option<FeedJob>> {
-        Ok(self
-            .pending_feed_jobs(10)?
-            .into_iter()
-            .find(|job| job.job_id == job_id))
-    }
-
-    pub fn mark_feed_receiving(&self, job_id: Uuid) -> rusqlite::Result<bool> {
-        self.with_connection(|connection| Ok(connection.execute(
-            "UPDATE feed_jobs SET state='receiving',updated_at=?2 WHERE id=?1 AND state IN ('pending','receiving')",
-            params![job_id.to_string(), Utc::now().to_rfc3339()],
-        )? == 1))
-    }
-
-    pub fn activate_feed_job(
-        &self,
-        job: &FeedJob,
-        digest: &str,
-        metadata_count: usize,
-        dictionary_count: usize,
-    ) -> rusqlite::Result<()> {
-        self.with_connection(|connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let now = Utc::now().to_rfc3339();
-            let changed = transaction.execute(
-                "UPDATE feed_jobs SET state='active',digest=?2,expected_count=?3,updated_at=?4
-                 WHERE id=?1 AND database_id=?5 AND target_version=?6 AND state='receiving'",
-                params![
-                    job.job_id.to_string(),
-                    digest,
-                    (metadata_count + dictionary_count) as i64,
-                    now,
-                    job.database_id.to_string(),
-                    job.target_version.min(i64::MAX as u64) as i64
-                ],
-            )?;
-            if changed != 1 {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            transaction.execute(
-                "UPDATE cache_generations SET status='failed' WHERE database_id=?1 AND status='active'",
-                [job.database_id.to_string()],
-            )?;
-            transaction.execute(
-                "INSERT OR REPLACE INTO cache_generations(database_id,version,digest,status,metadata_count,dictionary_count,created_at,activated_at)
-                 VALUES (?1,?2,?3,'active',?4,?5,?6,?6)",
-                params![job.database_id.to_string(), job.target_version as i64, digest, metadata_count as i64, dictionary_count as i64, now],
-            )?;
-            transaction.execute(
-                "UPDATE databases SET active_cache_version=?2,updated_at=?3 WHERE id=?1",
-                params![job.database_id.to_string(), job.target_version as i64, now],
-            )?;
-            transaction.commit()
-        })
-    }
-
-    pub fn fail_feed_job(
-        &self,
-        job_id: Uuid,
-        reason_code: &str,
-        correlation_id: Uuid,
-    ) -> rusqlite::Result<bool> {
-        self.with_connection(|connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let changed = transaction.execute(
-                "UPDATE feed_jobs SET state='failed',updated_at=?2 WHERE id=?1 AND state IN ('pending','receiving')",
-                params![job_id.to_string(), Utc::now().to_rfc3339()],
-            )?;
-            transaction.execute(
-                "INSERT INTO audit_events(actor_kind,action,outcome,code,correlation_id,created_at)
-                 VALUES ('service','feed.fail','failed',?1,?2,?3)",
-                params![reason_code, correlation_id.to_string(), Utc::now().to_rfc3339()],
-            )?;
-            transaction.commit()?;
-            Ok(changed == 1)
-        })
-    }
-}
-
-fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(&value).map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 fn read_policy_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRule> {
@@ -1013,19 +889,20 @@ fn valid_filter_ast_node(value: &Value, depth: usize, nodes: &mut usize) -> bool
                 return false;
             }
             object.get("field").is_some_and(valid_filter_field)
-                && object.get("value").is_some_and(valid_filter_scalar)
+                && object.get("value").is_some_and(|operand| {
+                    valid_filter_scalar(operand) && valid_filter_operand(operand)
+                })
         }
         "in" => {
             if object.len() != 3 {
                 return false;
             }
             object.get("field").is_some_and(valid_filter_field)
-                && object
-                    .get("values")
-                    .and_then(Value::as_array)
-                    .is_some_and(|values| {
-                        values.len() <= 100 && values.iter().all(valid_filter_scalar)
-                    })
+                && object.get("values").is_some_and(|values| {
+                    values.as_array().is_some_and(|items| {
+                        items.len() <= 100 && items.iter().all(valid_filter_scalar)
+                    }) && valid_filter_operand(values)
+                })
         }
         _ => false,
     }
@@ -1050,4 +927,14 @@ fn valid_filter_scalar(value: &Value) -> bool {
         || value.is_boolean()
         || value.is_number()
         || value.as_str().is_some_and(|text| text.len() <= 1024)
+}
+
+//++agent TASK-221 [23.09.2026 23:05:00]
+/// C2-04 spec bound: serialized operand payload ОДНОГО узла ≤4096 байт —
+/// `value` для eq/ne, массив `values` для in. Per-scalar bound один
+/// недостаточен: `in` из 100 строк по 1024B формально валиден, а operand
+/// выходит за 4KiB. Value уже распарсен — `to_string` не может упасть.
+//--agent TASK-221
+fn valid_filter_operand(value: &Value) -> bool {
+    serde_json::to_string(value).is_ok_and(|json| json.len() <= 4096)
 }

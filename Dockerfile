@@ -22,7 +22,8 @@ ENV MASKING_DATABASE_PATH=/var/lib/1c-masking/service.sqlite3 \
     MASKING_SOCKET_PATH=/run/1c-masking/service.sock \
     MASKING_CONTROL_SOCKET_PATH=/run/1c-masking/control.sock \
     MASKING_HUMAN_BIND=0.0.0.0:8787 \
-    MASKING_MANAGER_UID=1000
+    MASKING_MANAGER_UID=1000 \
+    MASKING_MANAGER_SOCKET_PATH=/run/1c-masking/manager.sock
 
 EXPOSE 8787
 

@@ -30,7 +30,8 @@ human listener предназначен для localhost или доверенн
 
 ## Текущий статус
 
-- Реализованы internal `preflight`/`finalize`, bounded metadata/dictionary feed,
+- Реализованы internal `preflight`/`finalize`, pull-загрузка
+  metadata/dictionary через internal tools менеджера по Unix socket,
   автоматическая masked history, online human reveal и SQLite-backed policy,
   database/tool/dictionary configuration.
 - Есть локальная human authentication с ровно двумя ролями `Admin` и `Viewer`,
@@ -84,6 +85,7 @@ export MASKING_SOCKET_PATH="$PWD/.local/run/service.sock"
 export MASKING_CONTROL_SOCKET_PATH="$PWD/.local/run/control.sock"
 export MASKING_HUMAN_BIND="127.0.0.1:8787"
 export MASKING_EXPECTED_ORIGIN="https://masking.local"
+export MASKING_MANAGER_SOCKET_PATH="$PWD/.local/run/manager.sock"
 export RUST_LOG=info
 cargo run
 ```
@@ -116,6 +118,9 @@ Argon2id hash и после успеха необратимо закрывает
 | `MASKING_HUMAN_BIND` | `127.0.0.1:8787` | plain TCP listener для human reverse proxy |
 | `MASKING_EXPECTED_ORIGIN` | обязательна | точный публичный origin human API; пустое значение отклоняется |
 | `MASKING_MANAGER_UID` | effective UID процесса | ожидаемый Unix peer UID для internal API; задайте UID доверенного manager явно |
+| `MASKING_MANAGER_SOCKET_PATH` | обязательна | UDS internal listener менеджера (`POST /internal/v1/tools/call`); pull worker загружает через него metadata/dictionary |
+| `MASKING_PULL_INTERVAL_SECONDS` | `10` | период тика pull worker (1–300); durable refresh intents обрабатываются каждый тик |
+| `MASKING_MANAGER_CALL_TIMEOUT_SECONDS` | `30` | дедлайн одного internal tool.call к менеджеру (1–120) |
 | `RUST_LOG` | `info` | фильтр `tracing`; формат compact без timestamp |
 
 Родительские каталоги создаются самим процессом. Системные defaults требуют
@@ -134,8 +139,15 @@ Internal API не публикуется TCP listener-ом и не предна�
   возврат того же public result contract и automatic masked history;
 - `GET /internal/v1/health/live` и `GET /internal/v1/health/ready` — liveness и
   database-specific readiness;
-- `/internal/v1/feed/jobs` и `/chunks/{index}`, `/activate`, `/fail` — bounded
-  metadata/dictionary feed с digest/count validation и atomic activation.
+- `POST /internal/v1/calls/terminal` — idempotent terminal event ledger.
+
+Metadata и dictionary сервис загружает сам (pull-модель TASK-222): durable
+refresh intents (`v2_refresh_intents`) дрейнит pull worker, вызывая
+`mcp_internal_masking_metadata_feed` и `mcp_internal_masking_dictionary_feed`
+на `MASKING_MANAGER_SOCKET_PATH`. Страницы собираются по opaque cursor до
+`final_chunk`; snapshot публикуется атомарно только после полного успешного
+прогона, при сбое остаётся прежний активный snapshot. Успешный прогон
+журналируется в `cache_generations`.
 
 JSON body limit internal API — 8 MiB. При заданном `MASKING_MANAGER_UID`
 каждый Unix peer проверяется до маршрута. Неизвестный database identity
@@ -213,7 +225,8 @@ classification, dictionary selectors и immutable policy versions. Dictionary AP
   identity binding;
 - raw non-secret result может кратковременно находиться в bounded process-local
   retry cache для `disabled`/bypass projection, но не записывается в history;
-- mapping, feed staging, policy cache и retry cache теряются при restart;
+- mapping, RAM policy snapshot/manifest и retry cache теряются при restart —
+  startup pull intents заново загружают enabled-базы через менеджер;
 - 1С extension, manager route closure, production direct-route inventory и
   live manager+1С E2E в рамках этого репозитория не проверялись.
 

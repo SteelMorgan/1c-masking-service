@@ -15,6 +15,10 @@ pub struct DatabaseSummary {
     pub mode: String,
     pub mapping_ttl_seconds: u64,
     pub history_ttl_seconds: u64,
+    /// Stage durable refresh intent (`full`), если refresh в работе;
+    /// `null`, когда очередь пуста. Stage label без feed данных — только
+    /// состояние очереди.
+    pub refresh_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
