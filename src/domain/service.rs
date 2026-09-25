@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
@@ -15,9 +15,10 @@ mod dictionary_feed;
 use crate::storage::{HistoryWrite, SqliteStorage, TerminalWrite};
 
 use super::{
-    DatabaseMode, ErrorCode, FinalizeOutcome, FinalizeRequest, FinalizeResponse, MappingLimits,
-    MappingStore, MaskEngine, PolicySnapshot, PreflightRequest, PreflightResponse, ServiceError,
-    TerminalEventRequest, TerminalEventResponse, TerminalScopeKind, ToolClass, SCHEMA_VERSION,
+    DatabaseMode, ErrorCode, FeedMetadataItem, FinalizeOutcome, FinalizeRequest, FinalizeResponse,
+    MappingLimits, MappingStore, MaskEngine, PolicySnapshot, PreflightRequest, PreflightResponse,
+    ServiceError, TerminalEventRequest, TerminalEventResponse, TerminalScopeKind, ToolClass,
+    SCHEMA_VERSION,
 };
 
 type CallKey = (Uuid, String, Uuid);
@@ -76,6 +77,12 @@ impl MaskingService {
         // всё равно инициирует refresh через durable intent).
         let _ = storage.enqueue_startup_pull_intents();
         //++agent TASK-222
+        //++agent TASK-224 [08.10.2026] итерация 4
+        // Mapping store — только RAM: после рестарта ни одну запись истории
+        // нельзя раскрыть. Нераскрываемая история — чистый риск хранения,
+        // поэтому старт сервиса удаляет history и контексты вызовов целиком.
+        let _ = storage.purge_ephemeral_history();
+        //--agent TASK-224
         Self {
             storage,
             mappings: RwLock::new(MappingStore::new(MappingLimits::default())),
@@ -128,6 +135,36 @@ impl MaskingService {
             })
             .unwrap_or(false)
     }
+    //++agent TASK-224 [24.09.2026]
+    /// Read-only проекция manifest для Admin-дерева метаданных: `view`
+    /// вызывается над `items` под короткой блокировкой store, чтобы не
+    /// клонировать до 100k записей наружу. `None` — manifest не получен
+    /// (рестарт/refresh не завершён); poisoned lock → тот же None
+    /// (fail-closed, как `has_metadata_manifest`).
+    pub fn metadata_manifest_view<R>(
+        &self,
+        database_id: Uuid,
+        view: impl FnOnce(&[FeedMetadataItem]) -> R,
+    ) -> Option<(DateTime<Utc>, R)> {
+        let manifests = self.metadata_manifests.lock().ok()?;
+        let entry = manifests.get(database_id)?;
+        Some((entry.completed_at, view(&entry.items)))
+    }
+    /// Тестовая загрузка manifest в RAM-store напрямую, минуя pull:
+    /// integration-тесты human API не поднимают manager feed. Durable
+    /// commit не выполняется — только для тестов.
+    #[doc(hidden)]
+    pub fn seed_metadata_manifest(&self, database_id: Uuid, items: Vec<FeedMetadataItem>) -> bool {
+        self.metadata_manifests
+            .lock()
+            .map(|mut manifests| {
+                manifests
+                    .insert(database_id, Uuid::new_v4(), items, String::new())
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    }
+    //--agent TASK-224
     //++agent TASK-222
 
     pub(crate) fn admission_for(
@@ -225,6 +262,28 @@ impl MaskingService {
             .storage
             .ensure_database(request.database_id)
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
+        //++agent TASK-224 [08.10.2026] итерация 4; ревью R1 [25.09.2026]
+        // Заголовок — durable-производная `request.arguments`: записывается
+        // только после зачистки engine-ом (ключи-секреты и литералы
+        // `Пароль = "…"`/`api_key=…` в тексте → [SECRET_REMOVED]) — сырые
+        // литералы в arguments возможны, «только mask-токены» не гарантия.
+        // Ошибка зачистки — fail-closed: контекст без title, отчёт в UI
+        // покажет имя инструмента. Fail-soft: без контекста отчёт просто
+        // без заголовка; finalize прочитает заголовок по call_id.
+        let call_title = self
+            .engine
+            .cut_call_arguments(&request.arguments)
+            .ok()
+            .and_then(|arguments| describe_call(&request.tool_name, &arguments));
+        let _ = self.storage.write_call_context(
+            request.call_id,
+            request.database_id,
+            &request.chat_id,
+            &request.tool_name,
+            call_title.as_deref(),
+            effective_history_ttl(&settings),
+        );
+        //--agent TASK-224
         if created || settings.mode == DatabaseMode::Unconfigured {
             return self.persist_preflight_denial(&request, &settings, ErrorCode::ActionRequired);
         }
@@ -325,7 +384,21 @@ impl MaskingService {
                 })?;
                 let public_result =
                     safe_terminal_error(&request.error_code, request.correlation_id);
-                let report = neutral_report(&public_result);
+                //++agent TASK-224 [08.10.2026] итерация 4: заголовок берём из
+                // контекста вызова, если preflight его записал; TTL —
+                // effective min.
+                let call_title = self
+                    .storage
+                    .call_context_text(request.call_id)
+                    .ok()
+                    .flatten();
+                let report = neutral_report(
+                    &public_result,
+                    &ReportMeta {
+                        title: call_title.as_deref(),
+                        schema: None,
+                    },
+                );
                 self.storage.write_scoped_terminal(
                     database_id,
                     chat_id,
@@ -334,7 +407,7 @@ impl MaskingService {
                     &request.error_code,
                     &public_result,
                     &report,
-                    settings.history_ttl_seconds,
+                    effective_history_ttl(&settings),
                     request.correlation_id,
                 )
             }
@@ -483,6 +556,15 @@ impl MaskingService {
                 request.correlation_id,
             ));
         }
+        //++agent TASK-224 [08.10.2026] итерация 4: заголовок отчёта —
+        // текст запроса из контекста, записанного preflight-фазой
+        // (fail-soft: без записи отчёт остаётся без заголовка).
+        let call_title = self
+            .storage
+            .call_context_text(request.call_id)
+            .ok()
+            .flatten();
+        //--agent TASK-224
         if let Some(reason) = sanitized_reason {
             return self.persist_sanitized_failure(
                 &request,
@@ -490,6 +572,7 @@ impl MaskingService {
                 policy.version,
                 outcome_name,
                 reason,
+                call_title.as_deref(),
             );
         }
         //++agent TASK-222 [05.10.2026]
@@ -510,6 +593,7 @@ impl MaskingService {
                 policy.version,
                 "sanitized_error",
                 "service:query_lineage_incomplete",
+                call_title.as_deref(),
             );
         }
         let cut_result = match self
@@ -524,6 +608,7 @@ impl MaskingService {
                     policy.version,
                     "sanitized_error",
                     "service:result_limit_exceeded",
+                    call_title.as_deref(),
                 );
             }
         };
@@ -548,6 +633,7 @@ impl MaskingService {
                     policy.version,
                     "sanitized_error",
                     "service:result_limit_exceeded",
+                    call_title.as_deref(),
                 );
             }
         };
@@ -559,6 +645,7 @@ impl MaskingService {
                 policy.version,
                 "sanitized_error",
                 "service:mapping_capacity_exceeded",
+                call_title.as_deref(),
             );
         }
 
@@ -586,7 +673,16 @@ impl MaskingService {
         };
         let public_result = wrap(&public_result);
         let stored_public = wrap(&fully_masked);
-        let report = neutral_report(&fully_masked);
+        //++agent TASK-224 [08.10.2026] итерация 4: отчёт хранит исходный
+        // порядок колонок запроса (field_sources.schema) и заголовок.
+        let report = neutral_report(
+            &fully_masked,
+            &ReportMeta {
+                title: call_title.as_deref(),
+                schema: Some(&request.field_sources.schema),
+            },
+        );
+        //--agent TASK-224
         let write = self
             .storage
             .write_history(
@@ -599,7 +695,7 @@ impl MaskingService {
                 &report,
                 policy.version,
                 &mask_reasons,
-                settings.history_ttl_seconds,
+                effective_history_ttl(&settings),
                 (!masked.candidates.is_empty()).then_some(batch_id),
                 request.correlation_id,
             )
@@ -623,7 +719,7 @@ impl MaskingService {
                 ))
             }
         }
-        self.cache_response(key, public_result.clone(), settings.history_ttl_seconds);
+        self.cache_response(key, public_result.clone(), effective_history_ttl(&settings));
         Ok(FinalizeResponse {
             schema_version: SCHEMA_VERSION,
             public_result,
@@ -724,9 +820,19 @@ impl MaskingService {
         policy_version: i64,
         outcome: &str,
         reason: &str,
+        //++agent TASK-224 [08.10.2026] итерация 4: заголовок из контекста
+        // вызова — sanitized-запись тоже должна показывать текст запроса.
+        //--agent TASK-224
+        title: Option<&str>,
     ) -> Result<FinalizeResponse, ServiceError> {
         let public_result = safe_processing_error(request.correlation_id);
-        let report = neutral_report(&public_result);
+        let report = neutral_report(
+            &public_result,
+            &ReportMeta {
+                title,
+                schema: Some(&request.field_sources.schema),
+            },
+        );
         let reasons = [reason.to_owned()];
         let write = self
             .storage
@@ -740,7 +846,7 @@ impl MaskingService {
                 &report,
                 policy_version,
                 &reasons,
-                settings.history_ttl_seconds,
+                effective_history_ttl(settings),
                 None,
                 request.correlation_id,
             )
@@ -764,7 +870,7 @@ impl MaskingService {
                 request.call_id,
             ),
             public_result.clone(),
-            settings.history_ttl_seconds,
+            effective_history_ttl(settings),
         );
         Ok(FinalizeResponse {
             schema_version: SCHEMA_VERSION,
@@ -779,7 +885,23 @@ impl MaskingService {
         code: ErrorCode,
     ) -> Result<PreflightResponse, ServiceError> {
         let public_result = safe_terminal_error(code.as_str(), request.correlation_id);
-        let report = neutral_report(&public_result);
+        //++agent TASK-224 [08.10.2026] итерация 4: заголовок — из контекста
+        // первого preflight (first-write-wins), а не из текущих аргументов:
+        // повторный вызов с тем же call_id и другим текстом запроса
+        // остаётся идемпотентным (report совпадает → Existing → тот же
+        // код отказа, а не TERMINAL_ALREADY_RECORDED).
+        let call_title = self
+            .storage
+            .call_context_text(request.call_id)
+            .ok()
+            .flatten();
+        let report = neutral_report(
+            &public_result,
+            &ReportMeta {
+                title: call_title.as_deref(),
+                schema: None,
+            },
+        );
         let write = self
             .storage
             .write_scoped_terminal(
@@ -790,7 +912,7 @@ impl MaskingService {
                 code.as_str(),
                 &public_result,
                 &report,
-                settings.history_ttl_seconds,
+                effective_history_ttl(settings),
                 request.correlation_id,
             )
             .map_err(|_| {
@@ -1027,7 +1149,58 @@ fn wrap_tool_result(masked: &Value) -> Value {
 }
 //++agent TASK-222
 
-fn neutral_report(result: &Value) -> Value {
+//++agent TASK-224 [08.10.2026] итерация 4
+/// Метаданные отчёта истории: `title` — текст запроса/описание вызова,
+/// `schema` — `field_sources.schema` (по `columns[].name` восстанавливается
+/// исходный порядок колонок: serde_json Map сортирует ключи, поэтому без
+/// схемы порядок запроса был бы потерян).
+struct ReportMeta<'a> {
+    title: Option<&'a str>,
+    schema: Option<&'a Value>,
+}
+
+/// Заголовок записи истории из preflight-arguments. На вход принимается
+/// только зачищенная форма (`MaskEngine::cut_call_arguments`) — функция
+/// сама по себе секреты не вырезает. Для инструментов с текстовым
+/// параметром `query` — сам текст запроса; иначе компактный JSON
+/// аргументов. Длина ограничена — это durable-поле.
+const MAX_CALL_TITLE_CHARS: usize = 4096;
+
+fn describe_call(_tool_name: &str, arguments: &Value) -> Option<String> {
+    let title = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| match arguments {
+            Value::Null => None,
+            Value::Object(object) if object.is_empty() => None,
+            _ => Some(canonical_json(arguments)),
+        })?;
+    Some(truncate_chars(&title, MAX_CALL_TITLE_CHARS))
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Effective срок жизни записи истории: не дольше, чем живёт RAM-mapping —
+/// запись без возможности раскрытия бесполезна и только рискует хранением.
+fn effective_history_ttl(settings: &super::DatabaseSettings) -> u64 {
+    settings
+        .history_ttl_seconds
+        .min(settings.mapping_ttl_seconds)
+}
+//--agent TASK-224
+
+fn neutral_report(result: &Value, meta: &ReportMeta) -> Value {
     let mut blocks = Vec::new();
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for item in content {
@@ -1037,26 +1210,30 @@ fn neutral_report(result: &Value) -> Value {
                         blocks.push(json!({"kind":"text", "text":text}));
                     }
                 }
-                Some("json") => {
-                    blocks.push(neutral_block(item.get("json").unwrap_or(&Value::Null)))
-                }
+                Some("json") => blocks.push(neutral_block(
+                    item.get("json").unwrap_or(&Value::Null),
+                    meta.schema,
+                )),
                 _ => {}
             }
         }
     }
     if let Some(structured) = result.get("structured_content") {
-        blocks.push(neutral_block(structured));
+        blocks.push(neutral_block(structured, meta.schema));
     }
     //++agent TASK-222 [05.10.2026]
     // Контракт Р2: result — сам бизнес-JSON; без ToolCallResult-ключей
     // отчёт строится по всему значению.
     if blocks.is_empty() {
-        blocks.push(neutral_block(result));
+        blocks.push(neutral_block(result, meta.schema));
     }
-    json!({"version":1, "blocks":blocks})
+    //++agent TASK-224 [08.10.2026] итерация 4: title — текст запроса
+    // (при его отсутствии null — форма отчёта стабильна).
+    json!({"version":1, "title":meta.title, "blocks":blocks})
+    //--agent TASK-224
 }
 
-fn neutral_block(value: &Value) -> Value {
+fn neutral_block(value: &Value, schema: Option<&Value>) -> Value {
     let rows = value
         .as_array()
         .or_else(|| value.get("rows").and_then(Value::as_array))
@@ -1072,23 +1249,62 @@ fn neutral_block(value: &Value) -> Value {
     else {
         return json!({"kind":"text", "text":canonical_json(value)});
     };
-    let columns: std::collections::BTreeSet<_> =
-        objects.iter().flat_map(|row| row.keys().cloned()).collect();
-    if columns.is_empty()
-        || objects.iter().any(|row| {
-            columns
-                .iter()
-                .any(|column| !is_report_scalar(row.get(column).unwrap_or(&Value::Null)))
-        })
+    //++agent TASK-224 [08.10.2026] итерация 4
+    // Порядок колонок — порядок запроса из schema.columns[].name (ключи
+    // строк сортируются serde_json — без схемы порядок был бы алфавитным).
+    // Ключи строк вне схемы дописываются в конец; колонка схемы без
+    // значений в строках всё равно показывается (null).
+    let mut columns: Vec<String> = Vec::new();
+    if let Some(schema_columns) = schema
+        .and_then(|s| s.get("columns"))
+        .and_then(Value::as_array)
     {
+        for name in schema_columns
+            .iter()
+            .filter_map(|column| column.get("name").and_then(Value::as_str))
+        {
+            let key = objects
+                .iter()
+                .flat_map(|row| row.keys())
+                .find(|key| key.eq_ignore_ascii_case(name))
+                .cloned()
+                .unwrap_or_else(|| name.to_owned());
+            if !columns.iter().any(|c| c.eq_ignore_ascii_case(&key)) {
+                columns.push(key);
+            }
+        }
+    }
+    let extra: std::collections::BTreeSet<String> = objects
+        .iter()
+        .flat_map(|row| row.keys())
+        .filter(|key| !columns.iter().any(|c| c.eq_ignore_ascii_case(key)))
+        .cloned()
+        .collect();
+    columns.extend(extra);
+    if columns.is_empty() {
         return json!({"kind":"text", "text":canonical_json(value)});
     }
+    // Нескалярные ячейки (например, ссылочные объекты 1С) больше не роняют
+    // всю таблицу в text-блок — приводятся к читаемому скаляру.
+    let scalar_rows: Vec<Vec<Value>> = objects
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| {
+                    let cell = objects_cell(row, column);
+                    report_cell(cell)
+                })
+                .collect()
+        })
+        .collect();
     let column_descriptors: Vec<_> = columns
         .iter()
-        .map(|column| {
-            let mut types: HashSet<_> = objects
+        .enumerate()
+        .map(|(index, column)| {
+            let mut types: HashSet<_> = scalar_rows
                 .iter()
-                .map(|row| report_scalar_type(row.get(column).unwrap_or(&Value::Null)))
+                .map(|row| report_scalar_type(&row[index]))
                 .collect();
             types.remove("null");
             let value_type = if types.len() == 1 {
@@ -1098,22 +1314,57 @@ fn neutral_block(value: &Value) -> Value {
             } else {
                 "mixed"
             };
-            json!({"id":column,"label":column,"type":value_type})
-        })
-        .collect();
-    let scalar_rows: Vec<_> = objects
-        .iter()
-        .map(|row| {
-            Value::Array(
-                columns
-                    .iter()
-                    .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
-                    .collect(),
-            )
+            // Замок в UI: колонка реально содержит маскированные значения.
+            let masked = scalar_rows
+                .iter()
+                .any(|row| row[index].as_str().is_some_and(masked_cell));
+            json!({"id":column,"label":column,"type":value_type,"masked":masked})
         })
         .collect();
     json!({"kind":"table","columns":column_descriptors,"rows":scalar_rows})
+    //--agent TASK-224
 }
+
+//++agent TASK-224 [08.10.2026] итерация 4
+/// Ячейка строки по имени колонки — регистронезависимо (схема запроса и
+/// ключи ответа 1С могут различаться регистром).
+fn objects_cell<'a>(row: &'a serde_json::Map<String, Value>, column: &str) -> &'a Value {
+    row.get(column)
+        .or_else(|| {
+            row.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(column))
+                .map(|(_, value)| value)
+        })
+        .unwrap_or(&Value::Null)
+}
+
+/// Приведение ячейки к скаляру отчёта: ссылочные объекты 1С отдают
+/// человекочитаемое представление, прочие — компактный JSON.
+fn report_cell(value: &Value) -> Value {
+    if is_report_scalar(value) {
+        return value.clone();
+    }
+    if let Some(object) = value.as_object() {
+        for key in [
+            "Представление",
+            "presentation",
+            "ПредставлениеСсылки",
+            "name",
+            "text",
+            "value",
+        ] {
+            if let Some(text) = object.get(key).and_then(Value::as_str) {
+                return Value::String(text.to_owned());
+            }
+        }
+    }
+    Value::String(canonical_json(value))
+}
+
+fn masked_cell(text: &str) -> bool {
+    text.contains("[MASK:v1:") || text.contains("[SECRET_REMOVED]")
+}
+//--agent TASK-224
 
 fn is_report_scalar(value: &Value) -> bool {
     matches!(

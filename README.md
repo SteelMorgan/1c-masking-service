@@ -174,24 +174,60 @@ Bootstrap работает только через control socket; HTTP route у
 ## Human UI и API
 
 Контракт — [web/API.md](web/API.md). UI: `/`, `/viewer`, `/admin`,
-`/activate/{token}`; статика `human.js`/`human.css` отдаётся сервисом.
+`/activate/{token}`; статика `app.js`/`grid.js`/`app.css` отдаётся сервисом
+без inline JS/CSS и внешних ресурсов (CSP `default-src 'self'`).
 Аутентификация локальная: ровно две роли `Admin`/`Viewer`, Argon2id,
 activation-токены (15 минут), отзываемые сессии (30 мин idle / 8 ч absolute),
 CSRF + точный Origin, cookie `__Host-mask_session` (Secure, HttpOnly,
-SameSite=Strict). Login/bootstrap rate limit — 5/мин и 20/час на ключ.
+SameSite=Strict). Login/activation/bootstrap rate limit — 5/мин и 20/час на
+ключ. CSRF токен привязан к сессии и выдаётся в ответах login/activate и
+`GET /api/v1/session`; UI держит его только в памяти вкладки.
 
-- `Viewer`: базы → чаты → последние 30–50 masked reports; online reveal
-  конкретного history ID в своём database/chat scope — neutral report v1
-  (`text`/`table`), `Cache-Control: no-store`, не записывается обратно,
-  аудируется. `Admin` reveal не получает.
-- `Admin`: пользователи, режим базы и оба TTL, refresh, классификация
-  инструментов, dictionary selectors (до 100, только configuration с
-  `filter_ast` — не raw values), immutable policy versions.
+Стартовый экран `/` объединяет вход и активацию приглашения (код или ссылка
+целиком). Если первый Admin ещё не задан (`GET /api/v1/status` →
+`bootstrap_required`), вместо формы входа показывается инструкция CLI
+bootstrap. `/activate/{token}` предпроверяет код и показывает логин до ввода
+пароля; после установки пароля сессия выдаётся сразу (автовход).
+
+- `Viewer`: базы → чаты → последние 30–50 masked reports; при открытии записи
+  reveal конкретного history ID в своём database/chat scope вызывается
+  автоматически — neutral report v1 (`text`/`table`), `Cache-Control:
+  no-store`, не записывается обратно, не аудируется; раскрытые значения живут
+  только в памяти вкладки, сбрасываются при уходе с записи, отличия от
+  маскированного подсвечиваются. Если mapping недоступен (истёк TTL/рестарт),
+  показывается маскированный отчёт с предупреждением. Переключатель
+  «Оригинал» меняет вид без повторного запроса (маскированное/реальные).
+  `Admin` reveal не получает. Табличные блоки отчёта рендерятся
+  изолированным модулем `grid.js` (`window.MaskingGrid`): сортировка,
+  фильтры по колонкам (для чисел — диапазон `a..b`), общий поиск, сброс
+  фильтров/поиска/сортировки, «Копировать всё», скрытие колонок,
+  постраничный вывод, закреплённая шапка, копирование ячейки кликом,
+  размер шрифта A−/A+; колонки с маскированными значениями
+  (`columns[].masked`) помечены замком и подсвечены. Экспорт CSV и
+  «Копировать всё» выгружают только маскированные значения и отключены с
+  пояснением, пока на экране раскрытые данные.
+  <!--++agent TASK-224 [08.10.2026] итерация 4-->
+  Заголовок отчёта — текст запроса/описание вызова (`report.title`, пишется
+  на preflight в `call_contexts`) плюс статус и время записи; порядок
+  колонок таблицы повторяет порядок запроса из `field_sources.schema.columns`.
+  <!----agent TASK-224-->
+- `Admin`: пользователи (создание с серверной ссылкой приглашения, перевыпуск,
+  сброс пароля новым приглашением, отключение, удаление никогда не входивших),
+  отображаемое имя базы (`display_label`, переименование через PATCH), режим
+  базы и оба TTL, refresh, классификация инструментов, dictionary selectors
+  (до 100, только configuration с `filter_ast` — не raw values; выбор —
+  через ленивое дерево метаданных `GET .../metadata` по RAM-manifest),
+  immutable policy versions.
 
 Mapping токенов живёт только в RAM: scope = database+chat, reverse key —
-HMAC-SHA-256 с process-local ключом. Рестарт сохраняет masked history, но
-reveal старых токенов становится недоступным; pull worker заново поднимает
-снапшоты enabled-баз через менеджер.
+HMAC-SHA-256 с process-local ключом.
+<!--++agent TASK-224 [08.10.2026] итерация 4-->
+Рестарт теряет mapping → при старте `history` и `call_contexts` очищаются
+полностью (нераскрываемая история — чистый риск хранения). Эффективный TTL
+записи истории и контекста вызова — `min(history_ttl, mapping_ttl)` базы:
+запись не переживает соответствия, без которых не раскрывается.
+<!----agent TASK-224-->
+pull worker заново поднимает снапшоты enabled-баз через менеджер.
 
 ## Лимиты обработки
 
@@ -221,6 +257,9 @@ reveal старых токенов становится недоступным; 
 | `0003`–`0006` | таблицы отменённого feed/lease-протокола (v2 receipts/snapshots/leases) — исторические |
 | `0007_v2_refresh_intents` | durable-очередь refresh + `cache_generations.selectors_json` — используется pull worker-ом |
 | `0008_drop_v2_feed` | `DROP` feed_jobs и v2-таблиц 0003–0006 |
+<!--++agent TASK-224 [08.10.2026]-->
+| `0009_call_contexts` | `call_contexts` — контекст вызова (заголовок отчёта) между preflight и finalize |
+<!----agent TASK-224-->
 
 ## Тесты и статус
 

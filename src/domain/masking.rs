@@ -65,6 +65,12 @@ pub struct MaskingOutput {
 pub struct MaskEngine {
     secret_name: Regex,
     secret_value: Regex,
+    //++agent TASK-224 [25.09.2026] ревью R1
+    // Присвоение секретного литерала в свободном тексте (`Пароль = "…"`,
+    // `api_key='…'`, `token: …`): durable-производные аргументов вызова не
+    // имеют evidence, поэтому литерал распознаётся по имени ключа в тексте.
+    secret_assignment: Regex,
+    //--agent TASK-224
     fio_name: Regex,
     fio_value: Regex,
     token: Regex,
@@ -96,6 +102,12 @@ struct CutContext<'a> {
     deadline: Instant,
     secret_fields: &'a HashSet<String>,
     literals: &'a HashSet<String>,
+    //++agent TASK-224 [25.09.2026] ревью R1
+    // Режим durable-производных аргументов (без evidence): имена ключей
+    // проверяются и по компактной форме, а в строках дополнительно режутся
+    // присвоения секретных литералов по имени ключа.
+    strict_text: bool,
+    //--agent TASK-224
 }
 
 #[derive(Default, Clone)]
@@ -112,6 +124,13 @@ impl MaskEngine {
                 .case_insensitive(true).build().expect("static regex"),
             secret_value: RegexBuilder::new(r"(?i)(bearer\s+[a-z0-9._~+/=-]{8,}|authorization\s*[:=]\s*\S+|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)")
                 .case_insensitive(true).build().expect("static regex"),
+            //++agent TASK-224 [25.09.2026] ревью R1
+            // Имена ключей — из secret_name; значение — кавычки либо
+            // непробельный литерал. Левой границы нет: недорезание опаснее
+            // лишнего среза в durable-заголовке.
+            secret_assignment: RegexBuilder::new(r#"(password|passwd|secret|token|api.?key|private.?key|access.?token|refresh.?token|authorization|парол\w*|токен\w*|секрет\w*|ключ\w*)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;)]+)"#)
+                .case_insensitive(true).build().expect("static regex"),
+            //--agent TASK-224
             fio_name: RegexBuilder::new(r"(^|[_\-.])(фио|full.?name|person.?name|employee.?name|контрагент|физлицо)([_\-.]|$)")
                 .case_insensitive(true).build().expect("static regex"),
             fio_value: Regex::new(r"(?u)\b[А-ЯЁ][а-яё]{2,}(?:\s+[А-ЯЁ][а-яё]{2,}){1,2}\b").expect("static regex"),
@@ -218,10 +237,42 @@ impl MaskEngine {
             deadline: Instant::now() + self.processing_timeout,
             secret_fields: &secret_fields,
             literals: &literals,
+            strict_text: false,
         };
         self.cut_walk(input, None, 0, &mut context)
             .map_err(|_| ProcessingError)
     }
+
+    //++agent TASK-224 [25.09.2026] ревью R1
+    /// Необратимая зачистка аргументов вызова перед сохранением
+    /// durable-производных (заголовок call_contexts → title отчёта истории).
+    /// Тот же cut, что у результата (ключи по secret_name → SECRET_REMOVED,
+    /// сигнатуры bearer/authorization/private-key в строках), плюс — так как
+    /// evidence у аргументов нет — присвоения секретных литералов в свободном
+    /// тексте (`Пароль = "…"`, `api_key=…`) и компактные имена ключей.
+    /// Fail-closed: нарушение границ/таймаут → Err, заголовок не хранится.
+    pub fn cut_call_arguments(&self, input: &Value) -> Result<Value, ProcessingError> {
+        validate_value_bounds(
+            input,
+            self.max_depth,
+            self.max_strings,
+            self.max_rows,
+            self.max_text_bytes,
+        )
+        .map_err(|_| ProcessingError)?;
+        let secret_fields = HashSet::new();
+        let literals = HashSet::new();
+        let mut context = CutContext {
+            strings: 0,
+            deadline: Instant::now() + self.processing_timeout,
+            secret_fields: &secret_fields,
+            literals: &literals,
+            strict_text: true,
+        };
+        self.cut_walk(input, None, 0, &mut context)
+            .map_err(|_| ProcessingError)
+    }
+    //--agent TASK-224
 
     fn is_secret_source(&self, evidence: &FieldEvidence, policy: &PolicySnapshot) -> bool {
         evidence.secret_cut
@@ -513,7 +564,13 @@ impl MaskEngine {
             return Err(());
         }
         if field.is_some_and(|name| {
-            self.secret_name.is_match(name) || context.secret_fields.contains(&name.to_lowercase())
+            self.secret_name.is_match(name)
+                || context.secret_fields.contains(&name.to_lowercase())
+                //++agent TASK-224 [25.09.2026] ревью R1: без evidence ключ
+                // вида `myApiKey`/`ПарольПользователя` опознаётся только по
+                // компактной форме имени.
+                || (context.strict_text && compact_secret_name(name))
+            //--agent TASK-224
         }) {
             return Ok(Value::String(SECRET_REMOVED.to_owned()));
         }
@@ -542,6 +599,16 @@ impl MaskEngine {
                     .secret_value
                     .replace_all(text, SECRET_REMOVED)
                     .into_owned();
+                //++agent TASK-224 [25.09.2026] ревью R1: литерал может быть
+                // вписан в свободный текст запроса присвоением — режется по
+                // имени ключа (`Пароль = "…"` → `[SECRET_REMOVED]`).
+                if context.strict_text {
+                    cut = self
+                        .secret_assignment
+                        .replace_all(&cut, SECRET_REMOVED)
+                        .into_owned();
+                }
+                //--agent TASK-224
                 for literal in context.literals {
                     if !literal.is_empty() {
                         cut = cut.replace(literal, SECRET_REMOVED);

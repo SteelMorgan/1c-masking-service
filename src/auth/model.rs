@@ -42,6 +42,26 @@ pub struct ActivationCapability {
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
+//++agent TASK-224 [24.09.2026]
+/// Валидная (не погашенная, не истёкшая) пригласительная capability:
+/// отдаётся наружу для предпроверки кода — логин показывается до ввода пароля.
+#[derive(Debug, Clone)]
+pub struct PendingActivation {
+    pub user_id: Uuid,
+    pub display_login: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Строка списка пользователей для Admin UI: аккаунт + агрегаты приглашения
+/// и последнего входа (нужны состояниям «Ожидает/Истекло» и колонке входа).
+#[derive(Debug, Clone)]
+pub struct UserListEntry {
+    pub account: UserAccount,
+    pub invitation_expires_at: Option<DateTime<Utc>>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+//--agent TASK-224
+
 #[derive(Debug, Clone)]
 pub struct NewSession {
     pub token_hash: [u8; 32],
@@ -75,6 +95,13 @@ pub enum AuthError {
     Conflict,
     #[error("authentication record was not found")]
     NotFound,
+    //++agent TASK-224 [08.10.2026] итерация 4
+    /// Целевой пользователь отключён: приглашение и сброс пароля для него
+    /// запрещены до включения — иначе у отключённой учётной записи
+    /// появился бы свежий путь входа.
+    #[error("target user is disabled")]
+    UserDisabled,
+    //--agent TASK-224
 }
 
 /// Persistence boundary for local human identities. Implementations must make
@@ -83,7 +110,8 @@ pub trait AuthStore: Send + Sync {
     fn ensure_initial_admin(&self) -> Result<UserAccount, AuthError>;
     fn find_user_by_login(&self, normalized_login: &str) -> Result<Option<UserAccount>, AuthError>;
     fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<UserAccount>, AuthError>;
-    fn list_users(&self) -> Result<Vec<UserAccount>, AuthError>;
+    /// Список для Admin UI (Б7): аккаунт + invitation_expires_at/last_login_at.
+    fn list_users(&self) -> Result<Vec<UserListEntry>, AuthError>;
 
     /// Permanently completes first-admin bootstrap. It must succeed only once,
     /// only for login `Admin`, and only while its password hash is NULL.
@@ -101,13 +129,60 @@ pub trait AuthStore: Send + Sync {
     ) -> Result<UserAccount, AuthError>;
 
     /// Consumes the capability, stores the password hash, increments auth_epoch,
-    /// and revokes all user sessions in one transaction.
+    /// and revokes all user sessions in one transaction. Returns the activated
+    /// principal so the caller can issue a session (auto-login, TASK-224/Б3).
     fn activate_user(
         &self,
         token_hash: &[u8; 32],
         now: DateTime<Utc>,
         password_hash: &str,
+    ) -> Result<Principal, AuthError>;
+
+    //++agent TASK-224 [24.09.2026]
+    /// Возвращает pending-активацию по хешу кода: capability не погашена, не
+    /// истекла, пользователь активен и ещё без пароля. Используется и
+    /// предпроверкой (Б2), и самой активацией (Б8), чтобы слабый пароль не
+    /// маскировался под «код недействителен».
+    fn find_pending_activation(
+        &self,
+        token_hash: &[u8; 32],
+        now: DateTime<Utc>,
+    ) -> Result<Option<PendingActivation>, AuthError>;
+
+    /// Перевыпуск приглашения (Б1): гасит все pending-capability пользователя
+    /// и ставит новую. Только для активного пользователя без пароля.
+    fn reissue_activation(
+        &self,
+        user_id: Uuid,
+        capability: ActivationCapability,
+        actor_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Result<UserAccount, AuthError>;
+
+    /// Сброс пароля администратором (Б5): обнуляет пароль, увеличивает
+    /// auth_epoch, отзывает сессии, гасит pending-capability и ставит новую —
+    /// атомарно, иначе пользователь остался бы без способа войти.
+    fn reset_user_password(
+        &self,
+        user_id: Uuid,
+        capability: ActivationCapability,
+        actor_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Result<UserAccount, AuthError>;
+
+    /// Удаление пользователя (Б6), который ни разу не входил (пароль NULL и
+    /// ни одной сессии). Последний активный Admin не удаляется — защита от
+    /// полной потери административного доступа.
+    fn delete_user(
+        &self,
+        user_id: Uuid,
+        actor_id: Uuid,
+        correlation_id: Uuid,
     ) -> Result<(), AuthError>;
+
+    /// Б9: true, пока bootstrap первого администратора не завершён.
+    fn bootstrap_pending(&self) -> Result<bool, AuthError>;
+    //--agent TASK-224
 
     /// Updates role/status, increments auth_epoch, and revokes all sessions atomically.
     fn update_user_access(

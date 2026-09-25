@@ -1,29 +1,93 @@
 <!doctype html>
+<!--++agent TASK-224 [24.09.2026] Viewer: базы → чаты → записи → отчёт.
+     Итерация 3: reveal автоматический при выборе записи; таблицы — grid.js.-->
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Просмотр маскированной истории</title>
-  <link rel="stylesheet" href="/human.css">
+  <title>Просмотр истории — сервис маскирования</title>
+  <link rel="stylesheet" href="/app.css">
 </head>
 <body data-page="viewer">
-  <header><h1>Маскированная история</h1><button id="logout">Выйти</button></header>
-  <main class="layout">
-    <nav><h2>Базы</h2><div id="databases"></div><h2>Чаты</h2><div id="chats"></div></nav>
-    <div>
-      <section>
-        <h2>Сменить мой пароль</h2>
-        <form id="change-password" autocomplete="off">
-          <label>Текущий пароль <input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label>
-          <label>Новый пароль <input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-          <label>Повторите новый пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-          <button type="submit">Сменить пароль</button>
-        </form>
-      </section>
-      <section><h2>Последние сообщения</h2><p>История доступна только для чтения.</p><div id="history"></div><h2>Просмотр</h2><div id="report"></div></section>
+  <header class="top">
+    <div class="logo">М</div><span class="title">Просмотр истории</span><span class="sp"></span>
+    <div class="profile">
+      <button class="btn sm" id="profileBtn" type="button"><span id="profileName"></span> ▾</button>
+      <div class="menu" id="profileMenu">
+        <button id="menuPassword" type="button">Сменить пароль</button>
+        <button id="menuTheme" type="button">Сменить тему</button>
+        <button id="menuLogout" type="button">Выйти</button>
+      </div>
     </div>
-  </main>
-  <p id="status" role="status"></p>
-  <script src="/human.js" defer></script>
+  </header>
+
+  <div class="page">
+    <div class="note err" id="viewerErr" hidden role="alert"></div>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="v3">
+      <div class="col">
+        <h3>Базы</h3>
+        <div class="list" id="dbList"><p class="empty">Загрузка…</p></div>
+        <h3 id="chatsHead" hidden>Чаты</h3>
+        <div class="list" id="chatList"></div>
+      </div>
+      <div class="col">
+        <h3 id="recordsHead" hidden>Записи</h3>
+        <div class="list" id="recordList"></div>
+      </div>
+      <div class="col card" id="reportCard" hidden>
+        <!--++agent TASK-224 [08.10.2026] итерация 4: заголовок — текст
+             запроса; статус записи и метаданные в шапке; «Оригинал» —
+             toggle показа реальных значений.-->
+        <!--**agent TASK-224 [25.09.2026 12:20:00] итерация 5: шапка отчёта —
+             текст запроса моноширинно (свёрнут до 2 строк, «развернуть»),
+             справа статус и сегментный переключатель «Реальные /
+             Маскированные»; плашка раскрытия → строка-подсказка.
+        <div class="row spread"><h3 id="reportTitle" class="m0 clip">Отчёт</h3>
+          <span class="row">
+            <span class="tag mut" id="reportStatus"></span>
+            <button class="btn sm tgl" id="maskToggle" type="button" hidden>Оригинал</button>
+          </span></div>
+        <div class="small muted mb14" id="reportMeta"></div>
+        <div class="note warn" id="revealNote" hidden>Показаны реальные значения. Они не сохраняются и сбрасываются при уходе с записи.</div>
+        -->
+        <div class="rep-head">
+          <div class="rep-q">
+            <h3 id="reportTitle" class="rep-title clamp">Отчёт</h3>
+            <button class="btn link rep-more" id="reportMore" type="button" hidden>Развернуть</button>
+          </div>
+          <div class="rep-side">
+            <span class="tag mut" id="reportStatus"></span>
+            <div class="pill" id="maskToggle" role="group" aria-label="Какие значения показать" hidden>
+              <button type="button" data-view="real">Реальные</button>
+              <button type="button" data-view="masked">Маскированные</button>
+            </div>
+          </div>
+        </div>
+        <div class="rep-meta" id="reportMeta"></div>
+        <p class="hintline" id="revealNote" hidden>Показаны реальные значения — только в этой вкладке; сбрасываются при уходе с записи. Экспорт и копирование всегда маскированные.</p>
+        <!--**agent TASK-224-->
+        <!----agent TASK-224-->
+        <div class="note warn" id="revealWarn" hidden></div>
+        <div class="note err" id="revealErr" hidden></div>
+        <div id="reportBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="dlgPass"><div class="card dialog">
+    <h2>Смена пароля</h2>
+    <div class="note err" id="passErr" hidden role="alert"></div>
+    <div class="note ok" id="passOk" hidden>Пароль изменён. Другие сеансы завершены.</div>
+    <form id="passForm" autocomplete="off">
+      <div class="field"><label for="pwCurrent">Текущий пароль</label><input class="input" id="pwCurrent" type="password" autocomplete="current-password" required maxlength="1024"></div>
+      <div class="field"><label for="pwNew">Новый пароль</label><input class="input" id="pwNew" type="password" autocomplete="new-password" required maxlength="1024"><div class="hint">Не короче 12 символов.</div></div>
+      <div class="field"><label for="pwRepeat">Повторите новый</label><input class="input" id="pwRepeat" type="password" autocomplete="new-password" required maxlength="1024"></div>
+      <div class="row"><button class="btn primary" type="submit">Сменить</button><button class="btn" id="passCancel" type="button">Отмена</button></div>
+    </form>
+  </div></div>
+
+  <script src="/grid.js" defer></script>
+  <script src="/app.js" defer></script>
 </body>
 </html>

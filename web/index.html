@@ -1,21 +1,63 @@
 <!doctype html>
+<!--++agent TASK-224 [24.09.2026] Стартовый экран: вход + приглашение + первый запуск (Б9).-->
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>1C Masking Service</title>
-  <link rel="stylesheet" href="/human.css">
+  <title>Сервис маскирования</title>
+  <link rel="stylesheet" href="/app.css">
 </head>
-<body data-page="login">
-  <main class="narrow">
-    <h1>1C Masking Service</h1>
-    <form id="login-form">
-      <label>Логин <input name="login" autocomplete="username" required maxlength="128"></label>
-      <label>Пароль <input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
-      <button type="submit">Войти</button>
-    </form>
-    <p id="status" role="status"></p>
-  </main>
-  <script src="/human.js" defer></script>
+<body data-page="start">
+  <section class="screen on" id="s-start">
+    <div class="center"><div class="auth">
+      <div class="brand"><div class="logo">М</div><div><h1>Сервис маскирования</h1><div class="muted small">Вход для сотрудников</div></div></div>
+      <div class="card">
+        <div class="note info" id="noticeExpired" hidden>Сеанс завершён. Войдите снова.</div>
+        <div class="tabs">
+          <button class="on" id="tabBtnLogin" type="button">Вход</button>
+          <button id="tabBtnInvite" type="button">У меня есть приглашение</button>
+        </div>
+        <form id="paneLogin" autocomplete="off">
+          <div class="note err" id="loginErr" hidden role="alert"></div>
+          <div class="note warn" id="loginLimited" hidden>Слишком много попыток входа. Подождите <span class="timer" id="loginTimer">60</span> с и попробуйте снова.</div>
+          <div class="field"><label for="loginName">Логин</label><input class="input" id="loginName" name="login" autocomplete="username" required maxlength="128"></div>
+          <div class="field"><label for="loginPassword">Пароль</label><input class="input" id="loginPassword" name="password" type="password" autocomplete="current-password" required maxlength="1024"></div>
+          <div class="row spread">
+            <button class="btn primary" id="loginSubmit" type="submit">Войти</button>
+          </div>
+        </form>
+        <div id="paneInvite" hidden>
+          <p class="muted small">Администратор прислал ссылку или код приглашения. Вставьте любое из двух.</p>
+          <div class="note err" id="inviteErr" hidden role="alert"></div>
+          <form id="inviteForm" autocomplete="off">
+            <div class="field"><label for="inviteInput">Код или ссылка приглашения</label>
+              <input class="input mono" id="inviteInput" placeholder="https://…/activate/… или код">
+              <div class="hint">Приглашение действует 15 минут с момента выдачи.</div></div>
+            <button class="btn primary" id="inviteSubmit" type="submit">Продолжить</button>
+          </form>
+        </div>
+      </div>
+      <p class="small muted">Первый запуск сервиса? <button class="btn link" id="firstRunLink" type="button">Как задать первого администратора</button></p>
+      <p class="small muted" id="versionLine" hidden></p>
+    </div></div>
+  </section>
+
+  <section class="screen" id="s-notinit">
+    <div class="center"><div class="auth wide">
+      <div class="brand"><div class="logo">М</div><h1>Сервис ещё не настроен</h1></div>
+      <div class="card">
+        <p>Пароль первого администратора задаётся на сервере, а не в браузере — так его нельзя перехватить по сети.</p>
+        <ol class="steps">
+          <li>Подключитесь к серверу сервиса и выполните:
+            <div class="code"><span id="bootstrapCmd">masking-service admin bootstrap</span><button class="btn sm" id="copyCmd" type="button">Копировать</button></div></li>
+          <li>Дважды введите пароль — не короче 12 символов.</li>
+          <li>Вернитесь сюда и войдите под логином <b class="mono">admin</b>.</li>
+        </ol>
+        <div class="row"><button class="btn primary" id="recheckStatus" type="button">Проверить снова</button><span class="small muted">Команда выполняется один раз.</span></div>
+      </div>
+    </div></div>
+  </section>
+
+  <script src="/app.js" defer></script>
 </body>
 </html>

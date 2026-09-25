@@ -1275,7 +1275,11 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
         .reveal_history(history_id, database_id, "chat-reveal")
         .await
         .unwrap_err();
-    assert_eq!(unavailable.code, ErrorCode::MappingUnavailable);
+    //++agent TASK-224 [08.10.2026] итерация 4: рестарт очищает историю
+    // целиком (RAM mapping потерян — раскрывать уже нечего), поэтому
+    // reveal сообщает об отсутствии записи, а не о недоступности маппинга.
+    assert_eq!(unavailable.code, ErrorCode::HistoryUnavailable);
+    //--agent TASK-224
 }
 
 #[tokio::test]
@@ -2198,3 +2202,338 @@ fn source_mask_rule(source_path: &str) -> onec_masking_service::domain::PolicyRu
         priority: 0,
     }
 }
+
+//++agent TASK-224 [08.10.2026] итерация 4
+// Отчёт истории: порядок колонок — порядок запроса (field_sources.schema),
+// колонки с маскированными значениями помечаются masked, нескалярные ячейки
+// приводятся к читаемому скаляру, title — текст запроса из контекста,
+// записанного preflight-фазой.
+#[tokio::test]
+async fn finalize_report_preserves_query_column_order_marks_masked_and_scalars() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let (_, call_id, correlation_id) = request_ids();
+    let query = "SELECT Контрагент, Дата, Ссылка FROM Документ.Продажи";
+    state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-report".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"query": query}),
+        })
+        .await
+        .unwrap();
+    state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-report".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": true,
+                    "data": [{
+                        "Дата": "2026-10-08",
+                        "Контрагент": "Иванов Иван Иванович",
+                        "Ссылка": {"Представление": "Продажа 0001"}
+                    }]
+                }),
+            },
+            field_sources: FieldSources {
+                // Порядок колонок специально не совпадает с алфавитным —
+                // он восстанавливается только из schema.columns.
+                schema: json!({"columns":[
+                    {"name":"Контрагент","sources":["Справочник.People.FullName"]},
+                    {"name":"Дата","sources":["Справочник.Test.Name"]},
+                    {"name":"Ссылка","sources":["Справочник.Test.Name"]}
+                ]}),
+                lineage: vec![
+                    json!({"column":"Контрагент","source_path":"Справочник.People.FullName"}),
+                    json!({"column":"Дата","source_path":"Справочник.Test.Name"}),
+                    json!({"column":"Ссылка","source_path":"Справочник.Test.Name"}),
+                ],
+            },
+        })
+        .await
+        .unwrap();
+
+    let report: Value = state
+        .storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT report_json FROM history WHERE call_id=?1",
+                [call_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .unwrap();
+
+    assert_eq!(report["title"], query);
+    let table = &report["blocks"][0];
+    assert_eq!(table["kind"], "table");
+    let columns = table["columns"].as_array().unwrap();
+    let ids: Vec<&str> = columns
+        .iter()
+        .map(|column| column["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["Контрагент", "Дата", "Ссылка"]);
+    let masked: Vec<bool> = columns
+        .iter()
+        .map(|column| column["masked"].as_bool().unwrap())
+        .collect();
+    assert_eq!(masked, [true, false, false]);
+    let row = table["rows"][0].as_array().unwrap();
+    assert!(row
+        .iter()
+        .all(|cell| cell.is_null() || cell.is_boolean() || cell.is_number() || cell.is_string()));
+    assert!(row[0].as_str().unwrap().starts_with("[MASK:v1:FIO:"));
+    assert_eq!(row[2], "Продажа 0001");
+}
+
+// Запись истории и контекст вызова живут не дольше min(history_ttl,
+// mapping_ttl): без RAM mapping раскрытие невозможно, хранить дольше
+// бессмысленно и опасно.
+#[tokio::test]
+async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .storage
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE databases SET mapping_ttl_seconds=300, history_ttl_seconds=7200 WHERE id=?1",
+                [database_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (_, call_id, correlation_id) = request_ids();
+    state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-ttl".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"query": "SELECT 1"}),
+        })
+        .await
+        .unwrap();
+    state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-ttl".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"Дата": "2026-10-08"}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[
+                    {"name":"Дата","sources":["Справочник.Test.Name"]}
+                ]}),
+                lineage: vec![json!({"column":"Дата","source_path":"Справочник.Test.Name"})],
+            },
+        })
+        .await
+        .unwrap();
+
+    state
+        .storage
+        .with_connection(|connection| {
+            let lifetime = |sql: &str| {
+                connection
+                    .query_row(sql, [call_id.to_string()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map(|(created, expires)| {
+                        let created = chrono::DateTime::parse_from_rfc3339(&created).unwrap();
+                        let expires = chrono::DateTime::parse_from_rfc3339(&expires).unwrap();
+                        (expires - created).num_seconds()
+                    })
+            };
+            let history_ttl =
+                lifetime("SELECT created_at, expires_at FROM history WHERE call_id=?1")?;
+            let context_ttl =
+                lifetime("SELECT created_at, expires_at FROM call_contexts WHERE call_id=?1")?;
+            assert_eq!(history_ttl, 300);
+            assert_eq!(context_ttl, 300);
+            Ok(())
+        })
+        .unwrap();
+}
+
+// Рестарт сервиса = потеря RAM mapping → вся накопленная история и контексты
+// вызовов нераскрываемы и удаляются при старте (fail-closed по хранению).
+#[test]
+fn service_start_purges_history_and_call_contexts() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let database_id = Uuid::new_v4();
+    storage.ensure_database(database_id).unwrap();
+    storage
+        .write_history(
+            database_id,
+            "chat-purge",
+            Uuid::new_v4(),
+            "execute_query",
+            "tool_result",
+            &json!({"content":[{"type":"text","text":"masked"}],"is_error":false}),
+            &json!({"version":1,"blocks":[]}),
+            1,
+            &[],
+            86_400,
+            None,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+    storage
+        .write_call_context(
+            Uuid::new_v4(),
+            database_id,
+            "chat-purge",
+            "execute_query",
+            Some("SELECT 1"),
+            86_400,
+        )
+        .unwrap();
+    let _state = AppState::new(storage.clone(), "https://masking.test");
+    let (history_count, context_count): (i64, i64) = storage
+        .with_connection(|connection| {
+            let history_count =
+                connection.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+            let context_count =
+                connection.query_row("SELECT COUNT(*) FROM call_contexts", [], |row| row.get(0))?;
+            Ok((history_count, context_count))
+        })
+        .unwrap();
+    assert_eq!((history_count, context_count), (0, 0));
+}
+
+//++agent TASK-224 [25.09.2026] ревью R1
+// Заголовок отчёта — durable-форма: ни в call_contexts.title, ни в
+// history.report_json не остаётся сырых секретов из arguments — ни
+// значений секретных ключей, ни литералов, вписанных в текст запроса.
+#[tokio::test]
+async fn call_title_never_persists_raw_secrets_from_arguments() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let finalize = |call_id: Uuid, correlation_id: Uuid| FinalizeRequest {
+        schema_version: SCHEMA_VERSION,
+        call_id,
+        correlation_id,
+        database_id,
+        chat_id: "chat-secret".to_owned(),
+        tool_name: "execute_query".to_owned(),
+        outcome: FinalizeOutcome::ToolResult {
+            result: json!({"success": true, "data": [{"Дата": "2026-10-08"}]}),
+        },
+        field_sources: FieldSources {
+            schema: json!({"columns":[{"name":"Дата","sources":["Справочник.Test.Name"]}]}),
+            lineage: vec![json!({"column":"Дата","source_path":"Справочник.Test.Name"})],
+        },
+    };
+    let preflight = |call_id: Uuid, correlation_id: Uuid, arguments: Value| PreflightRequest {
+        schema_version: SCHEMA_VERSION,
+        call_id,
+        correlation_id,
+        database_id,
+        chat_id: "chat-secret".to_owned(),
+        tool_name: "execute_query".to_owned(),
+        arguments,
+    };
+    let durable_parts = |call_id: Uuid| {
+        state
+            .storage
+            .with_connection(|connection| {
+                let title: Option<String> = connection.query_row(
+                    "SELECT title FROM call_contexts WHERE call_id=?1",
+                    [call_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let report: String = connection.query_row(
+                    "SELECT report_json FROM history WHERE call_id=?1",
+                    [call_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                Ok((title, report))
+            })
+            .unwrap()
+    };
+
+    // Секретные литералы внутри свободного текста query — вырезаются
+    // присвоениями (`Пароль = "…"`, `api_key = '…'`).
+    let (_, call_id, correlation_id) = request_ids();
+    state
+        .masking
+        .preflight(preflight(
+            call_id,
+            correlation_id,
+            json!({"query": "ВЫБРАТЬ * ГДЕ Пароль = \"s3cr3t-lit-1\" И api_key = 'sk-live-777'"}),
+        ))
+        .await
+        .unwrap();
+    state
+        .masking
+        .finalize(finalize(call_id, correlation_id))
+        .await
+        .unwrap();
+    let (title, report) = durable_parts(call_id);
+    let durable = format!("{}\n{}", title.unwrap_or_default(), report);
+    assert!(durable.contains("[SECRET_REMOVED]"), "{durable}");
+    for secret in ["s3cr3t-lit-1", "sk-live-777"] {
+        assert!(!durable.contains(secret), "leaked {secret}: {durable}");
+    }
+
+    // Без `query` заголовок — JSON аргументов: значения секретных ключей
+    // заменяются на [SECRET_REMOVED], нейтральные поля сохраняются.
+    let (_, call_id, correlation_id) = request_ids();
+    state
+        .masking
+        .preflight(preflight(
+            call_id,
+            correlation_id,
+            json!({"password":"raw-pass-9","api_key":"sk-key-2","note":"проверка связи"}),
+        ))
+        .await
+        .unwrap();
+    state
+        .masking
+        .finalize(finalize(call_id, correlation_id))
+        .await
+        .unwrap();
+    let (title, report) = durable_parts(call_id);
+    let durable = format!("{}\n{}", title.unwrap_or_default(), report);
+    assert!(durable.contains("проверка связи"), "{durable}");
+    assert!(durable.contains("[SECRET_REMOVED]"), "{durable}");
+    for secret in ["raw-pass-9", "sk-key-2"] {
+        assert!(!durable.contains(secret), "leaked {secret}: {durable}");
+    }
+
+    // Fail-closed: аргументы глубже предела зачистки → заголовок не
+    // сохраняется вовсе (отчёт показывает имя инструмента).
+    let (_, call_id, correlation_id) = request_ids();
+    let mut deep = json!("leaf");
+    for _ in 0..100 {
+        deep = json!({"x": deep});
+    }
+    let _ = state
+        .masking
+        .preflight(preflight(call_id, correlation_id, deep))
+        .await;
+    let (title, report) = durable_parts(call_id);
+    assert!(title.is_none());
+    let report: Value = serde_json::from_str(&report).unwrap();
+    assert!(report["title"].is_null());
+}
+//--agent TASK-224
+//--agent TASK-224

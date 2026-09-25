@@ -1,21 +1,53 @@
 <!doctype html>
+<!--++agent TASK-224 [24.09.2026] Активация: предпроверка кода (Б2), автовход (Б3).-->
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Активация пользователя</title>
-  <link rel="stylesheet" href="/human.css">
+  <title>Активация — сервис маскирования</title>
+  <link rel="stylesheet" href="/app.css">
 </head>
 <body data-page="activate">
-  <main class="narrow">
-    <h1>Установка пароля</h1>
-    <form id="activate-form">
-      <label>Новый пароль <input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-      <label>Повторите пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-      <button type="submit">Активировать</button>
-    </form>
-    <p id="status" role="status"></p>
-  </main>
-  <script src="/human.js" defer></script>
+  <section class="screen on" id="s-loading">
+    <div class="center"><div class="auth"><div class="card"><p class="muted"><span class="spin"></span> Проверяем приглашение…</p></div></div></div>
+  </section>
+
+  <section class="screen" id="s-form">
+    <div class="center"><div class="auth">
+      <div class="brand"><div class="logo">М</div><div><h1>Задайте пароль</h1><div class="muted small">Логин: <b class="mono" id="actLogin"></b></div></div></div>
+      <div class="card">
+        <div class="note err" id="actErr" hidden role="alert"></div>
+        <div class="note warn" id="actLimited" hidden>Слишком много попыток. Подождите минуту и попробуйте снова.</div>
+        <form id="activateForm" autocomplete="off">
+          <div class="field"><label for="actP1">Новый пароль</label><input class="input" id="actP1" type="password" autocomplete="new-password" required maxlength="1024"></div>
+          <div class="field"><label for="actP2">Повторите пароль</label><input class="input" id="actP2" type="password" autocomplete="new-password" required maxlength="1024"></div>
+          <ul class="checks"><li id="actC1">Не короче 12 символов</li><li id="actC2">Пароли совпадают</li></ul>
+          <button class="btn primary" id="actSubmit" type="submit" disabled>Задать пароль</button>
+        </form>
+      </div>
+    </div></div>
+  </section>
+
+  <section class="screen" id="s-done">
+    <div class="center"><div class="auth">
+      <div class="card">
+        <div class="note ok">Пароль задан. Учётная запись активирована.</div>
+        <p>Выполняется вход…</p>
+      </div>
+    </div></div>
+  </section>
+
+  <section class="screen" id="s-invalid">
+    <div class="center"><div class="auth">
+      <div class="card">
+        <div class="note err">Приглашение недействительно</div>
+        <p>Срок действия (15 минут) истёк, приглашение уже использовано или код введён с ошибкой.</p>
+        <p class="muted">Попросите администратора выпустить новое приглашение.</p>
+        <div class="row"><a class="btn primary" href="/">Ко входу</a></div>
+      </div>
+    </div></div>
+  </section>
+
+  <script src="/app.js" defer></script>
 </body>
 </html>

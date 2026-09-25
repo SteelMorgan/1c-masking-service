@@ -26,6 +26,9 @@ const V2_REFRESH_INTENTS_MIGRATION: &str =
 //++agent TASK-222 [05.10.2026]
 const DROP_V2_FEED_MIGRATION: &str = include_str!("../../migrations/0008_drop_v2_feed.sql");
 //++agent TASK-222
+//++agent TASK-224 [08.10.2026] итерация 4
+const CALL_CONTEXTS_MIGRATION: &str = include_str!("../../migrations/0009_call_contexts.sql");
+//++agent TASK-224
 
 pub enum HistoryWrite {
     Inserted(Uuid),
@@ -102,6 +105,20 @@ impl SqliteStorage {
             )?;
         }
         //++agent TASK-222
+        //++agent TASK-224 [08.10.2026] итерация 4
+        let has_call_contexts: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=9)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_call_contexts {
+            transaction.execute_batch(CALL_CONTEXTS_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        //++agent TASK-224
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
             [Utc::now().to_rfc3339()],
@@ -656,11 +673,81 @@ impl SqliteStorage {
     }
 
     pub fn cleanup_history(&self, limit: usize) -> rusqlite::Result<usize> {
-        self.with_connection(|connection| connection.execute(
+        self.with_connection(|connection| {
+            //++agent TASK-224 [08.10.2026] итерация 4: контексты вызовов —
+            // тот же жизненный цикл, что у истории.
+            connection.execute(
+                "DELETE FROM call_contexts WHERE expires_at <= ?1",
+                [Utc::now().to_rfc3339()],
+            )?;
+            //--agent TASK-224
+            connection.execute(
             "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE expires_at <= ?1 ORDER BY expires_at LIMIT ?2)",
             params![Utc::now().to_rfc3339(), limit.min(500) as i64],
-        ))
+        )})
     }
+
+    //++agent TASK-224 [08.10.2026] итерация 4
+    /// Контекст вызова записывается на preflight; `title` приходит уже
+    /// зачищенным engine-ом (secret-cut до durable-записи, ревью R1).
+    /// Повторный preflight того же call_id — идемпотентный no-op
+    /// (first-write-wins): отчёт ретрая должен
+    /// совпадать с первым, иначе denial-запись ломала бы equality в
+    /// write_scoped_terminal. TTL — effective history TTL (min истории/маппинга).
+    pub fn write_call_context(
+        &self,
+        call_id: Uuid,
+        database_id: Uuid,
+        chat_id: &str,
+        tool_name: &str,
+        title: Option<&str>,
+        ttl_seconds: u64,
+    ) -> rusqlite::Result<()> {
+        self.with_connection(|connection| {
+            let now = Utc::now();
+            connection.execute(
+                "INSERT INTO call_contexts(call_id,database_id,chat_id,tool_name,title,created_at,expires_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(call_id) DO NOTHING",
+                params![
+                    call_id.to_string(),
+                    database_id.to_string(),
+                    chat_id,
+                    tool_name,
+                    title,
+                    now.to_rfc3339(),
+                    (now + Duration::seconds(ttl_seconds.min(i64::MAX as u64) as i64)).to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Текст запроса/описание вызова для заголовка отчёта истории; просроченные
+    /// контексты не возвращаются (их TTL тот же, что у записи истории).
+    pub fn call_context_text(&self, call_id: Uuid) -> rusqlite::Result<Option<String>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT title FROM call_contexts WHERE call_id=?1 AND expires_at>?2",
+                    params![call_id.to_string(), Utc::now().to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+    }
+
+    /// Startup-очистка: mapping store живёт в RAM, поэтому после рестарта ни
+    /// одна запись истории не раскрывается — таблицы history и call_contexts
+    /// очищаются полностью. Ошибка fail-soft (maintenance tick доберёт).
+    pub fn purge_ephemeral_history(&self) -> rusqlite::Result<()> {
+        self.with_connection(|connection| {
+            connection.execute("DELETE FROM history", [])?;
+            connection.execute("DELETE FROM call_contexts", [])?;
+            Ok(())
+        })
+    }
+    //--agent TASK-224
 
     pub fn cleanup_unscoped_terminal(&self, limit: usize) -> rusqlite::Result<usize> {
         self.with_connection(|connection| {

@@ -15,8 +15,9 @@ use crate::{
 
 use super::{
     AdminDatabasePatch, ChatSummary, CreatePolicyRequest, DatabaseSummary, DictionaryConfig,
-    HistoryItem, HumanDataError, HumanDataStore, NeutralReport, PolicyRuleInput, PolicySummary,
-    ToolClassification, ToolClassificationPatch,
+    DictionaryConfigView, DictionarySelectorConfig, DictionarySelectorView, HistoryItem,
+    HumanDataError, HumanDataStore, MetadataNode, MetadataNodesPage, NeutralReport,
+    PolicyRuleInput, PolicySummary, ToolClassification, ToolClassificationPatch,
 };
 
 pub struct SqliteHumanDataStore {
@@ -38,7 +39,7 @@ impl HumanDataStore for SqliteHumanDataStore {
             // иначе 'active' при активной cache_generations строке; NULL —
             // snapshot ещё не собран. Stage label без feed данных.
             let mut statement = connection.prepare(
-                "SELECT d.id,COALESCE(d.display_label,d.id),d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
+                "SELECT d.id,COALESCE(d.display_label,d.id),d.display_label,d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
                         COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END)
                  FROM databases d
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
@@ -50,10 +51,11 @@ impl HumanDataStore for SqliteHumanDataStore {
                 Ok(DatabaseSummary {
                     id: parse_uuid(row.get(0)?)?,
                     label: row.get(1)?,
-                    mode: row.get(2)?,
-                    mapping_ttl_seconds: row.get::<_, i64>(3)?.max(1) as u64,
-                    history_ttl_seconds: row.get::<_, i64>(4)?.max(1) as u64,
-                    refresh_stage: row.get(5)?,
+                    display_label: row.get(2)?,
+                    mode: row.get(3)?,
+                    mapping_ttl_seconds: row.get::<_, i64>(4)?.max(1) as u64,
+                    history_ttl_seconds: row.get::<_, i64>(5)?.max(1) as u64,
+                    refresh_stage: row.get(6)?,
                 })
             })?.collect();
             //++agent TASK-222
@@ -111,13 +113,16 @@ impl HumanDataStore for SqliteHumanDataStore {
         }).map_err(|_| HumanDataError::Unavailable)
     }
 
+    //++agent TASK-224 [24.09.2026] итерация 3
+    // Reveal нарочно НЕ аудируется: раскрытие стало автоматическим при
+    // открытии записи (решение пользователя) — событие выродилось бы в шум
+    // «запись просмотрена». Аудируемыми остаются admin-мутации.
+    //--agent TASK-224
     fn reveal_history<'a>(
         &'a self,
-        actor: &Principal,
+        _actor: &Principal,
         history_id: Uuid,
-        correlation_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<NeutralReport, HumanDataError>> + Send + 'a>> {
-        let actor_id = actor.user_id;
         Box::pin(async move {
             let scope =
                 self.storage
@@ -131,29 +136,16 @@ impl HumanDataStore for SqliteHumanDataStore {
                     .map_err(|_| HumanDataError::Unavailable)?
                     .ok_or(HumanDataError::NotFound)?;
 
-            let result = self
+            let value = self
                 .masking
                 .reveal_history(history_id, scope.0, &scope.1)
-                .await;
-            let (outcome, code) = match &result {
-                Ok(_) => ("success", None),
-                Err(error) => ("denied", Some(error.code.as_str())),
-            };
-            self.storage.with_connection(|connection| {
-                connection.execute(
-                    "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
-                     VALUES ('human',?1,'history.reveal',?2,?3,?4,?5,?6,?7,?8)",
-                    params![actor_id.to_string(), scope.0.to_string(), scope.1, history_id.to_string(), outcome, code, correlation_id.to_string(), Utc::now().to_rfc3339()],
-                )?;
-                Ok(())
-            }).map_err(|_| HumanDataError::Unavailable)?;
-
-            let value = result.map_err(|error| match error.code {
-                ErrorCode::MaskTokenInvalid
-                | ErrorCode::HistoryUnavailable
-                | ErrorCode::MappingUnavailable => HumanDataError::MappingUnavailable,
-                _ => HumanDataError::Unavailable,
-            })?;
+                .await
+                .map_err(|error| match error.code {
+                    ErrorCode::MaskTokenInvalid
+                    | ErrorCode::HistoryUnavailable
+                    | ErrorCode::MappingUnavailable => HumanDataError::MappingUnavailable,
+                    _ => HumanDataError::Unavailable,
+                })?;
             let report: NeutralReport =
                 serde_json::from_value(value).map_err(|_| HumanDataError::Unavailable)?;
             report
@@ -176,6 +168,18 @@ impl HumanDataStore for SqliteHumanDataStore {
             .map(DatabaseMode::try_from)
             .transpose()
             .map_err(|_| HumanDataError::Conflict)?;
+        //++agent TASK-224 [24.09.2026]
+        // display_label — tri-state: Some(value)/Some("")/Some(None) пишут
+        // (пустое → NULL), None — не трогаем. Пробелы по краям срезаются.
+        let label_written = patch.display_label.is_some();
+        let label_value = patch
+            .display_label
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        //--agent TASK-224
         //++agent TASK-222 [05.10.2026]
         // Pull-модель: мутация — чисто durable tx (config + intent + audit
         // атомарно). RAM snapshot пересобирается pull worker по intent;
@@ -189,8 +193,8 @@ impl HumanDataStore for SqliteHumanDataStore {
                 |row| row.get(0),
             )?;
             let changed = transaction.execute(
-                "UPDATE databases SET mode=COALESCE(?1,mode),mapping_ttl_seconds=COALESCE(?2,mapping_ttl_seconds),history_ttl_seconds=COALESCE(?3,history_ttl_seconds),updated_at=?4 WHERE id=?5",
-                params![mode.map(DatabaseMode::as_str), patch.mapping_ttl_seconds.map(|value| value as i64), patch.history_ttl_seconds.map(|value| value as i64), Utc::now().to_rfc3339(), database_id.to_string()],
+                "UPDATE databases SET mode=COALESCE(?1,mode),mapping_ttl_seconds=COALESCE(?2,mapping_ttl_seconds),history_ttl_seconds=COALESCE(?3,history_ttl_seconds),display_label=CASE WHEN ?4=1 THEN ?5 ELSE display_label END,updated_at=?6 WHERE id=?7",
+                params![mode.map(DatabaseMode::as_str), patch.mapping_ttl_seconds.map(|value| value as i64), patch.history_ttl_seconds.map(|value| value as i64), i64::from(label_written), label_value, Utc::now().to_rfc3339(), database_id.to_string()],
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -285,7 +289,20 @@ impl HumanDataStore for SqliteHumanDataStore {
     fn list_dictionary_configs(
         &self,
         database_id: Uuid,
-    ) -> Result<Vec<DictionaryConfig>, HumanDataError> {
+    ) -> Result<Vec<DictionaryConfigView>, HumanDataError> {
+        //++agent TASK-224 [24.09.2026]
+        // in_manifest — проверка пути по RAM manifest: None, когда manifest
+        // не получен (UI тогда не маркирует «нет в конфигурации»).
+        let manifest_paths = self
+            .masking
+            .metadata_manifest_view(database_id, |items| {
+                items
+                    .iter()
+                    .map(|item| item.source_path.clone())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .map(|(_, paths)| paths);
+        //--agent TASK-224
         self.storage
             .with_connection(|connection| {
                 let mut statement = connection.prepare(
@@ -294,11 +311,23 @@ impl HumanDataStore for SqliteHumanDataStore {
                 let rows = statement
                     .query_map([database_id.to_string()], |row| {
                         let selectors_json: String = row.get(2)?;
-                        Ok(DictionaryConfig {
+                        let selectors: Vec<DictionarySelectorConfig> =
+                            serde_json::from_str(&selectors_json)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        Ok(DictionaryConfigView {
                             id: parse_uuid(row.get(0)?)?,
                             mode: row.get(1)?,
-                            selectors: serde_json::from_str(&selectors_json)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            selectors: selectors
+                                .into_iter()
+                                .map(|selector| DictionarySelectorView {
+                                    in_manifest: manifest_paths
+                                        .as_ref()
+                                        .map(|paths| paths.contains(&selector.source_path)),
+                                    source_path: selector.source_path,
+                                    category: selector.category,
+                                    filter_ast: selector.filter_ast,
+                                })
+                                .collect(),
                         })
                     })?
                     .collect();
@@ -306,6 +335,49 @@ impl HumanDataStore for SqliteHumanDataStore {
             })
             .map_err(|_| HumanDataError::Unavailable)
     }
+
+    //++agent TASK-224 [24.09.2026]
+    fn metadata_nodes(
+        &self,
+        database_id: Uuid,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<MetadataNodesPage, HumanDataError> {
+        let exists: bool = self
+            .storage
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM databases WHERE id=?1)",
+                    [database_id.to_string()],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|_| HumanDataError::Unavailable)?;
+        if !exists {
+            return Err(HumanDataError::NotFound);
+        }
+        let Some((completed_at, (nodes, truncated))) =
+            self.masking
+                .metadata_manifest_view(database_id, |items| match query {
+                    Some(needle) => search_metadata_nodes(items, needle),
+                    None => build_metadata_nodes(items, path),
+                })
+        else {
+            return Ok(MetadataNodesPage {
+                manifest_ready: false,
+                completed_at: None,
+                nodes: Vec::new(),
+                truncated: false,
+            });
+        };
+        Ok(MetadataNodesPage {
+            manifest_ready: true,
+            completed_at: Some(completed_at),
+            nodes,
+            truncated,
+        })
+    }
+    //--agent TASK-224
 
     fn put_dictionary_config(
         &self,
@@ -455,6 +527,113 @@ fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| rusqlite::Error::InvalidQuery)
 }
+
+//++agent TASK-224 [24.09.2026]
+/// Верхний лимит узлов на один ответ: Admin-UI лениво раскрывает уровни,
+/// больше не требуется; дальше — поиск `q`.
+const MAX_METADATA_NODES: usize = 1000;
+const MAX_METADATA_SEARCH_NODES: usize = 200;
+
+/// Дочерние узлы уровня `path` ("" — корень). Каждый `source_path` —
+/// «Класс.Объект[.ТЧ].Реквизит»; группой считается сегмент, под которым
+/// есть более глубокие записи, листом — собственный item manifest.
+fn build_metadata_nodes(
+    items: &[crate::domain::FeedMetadataItem],
+    path: &str,
+) -> (Vec<MetadataNode>, bool) {
+    struct Child {
+        deeper: bool,
+        fields: usize,
+        password: usize,
+        item: Option<crate::domain::FeedMetadataItem>,
+    }
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}.")
+    };
+    let mut children: std::collections::BTreeMap<String, Child> = Default::default();
+    for item in items {
+        let Some(rest) = item.source_path.strip_prefix(&prefix) else {
+            continue;
+        };
+        let (segment, deeper) = match rest.split_once('.') {
+            Some((segment, _)) => (segment, true),
+            None => (rest, false),
+        };
+        if segment.is_empty() {
+            continue;
+        }
+        let child = children.entry(segment.to_owned()).or_insert(Child {
+            deeper: false,
+            fields: 0,
+            password: 0,
+            item: None,
+        });
+        child.deeper |= deeper;
+        child.fields += 1;
+        child.password += usize::from(item.password_mode);
+        if !deeper {
+            child.item = Some(item.clone());
+        }
+    }
+    let truncated = children.len() > MAX_METADATA_NODES;
+    let nodes = children
+        .into_iter()
+        .take(MAX_METADATA_NODES)
+        .map(|(segment, child)| {
+            let leaf = !child.deeper;
+            MetadataNode {
+                kind: if leaf { "field" } else { "group" },
+                name: child
+                    .item
+                    .as_ref()
+                    .map(|item| item.field_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| segment.clone()),
+                path: format!("{prefix}{segment}"),
+                field_count: child.fields,
+                password_count: child.password,
+                field_type: child.item.as_ref().map(|item| item.field_type.clone()),
+                password_mode: child.item.as_ref().map(|item| item.password_mode),
+            }
+        })
+        .collect();
+    (nodes, truncated)
+}
+
+/// Плоский поиск по `source_path`/`field_name` без разбора уровней —
+/// результатом всегда листовые поля.
+fn search_metadata_nodes(
+    items: &[crate::domain::FeedMetadataItem],
+    query: &str,
+) -> (Vec<MetadataNode>, bool) {
+    let needle = query.to_lowercase();
+    let mut matches: Vec<&crate::domain::FeedMetadataItem> = items
+        .iter()
+        .filter(|item| {
+            item.source_path.to_lowercase().contains(&needle)
+                || item.field_name.to_lowercase().contains(&needle)
+        })
+        .collect();
+    matches.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+    let truncated = matches.len() > MAX_METADATA_SEARCH_NODES;
+    let nodes = matches
+        .into_iter()
+        .take(MAX_METADATA_SEARCH_NODES)
+        .map(|item| MetadataNode {
+            name: item.field_name.clone(),
+            path: item.source_path.clone(),
+            kind: "field",
+            field_count: 1,
+            password_count: usize::from(item.password_mode),
+            field_type: Some(item.field_type.clone()),
+            password_mode: Some(item.password_mode),
+        })
+        .collect();
+    (nodes, truncated)
+}
+//--agent TASK-224
 
 fn sql_error(e: rusqlite::Error) -> HumanDataError {
     if matches!(e, rusqlite::Error::QueryReturnedNoRows) {

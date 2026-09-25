@@ -1,36 +1,200 @@
 <!doctype html>
+<!--++agent TASK-224 [24.09.2026] Admin: пользователи/приглашения + настройки баз.-->
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Администрирование masking service</title>
-  <link rel="stylesheet" href="/human.css">
+  <title>Администрирование — сервис маскирования</title>
+  <link rel="stylesheet" href="/app.css">
 </head>
 <body data-page="admin">
-  <header><h1>Администрирование</h1><button id="logout">Выйти</button></header>
-  <main>
-    <section>
-      <h2>Сменить мой пароль</h2>
-      <form id="change-password" autocomplete="off">
-        <label>Текущий пароль <input name="current_password" type="password" autocomplete="current-password" required maxlength="1024"></label>
-        <label>Новый пароль <input name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-        <label>Повторите новый пароль <input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
-        <button type="submit">Сменить пароль</button>
-      </form>
-    </section>
-    <section>
-      <h2>Пользователи</h2>
-      <form id="create-user"><label>Логин <input name="login" required maxlength="128"></label><label>Роль <select name="role"><option>Viewer</option><option>Admin</option></select></label><button type="submit">Создать</button></form>
-      <p id="activation" class="sensitive"></p>
-      <div id="users"></div>
-    </section>
-    <section>
-      <h2>Настройки баз</h2>
-      <p>Policy, rules, dictionaries, tool classes, TTL и refresh доступны только в этой Admin-области.</p>
-      <div id="admin-databases"></div>
-    </section>
-  </main>
-  <p id="status" role="status"></p>
-  <script src="/human.js" defer></script>
+  <header class="top">
+    <div class="logo">М</div><span class="title">Администрирование</span>
+    <nav class="nav">
+      <button class="on" id="navUsers" type="button">Пользователи</button>
+      <button id="navDbs" type="button">Базы</button>
+    </nav>
+    <span class="sp"></span>
+    <div class="profile">
+      <button class="btn sm" id="profileBtn" type="button"><span id="profileName"></span> ▾</button>
+      <div class="menu" id="profileMenu">
+        <button id="menuPassword" type="button">Сменить пароль</button>
+        <button id="menuTheme" type="button">Сменить тему</button>
+        <button id="menuLogout" type="button">Выйти</button>
+      </div>
+    </div>
+  </header>
+
+  <section class="screen on" id="s-users"><div class="page">
+    <div class="row spread mb14"><h2 class="m0">Пользователи</h2><button class="btn primary" id="newUserBtn" type="button">Новый пользователь</button></div>
+    <div class="note err" id="usersErr" hidden role="alert"></div>
+    <div class="card flush"><div class="tablewrap"><table>
+      <thead><tr><th>Логин</th><th>Роль</th><th>Состояние</th><th class="hide-sm">Последний вход</th><th></th></tr></thead>
+      <tbody id="usersBody"><tr><td colspan="5" class="empty">Загрузка…</td></tr></tbody>
+    </table></div></div>
+  </div></section>
+
+  <section class="screen" id="s-dbs"><div class="page">
+    <h2>Базы</h2>
+    <div class="note err" id="dbsErr" hidden role="alert"></div>
+    <div class="split">
+      <div class="list" id="dbList"><p class="empty">Загрузка…</p></div>
+      <div class="card" id="dbCard" hidden>
+        <div id="dbHead" class="mb14">
+          <div class="row spread"><h3 id="dbTitle" class="m0"></h3>
+            <button class="btn sm" id="dbRename" type="button">Переименовать</button></div>
+          <div class="row mt8">
+            <code class="mono small muted" id="dbGuid"></code>
+            <button class="btn sm" id="dbGuidCopy" type="button">Копировать ID</button>
+          </div>
+          <div class="row mt8" id="dbRenameRow" hidden>
+            <input class="input" id="dbNameInput" maxlength="128" placeholder="Название базы">
+            <button class="btn sm primary" id="dbNameSave" type="button">Сохранить</button>
+            <button class="btn sm" id="dbNameCancel" type="button">Отмена</button>
+          </div>
+          <div class="note err" id="dbNameErr" hidden role="alert"></div>
+        </div>
+        <div class="tabs" id="dbTabs">
+          <button class="on" data-dt="main" type="button">Основное</button>
+          <button data-dt="tools" type="button">Инструменты</button>
+          <button data-dt="dict" type="button">Справочники</button>
+          <button data-dt="pol" type="button">Правила</button>
+        </div>
+
+        <div id="dt-main">
+          <div class="field"><label>Маскирование</label>
+            <button class="switch" id="dbMode" type="button"><i></i><span>Включено</span></button>
+            <div class="hint">Выключение потребует подтверждения: инструменты базы начнут отдавать данные без маскирования.</div></div>
+          <div class="grid2">
+            <div class="field"><label>Хранить соответствия для раскрытия</label>
+              <div class="row"><input class="input w90" id="ttlMapNum" type="number" min="1"><select class="input wauto" id="ttlMapUnit"><option value="60">минут</option><option value="3600">часов</option><option value="86400">дней</option></select></div>
+              <div class="hint" id="ttlMapHint"></div></div>
+            <div class="field"><label>Хранить историю</label>
+              <div class="row"><input class="input w90" id="ttlHistNum" type="number" min="1"><select class="input wauto" id="ttlHistUnit"><option value="60">минут</option><option value="3600">часов</option><option value="86400">дней</option></select></div>
+              <div class="hint" id="ttlHistHint"></div></div>
+          </div>
+          <!--++agent TASK-224 [08.10.2026] итерация 4: реальный срок жизни
+               записи = min(история, соответствия) — после рестарта mapping
+               в RAM пуст, поэтому вся история удаляется.-->
+          <div class="hint" id="ttlEffHint"></div>
+          <!----agent TASK-224-->
+          <div class="field"><label>Метаданные базы</label>
+            <div class="row"><button class="btn" id="refreshBtn" type="button">Обновить метаданные</button><span id="refreshState" class="tag mut">—</span></div></div>
+          <div class="note err" id="mainErr" hidden role="alert"></div>
+          <button class="btn primary" id="mainSave" type="button">Сохранить</button>
+        </div>
+
+        <div id="dt-tools" hidden>
+          <div class="field"><input class="input" id="toolFilter" placeholder="Найти инструмент"></div>
+          <div class="tablewrap"><table><thead><tr><th>Инструмент</th><th>Режим</th></tr></thead><tbody id="toolsBody"></tbody></table></div>
+          <p class="small muted">«Только метаданные» — инструмент не возвращает данных, маскировать нечего.</p>
+          <div class="note err" id="toolsErr" hidden role="alert"></div>
+          <button class="btn primary" id="toolsSave" type="button" disabled>Сохранить изменения</button>
+        </div>
+
+        <div id="dt-dict" hidden>
+          <div class="field"><label>Что маскировать</label>
+            <div class="seg" id="dictMode"><button type="button" data-mode="all">Все справочники</button><button type="button" data-mode="part">Только выбранные</button></div>
+            <div class="hint" id="dictModeHint"></div></div>
+          <div id="dictPart">
+            <div class="note warn" id="dictNoManifest" hidden>
+              Метаданные базы не получены — дерево недоступно. Уже выбранные источники сохранены в панели справа.
+              <div class="row mt8"><button class="btn sm" id="dictRefresh" type="button">Обновить сейчас</button>
+                <span id="dictRefreshState" class="tag mut"></span></div>
+            </div>
+            <div class="dictgrid">
+              <div>
+                <div class="field"><input class="input" id="dictSearch" placeholder="Найти объект или реквизит"></div>
+                <div class="mtree" id="dictTree"></div>
+              </div>
+              <div class="card p14 dictside">
+                <h3 class="m0">Что маскируется</h3>
+                <div class="hint" id="dictCount"></div>
+                <div id="dictSelList"></div>
+                <div class="field mt10"><label for="dictCatDefault">Категория для новых источников</label>
+                  <input class="input" id="dictCatDefault" maxlength="32" placeholder="например, FIO"></div>
+              </div>
+            </div>
+            <details class="small mt10"><summary class="muted">Дополнительно — источник вручную и условие (JSON)</summary>
+              <div class="card mt10 p14">
+                <div class="grid2">
+                  <div class="field"><label for="dictPath">Источник (путь)</label><input class="input mono" id="dictPath" placeholder="Справочник.Контрагенты.ИНН"></div>
+                  <div class="field"><label for="dictCat">Категория</label><input class="input" id="dictCat" placeholder="inn" maxlength="32"></div>
+                </div>
+                <div class="field"><label for="dictFilter">Условие (JSON)</label><textarea class="input mono" id="dictFilter" rows="3" placeholder="null"></textarea></div>
+                <div class="row mt8"><button class="btn" id="dictAdd" type="button">Добавить источник</button></div>
+              </div>
+            </details>
+          </div>
+          <div class="note err" id="dictErr" hidden role="alert"></div>
+          <button class="btn primary" id="dictSave" type="button">Сохранить</button>
+        </div>
+
+        <div id="dt-pol" hidden>
+          <div class="tablewrap"><table><thead><tr><th>Версия</th><th>Состояние</th><th>Правил</th><th></th></tr></thead><tbody id="polBody"></tbody></table></div>
+          <div class="note err" id="polErr" hidden role="alert"></div>
+          <button class="btn" id="polNew" type="button">Новая версия на основе действующей</button>
+        </div>
+      </div>
+    </div>
+  </div></section>
+
+  <div class="overlay" id="dlgNew"><div class="card dialog">
+    <h2>Новый пользователь</h2>
+    <div class="note err" id="newErr" hidden role="alert"></div>
+    <form id="newForm" autocomplete="off">
+      <div class="field"><label for="newLogin">Логин</label><input class="input mono" id="newLogin" required maxlength="128"><div class="hint" id="newLoginHint"></div></div>
+      <div class="field"><label>Роль</label>
+        <label class="row"><input type="radio" name="newRole" value="Viewer" checked> Просмотр истории — видит отчёты и может раскрывать значения</label>
+        <label class="row"><input type="radio" name="newRole" value="Admin"> Администратор — пользователи и настройки баз, без раскрытия</label></div>
+      <div class="row"><button class="btn primary" type="submit">Создать и выдать приглашение</button><button class="btn" id="newCancel" type="button">Отмена</button></div>
+    </form>
+  </div></div>
+
+  <div class="overlay" id="dlgInvite"><div class="card dialog">
+    <h2>Приглашение для <span class="mono" id="invLogin"></span></h2>
+    <div class="note warn" id="invLive">Действует ещё <span class="timer" id="invTimer">15:00</span>. Код показывается только сейчас.</div>
+    <div class="note err" id="invDead" hidden>Приглашение истекло. <button class="btn link" id="invReissue" type="button">Выпустить новое</button></div>
+    <div class="field"><label>Ссылка</label><div class="code"><span id="invUrl"></span><button class="btn sm" data-copy="invUrl" type="button">Копировать</button></div></div>
+    <div class="field"><label>Код</label><div class="code"><span id="invCode"></span><button class="btn sm" data-copy="invCode" type="button">Копировать</button></div></div>
+    <div class="field"><label>Готовое сообщение</label><div class="code plain"><span id="invMsg"></span><button class="btn sm" data-copy="invMsg" type="button">Копировать</button></div></div>
+    <div class="row"><button class="btn primary" id="invDone" type="button">Готово</button></div>
+  </div></div>
+
+  <div class="overlay" id="dlgUser"><div class="card dialog">
+    <h2 class="mono" id="userLogin"></h2>
+    <div class="note err" id="userErr" hidden role="alert"></div>
+    <div class="field"><label>Роль</label><div class="seg" id="userRoleSeg"><button type="button" data-role="Viewer">Просмотр истории</button><button type="button" data-role="Admin">Администратор</button></div></div>
+    <div class="field"><label>Доступ</label><div class="row"><span class="tag" id="userStatusTag"></span><button class="btn sm danger" id="userToggle" type="button"></button></div></div>
+    <!--++agent TASK-224 [08.10.2026] итерация 4: при несохранённом статусе
+         или отключённом пользователе приглашение/сброс блокируются — причина
+         показывается здесь, действие не уходит от устаревшего состояния.-->
+    <div class="hint" id="userAccessHint" hidden></div>
+    <!----agent TASK-224-->
+    <div class="field" id="userInviteRow"><label>Приглашение</label><button class="btn sm" id="userReissue" type="button">Выпустить новое</button></div>
+    <div class="field" id="userResetRow"><label>Пароль</label><button class="btn sm" id="userReset" type="button">Сбросить и выдать новое приглашение</button><div class="hint">Старый пароль перестанет работать, все сеансы будут завершены.</div></div>
+    <div class="field" id="userDeleteRow"><label>Учётная запись</label><button class="btn sm danger" id="userDelete" type="button">Удалить пользователя</button><div class="hint">Возможно только для пользователя, который ни разу не входил. Логин освобождается.</div></div>
+    <div class="row"><button class="btn primary" id="userSave" type="button" disabled>Сохранить</button><button class="btn" id="userClose" type="button">Закрыть</button></div>
+  </div></div>
+
+  <div class="overlay" id="dlgConfirm"><div class="card dialog">
+    <h2 id="confirmTitle">Подтвердите действие</h2>
+    <p id="confirmText"></p>
+    <div class="row"><button class="btn danger" id="confirmYes" type="button">Подтвердить</button><button class="btn" id="confirmNo" type="button">Отмена</button></div>
+  </div></div>
+
+  <div class="overlay" id="dlgPass"><div class="card dialog">
+    <h2>Смена пароля</h2>
+    <div class="note err" id="passErr" hidden role="alert"></div>
+    <div class="note ok" id="passOk" hidden>Пароль изменён. Другие сеансы завершены.</div>
+    <form id="passForm" autocomplete="off">
+      <div class="field"><label for="pwCurrent">Текущий пароль</label><input class="input" id="pwCurrent" type="password" autocomplete="current-password" required maxlength="1024"></div>
+      <div class="field"><label for="pwNew">Новый пароль</label><input class="input" id="pwNew" type="password" autocomplete="new-password" required maxlength="1024"><div class="hint">Не короче 12 символов.</div></div>
+      <div class="field"><label for="pwRepeat">Повторите новый</label><input class="input" id="pwRepeat" type="password" autocomplete="new-password" required maxlength="1024"></div>
+      <div class="row"><button class="btn primary" type="submit">Сменить</button><button class="btn" id="passCancel" type="button">Отмена</button></div>
+    </form>
+  </div></div>
+
+  <script src="/app.js" defer></script>
 </body>
 </html>
