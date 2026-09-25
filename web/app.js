@@ -1148,7 +1148,7 @@ async function adminPage() {
       const fresh = dbs.list.find(d => d.id === dbs.current.id);
       if (fresh) {
         dbs.current = fresh;
-        renderDbHead(fresh);
+        renderDbHead(fresh, true); // TASK-224: не закрывать открытую правку имени
         renderRefreshState(fresh);
       }
     }
@@ -1157,14 +1157,22 @@ async function adminPage() {
   //++agent TASK-224 [24.09.2026] шапка базы: display_label крупно; без имени —
   // короткий GUID + метка «без названия»; полный GUID мелко + копирование.
   //--agent TASK-224
-  const renderDbHead = db => {
+  const renderDbHead = (db, keepEdit) => {
     const title = $('#dbTitle');
     title.replaceChildren(el('span', '', db.display_label || shortId(db.id)));
     if (!db.display_label) title.append(document.createTextNode(' '), el('span', 'tag mut', 'без названия'));
     $('#dbGuid').textContent = db.id;
+    //**agent TASK-224 [25.09.2026 13:30:00] фоновый опрос статуса (каждые 3 с)
+    // перерисовывает шапку той же базы; сбрасывать открытую правку имени нельзя,
+    // иначе окно переименования закрывается через 1-2 с.
+    // $('#dbNameInput').value = db.display_label || '';
+    // $('#dbRenameRow').hidden = true;
+    // $('#dbNameErr').hidden = true;
+    if (keepEdit && !$('#dbRenameRow').hidden) return;
     $('#dbNameInput').value = db.display_label || '';
     $('#dbRenameRow').hidden = true;
     $('#dbNameErr').hidden = true;
+    //**agent TASK-224
   };
 
   $('#dbGuidCopy').addEventListener('click', async () => {
@@ -1191,6 +1199,7 @@ async function adminPage() {
         method: 'PATCH',
         body: JSON.stringify({ display_label: $('#dbNameInput').value.trim() }),
       });
+      $('#dbRenameRow').hidden = true; // TASK-224: сохранено — закрыть правку явно
       await loadDatabases();
     } catch (error) {
       showError($('#dbNameErr'), error);
