@@ -615,7 +615,11 @@ impl MaskingService {
         if request.tool_name == "execute_query"
             && matches!(&request.outcome, FinalizeOutcome::ToolResult { .. })
             && logical_result.get("success") != Some(&Value::Bool(false))
-            && !valid_query_lineage(&logical_result, &request.field_sources)
+            && !valid_query_lineage(
+                &logical_result,
+                &request.field_sources,
+                settings.strict_mode,
+            )
         {
             return self.persist_sanitized_failure(
                 &request,
@@ -1068,7 +1072,36 @@ fn validate_tool_result(result: &Value) -> Result<(), ()> {
 //++agent TASK-221 [23.09.2026 18:30:00]
 // Query rows require an unambiguous canonical source for every public column.
 // Other tools can return arbitrary text and use their remaining detectors.
-fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> bool {
+//++agent TASK-225 [25.09.2026]
+// `strict_mode` — настройка базы (databases.strict_mode): при включении
+// колонки с `unverified:true` допустимы и их значения маскируются
+// целиком в движке; при выключении маркер остаётся отказом.
+// Белые списки ключей evidence строгого режима (контракт с границей
+// t226): неизвестное поле колонки или lineage — отказ.
+const COLUMN_EVIDENCE_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "types",
+    "sources",
+    "sourceless",
+    "unverified",
+    "output_types",
+];
+const LINEAGE_EVIDENCE_KEYS: &[&str] = &[
+    "column",
+    "result_name",
+    "name",
+    "source_path",
+    "source_type",
+    "source_types",
+    "secret_cut",
+];
+
+fn valid_query_lineage(
+    result: &Value,
+    field_sources: &super::FieldSources,
+    strict_mode: bool,
+) -> bool {
     // Контракт Р2: `result` — сам бизнес-результат запроса; data/rows лежат
     // на верхнем уровне, обёртки ToolCallResult внутри нет.
     let payloads: Vec<&Value> = vec![result];
@@ -1116,26 +1149,65 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
     // `sources` пуст + `sourceless` ∈ {count,literal,parameter,value,
     // composite} → колонка допустима, а её значения проверяются по
     // строкам ниже (примитивы; для count — только числа). Маркер
-    // `unverified` — отказ в любом виде: строгий режим обработки
-    // непроверенных колонок — отдельный шаг, до него сервис обязан
-    // закрывать выдачу при неизвестном evidence.
+    // `unverified` — только `true` и только при strict_mode базы:
+    // колонка допустима, а все её значения маскируются целиком
+    // типизированным токеном в движке; без strict_mode маркер —
+    // отказ, как и любое неизвестное поле evidence.
     //++agent TASK-225
     let mut sourceless_by_name = HashMap::new();
+    let mut unverified_by_name = HashSet::new();
     for column in columns {
+        //++agent TASK-225 [25.09.2026]
+        // Неизвестные ключи evidence — отказ. Белый список колонки:
+        // name, type/types (типы источника), sources, sourceless,
+        // unverified, output_types (платформенные типы колонки,
+        // эмитируются границей на всех колонках при включённом флаге).
+        if column.as_object().is_none_or(|keys| {
+            keys.keys()
+                .any(|key| !COLUMN_EVIDENCE_KEYS.contains(&key.as_str()))
+        }) {
+            return false;
+        }
+        //++agent TASK-225
         let Some(name) = column.get("name").and_then(Value::as_str) else {
             return false;
         };
-        if column.get("unverified").is_some() {
-            return false;
-        }
+        // Маркер принимает единственную форму `unverified:true`; любое
+        // другое значение — неизвестное evidence и отказ. Без strict_mode
+        // и сам маркер — отказ как раньше.
+        let unverified = match column.get("unverified") {
+            None => false,
+            Some(Value::Bool(true)) if strict_mode => true,
+            Some(_) => return false,
+        };
         let Some(sources) = column.get("sources").and_then(Value::as_array) else {
             return false;
         };
         if name.is_empty()
             || sources_by_name.contains_key(name)
             || sourceless_by_name.contains_key(name)
+            || unverified_by_name.contains(name)
         {
             return false;
+        }
+        if unverified {
+            // Противоречия отсекаются: sourceless доказывал бы допуск,
+            // а output_types обязан лежать на unverified-колонке
+            // (массив платформенных имён типов, пустой допустим).
+            // Пути в sources не проверяются: они заведомо недоказуемы
+            // (пустой массив либо неразрешимые/нестроковые пути).
+            if column.get("sourceless").is_some() {
+                return false;
+            }
+            let types_valid = column
+                .get("output_types")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().all(Value::is_string));
+            if !types_valid {
+                return false;
+            }
+            unverified_by_name.insert(name);
+            continue;
         }
         if sources.is_empty() {
             let Some(kind) = column.get("sourceless").and_then(Value::as_str) else {
@@ -1165,6 +1237,16 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
     }
     let mut evidenced = HashMap::<&str, HashSet<&str>>::new();
     for item in &field_sources.lineage {
+        //++agent TASK-225 [25.09.2026]
+        // Неизвестные ключи lineage — отказ (маркер unverified здесь
+        // не входит в контракт и тоже отсекается списком).
+        if item.as_object().is_none_or(|keys| {
+            keys.keys()
+                .any(|key| !LINEAGE_EVIDENCE_KEYS.contains(&key.as_str()))
+        }) {
+            return false;
+        }
+        //++agent TASK-225
         if item.get("unverified").is_some() {
             return false;
         }
@@ -1179,6 +1261,14 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
         let Some(path) = item.get("source_path").and_then(Value::as_str) else {
             return false;
         };
+        //++agent TASK-225 [25.09.2026]
+        // Граница эмитирует lineage и по недоказуемым источникам
+        // (unverified-кейс с непустым sources): элемент допустим,
+        // значение колонки всё равно маскируется целиком.
+        if unverified_by_name.contains(name) {
+            continue;
+        }
+        //++agent TASK-225
         if !sources_by_name
             .get(name)
             .is_some_and(|paths| paths.contains(path))
@@ -1197,7 +1287,11 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
         rows.iter().all(|row| {
             row.as_object().is_some_and(|fields| {
                 fields.iter().all(|(name, value)| {
-                    if let Some(&kind) = sourceless_by_name.get(name.as_str()) {
+                    if unverified_by_name.contains(name.as_str()) {
+                        // Любое JSON-значение: ячейка маскируется
+                        // целиком одним токеном в движке.
+                        true
+                    } else if let Some(&kind) = sourceless_by_name.get(name.as_str()) {
                         sourceless_cell_valid(value, kind)
                     } else {
                         sources_by_name.contains_key(name.as_str())

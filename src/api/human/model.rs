@@ -29,6 +29,10 @@ pub struct DatabaseSummary {
     /// (COUNT(*) WHERE auto_added=1).
     //++agent TASK-225
     pub new_tools_count: i64,
+    /// Строгий режим lineage (databases.strict_mode): unverified-
+    /// колонки execute_query маскируются целиком вместо отказа.
+    //++agent TASK-225
+    pub strict_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +117,11 @@ pub struct AdminDatabasePatch {
     pub mode: Option<String>,
     pub mapping_ttl_seconds: Option<u64>,
     pub history_ttl_seconds: Option<u64>,
+    //++agent TASK-225 [25.09.2026]
+    // Tri-state через Option: поле отсутствует — настройку strict_mode
+    // не трогаем; true/false пишутся напрямую.
+    //++agent TASK-225
+    pub strict_mode: Option<bool>,
     //++agent TASK-224 [24.09.2026]
     // Tri-state: поле отсутствует — не трогаем; null/пустая строка — сброс
     // названия (колонка nullable); строка — установить. serde не различает

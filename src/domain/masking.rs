@@ -115,6 +115,11 @@ struct FieldEvidence {
     source_paths: Vec<String>,
     field_types: Vec<String>,
     secret_cut: bool,
+    //++agent TASK-225 [25.09.2026]
+    // Строгий режим: колонка помечена границей как unverified — её
+    // происхождение недоказуемо, значение маскируется целиком.
+    //++agent TASK-225
+    unverified: bool,
 }
 
 impl MaskEngine {
@@ -400,6 +405,28 @@ impl MaskEngine {
         {
             return Err(());
         }
+        //++agent TASK-225 [25.09.2026]
+        // Строгий режим: ячейка unverified-колонки заменяется одним
+        // обратимым токеном целиком — любой JSON-тип, без рекурсии в
+        // объект/массив (их внутренние ключи недоказуемы вместе с
+        // колонкой). Категория токена следует фактическому типу
+        // значения: объявленные output_types — только evidence.
+        if let Some(name) = field {
+            if context
+                .evidence
+                .get(&name.to_lowercase())
+                .is_some_and(|item| item.unverified)
+            {
+                context.reasons.insert(format!("unverified:{name}"));
+                return plan(
+                    context,
+                    unverified_category(value),
+                    &unverified_original(value),
+                )
+                .map(Value::String);
+            }
+        }
+        //++agent TASK-225
         match value {
             Value::Object(object) => {
                 let mut output = Map::with_capacity(object.len());
@@ -731,6 +758,34 @@ fn plan(context: &mut WalkContext<'_>, category: &str, original: &str) -> Result
         .map_err(|_| ())
 }
 
+//++agent TASK-225 [25.09.2026]
+// Типизация токена unverified-ячейки по фактическому JSON-типу:
+// bool/NULL/числа получают собственную категорию и не проходят
+// незамаскированными. `output_types` (платформенные имена) в категорию
+// не идут — категория должна следовать значению, а не декларации.
+fn unverified_category(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "UNVERIFIED_NULL",
+        Value::Bool(_) => "UNVERIFIED_BOOL",
+        Value::Number(_) => "UNVERIFIED_NUMBER",
+        Value::String(_) => "UNVERIFIED_STRING",
+        Value::Array(_) => "UNVERIFIED_ARRAY",
+        Value::Object(_) => "UNVERIFIED_OBJECT",
+    }
+}
+
+// Каноническая форма значения для дедупликации mapping: одинаковые
+// значения unverified-колонки получают один токен.
+fn unverified_original(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => "null".to_owned(),
+        scalar => serde_json::to_string(scalar).unwrap_or_default(),
+    }
+}
+//++agent TASK-225
+
 fn replace_matches<F>(regex: &Regex, text: &str, mut replacement: F) -> Result<String, ()>
 where
     F: FnMut(&str) -> Result<String, ()>,
@@ -758,14 +813,17 @@ fn parse_evidence(value: &Value) -> HashMap<String, FieldEvidence> {
     {
         for column in columns {
             if let Some(name) = column.get("name").and_then(Value::as_str) {
-                result
+                let entry = result
                     .entry(name.to_lowercase())
-                    .or_insert_with(FieldEvidence::default)
-                    .field_types = column
+                    .or_insert_with(FieldEvidence::default);
+                entry.field_types = column
                     .get("type")
                     .or_else(|| column.get("types"))
                     .map(parse_types)
                     .unwrap_or_default();
+                //++agent TASK-225 [25.09.2026]
+                entry.unverified |= column.get("unverified").and_then(Value::as_bool) == Some(true);
+                //++agent TASK-225
             }
         }
     }

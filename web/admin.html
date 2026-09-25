@@ -65,6 +65,12 @@
           <div class="field"><label>Маскирование</label>
             <button class="switch" id="dbMode" type="button"><i></i><span>Включено</span></button>
             <div class="hint">Выключение потребует подтверждения: инструменты базы начнут отдавать данные без маскирования.</div></div>
+          <!--++agent TASK-225 [25.09.2026] строгий режим lineage: тумблер
+               в стиле переключателя маскирования (TASK-224).-->
+          <div class="field"><label>Строгий режим lineage</label>
+            <button class="switch" id="dbStrict" type="button"><i></i><span>Включён</span></button>
+            <div class="hint">При включении непроверенные колонки запросов возвращаются с полностью маскированными значениями; при выключении — отказ запроса.</div></div>
+          <!--++agent TASK-225-->
           <div class="grid2">
             <div class="field"><label>Хранить соответствия для раскрытия</label>
               <div class="row"><input class="input w90" id="ttlMapNum" type="number" min="1"><select class="input wauto" id="ttlMapUnit"><option value="60">минут</option><option value="3600">часов</option><option value="86400">дней</option></select></div>

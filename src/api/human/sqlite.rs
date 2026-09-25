@@ -45,7 +45,8 @@ impl HumanDataStore for SqliteHumanDataStore {
             let mut statement = connection.prepare(
                 "SELECT d.id,COALESCE(d.display_label,d.id),d.display_label,d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
                         COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END),
-                        (SELECT COUNT(*) FROM tool_classifications t WHERE t.database_id=d.id AND t.auto_added=1)
+                        (SELECT COUNT(*) FROM tool_classifications t WHERE t.database_id=d.id AND t.auto_added=1),
+                        d.strict_mode
                  FROM databases d
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
                  LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
@@ -62,6 +63,9 @@ impl HumanDataStore for SqliteHumanDataStore {
                     history_ttl_seconds: row.get::<_, i64>(5)?.max(1) as u64,
                     refresh_stage: row.get(6)?,
                     new_tools_count: row.get(7)?,
+                    //++agent TASK-225 [25.09.2026]
+                    strict_mode: row.get::<_, i64>(8)? != 0,
+                    //++agent TASK-225
                 })
             })?.collect();
             //++agent TASK-222
@@ -199,8 +203,8 @@ impl HumanDataStore for SqliteHumanDataStore {
                 |row| row.get(0),
             )?;
             let changed = transaction.execute(
-                "UPDATE databases SET mode=COALESCE(?1,mode),mapping_ttl_seconds=COALESCE(?2,mapping_ttl_seconds),history_ttl_seconds=COALESCE(?3,history_ttl_seconds),display_label=CASE WHEN ?4=1 THEN ?5 ELSE display_label END,updated_at=?6 WHERE id=?7",
-                params![mode.map(DatabaseMode::as_str), patch.mapping_ttl_seconds.map(|value| value as i64), patch.history_ttl_seconds.map(|value| value as i64), i64::from(label_written), label_value, Utc::now().to_rfc3339(), database_id.to_string()],
+                "UPDATE databases SET mode=COALESCE(?1,mode),mapping_ttl_seconds=COALESCE(?2,mapping_ttl_seconds),history_ttl_seconds=COALESCE(?3,history_ttl_seconds),display_label=CASE WHEN ?4=1 THEN ?5 ELSE display_label END,strict_mode=COALESCE(?6,strict_mode),updated_at=?7 WHERE id=?8",
+                params![mode.map(DatabaseMode::as_str), patch.mapping_ttl_seconds.map(|value| value as i64), patch.history_ttl_seconds.map(|value| value as i64), i64::from(label_written), label_value, patch.strict_mode.map(i64::from), Utc::now().to_rfc3339(), database_id.to_string()],
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);

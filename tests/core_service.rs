@@ -3309,3 +3309,225 @@ async fn opaque_tool_call_result_passes_through_without_rewrap() {
     assert_eq!(response.public_result, opaque);
 }
 //++agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+// Строгий режим lineage (databases.strict_mode, default ON): колонка с
+// `unverified:true` + `output_types` не отклоняется, а каждое значение
+// уходит одним типизированным токеном — строки, числа, булево, null и
+// контейнеры. Неизвестные поля evidence и противоречия — отказ.
+#[test]
+fn strict_mode_defaults_to_on_for_new_databases() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let (settings, created) = storage.ensure_database(Uuid::new_v4()).unwrap();
+    assert!(created);
+    assert!(settings.strict_mode);
+}
+
+async fn finalize_unverified(
+    state: &AppState,
+    database_id: Uuid,
+    columns: Value,
+    rows: Value,
+    lineage: Vec<Value>,
+) -> Value {
+    let (call_id, correlation_id, _) = request_ids();
+    state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-strict".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": rows}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns": columns}),
+                lineage,
+            },
+        })
+        .await
+        .unwrap()
+        .public_result
+}
+
+#[tokio::test]
+async fn strict_mode_masks_unverified_values_of_any_json_type() {
+    for (value, category) in [
+        (json!("СыраяПодстрока"), "UNVERIFIED_STRING"),
+        (json!(42.5), "UNVERIFIED_NUMBER"),
+        (json!(true), "UNVERIFIED_BOOL"),
+        (json!(null), "UNVERIFIED_NULL"),
+        (json!({"_objectRef": true, "id": "x"}), "UNVERIFIED_OBJECT"),
+        (json!([1, 2]), "UNVERIFIED_ARRAY"),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        let public = finalize_unverified(
+            &state,
+            database_id,
+            json!([{"name":"Выражение","sources":[],"unverified":true,"output_types":["Строка"]}]),
+            json!([{"Выражение": value}]),
+            vec![],
+        )
+        .await;
+        assert_eq!(public["is_error"], json!(false), "{category}");
+        let text = public["content"][0]["text"].as_str().unwrap();
+        let inner: Value = serde_json::from_str(text).unwrap();
+        let cell = &inner["data"][0]["Выражение"];
+        assert!(
+            cell.as_str()
+                .is_some_and(|token| token.starts_with(&format!("[MASK:v1:{category}:"))),
+            "{category}: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_mode_off_keeps_unverified_refusal() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .storage
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE databases SET strict_mode=0 WHERE id=?1",
+                [database_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let public = finalize_unverified(
+        &state,
+        database_id,
+        json!([{"name":"Выражение","sources":[],"unverified":true,"output_types":["Строка"]}]),
+        json!([{"Выражение": "скрыто"}]),
+        vec![],
+    )
+    .await;
+    assert_eq!(public["is_error"], json!(true));
+    assert!(!serde_json::to_string(&public).unwrap().contains("скрыто"));
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_malformed_unverified_evidence() {
+    for (column, lineage, note) in [
+        // Нет output_types на unverified-колонке — отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":true}),
+            vec![],
+            "unverified without output_types",
+        ),
+        // output_types не массив строк — отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":true,"output_types":"Строка"}),
+            vec![],
+            "output_types not an array",
+        ),
+        // unverified ≠ true — отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":"yes","output_types":[]}),
+            vec![],
+            "unverified not boolean true",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"unverified":false,"output_types":[]}),
+            vec![],
+            "unverified false marker",
+        ),
+        // unverified + sourceless — противоречие, отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":true,"output_types":[],"sourceless":"literal"}),
+            vec![],
+            "unverified with sourceless",
+        ),
+        // Неизвестный ключ колонки — отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":true,"output_types":[],"surprise":1}),
+            vec![],
+            "unknown column key",
+        ),
+        // sources не массив — отказ.
+        (
+            json!({"name":"Кол","unverified":true,"output_types":[]}),
+            vec![],
+            "unverified without sources array",
+        ),
+        // Маркер на lineage-элементе — отказ.
+        (
+            json!({"name":"Кол","sources":["Справочник.Test.Поле"],"unverified":true,"output_types":[]}),
+            vec![json!({"column":"Кол","source_path":"Справочник.Test.Поле","unverified":true})],
+            "unverified on lineage item",
+        ),
+        // Неизвестный ключ lineage-элемента — отказ.
+        (
+            json!({"name":"Кол","sources":[],"unverified":true,"output_types":[]}),
+            vec![json!({"column":"Кол","source_path":"Справочник.Test.Поле","extra":"x"})],
+            "unknown lineage key",
+        ),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        let public = finalize_unverified(
+            &state,
+            database_id,
+            json!([column]),
+            json!([{"Кол": "значение"}]),
+            lineage,
+        )
+        .await;
+        assert_eq!(public["is_error"], json!(true), "{note}");
+    }
+}
+
+#[tokio::test]
+async fn strict_mode_unverified_column_with_unresolvable_sources_is_masked() {
+    // Кейс границы: sources непусты, но путь не разрешается — колонка
+    // помечается unverified, lineage-элемент по тому же пути допустим,
+    // значение маскируется целиком.
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let public = finalize_unverified(
+        &state,
+        database_id,
+        json!([{"name":"Выражение","sources":["Справочник.Несуществующий.Путь"],"unverified":true,"output_types":["Строка","Число"]}]),
+        json!([{"Выражение": "сырое"}]),
+        vec![json!({"column":"Выражение","source_path":"Справочник.Несуществующий.Путь","source_types":[],"secret_cut":false})],
+    )
+    .await;
+    assert_eq!(public["is_error"], json!(false));
+    let serialized = serde_json::to_string(&public).unwrap();
+    assert!(serialized.contains("[MASK:v1:UNVERIFIED_STRING:"));
+    assert!(!serialized.contains("сырое"));
+}
+
+#[tokio::test]
+async fn strict_mode_keeps_verified_and_secret_columns_unchanged() {
+    // output_types на обычных колонках не ломает проверенный путь;
+    // секрет по-прежнему режется до маскирования.
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let public = finalize_unverified(
+        &state,
+        database_id,
+        json!([
+            {"name":"Секрет","sources":["Справочник.Test.APIKey"],"output_types":["Строка"]},
+            {"name":"Выражение","sources":[],"unverified":true,"output_types":["Строка"]},
+            {"name":"К","sources":[],"sourceless":"count","output_types":["Число"]}
+        ]),
+        json!([{"Секрет": "тайное-значение", "Выражение": "подстрока", "К": 27}]),
+        vec![json!({"column":"Секрет","source_path":"Справочник.Test.APIKey","source_types":["Строка"],"secret_cut":true})],
+    )
+    .await;
+    assert_eq!(public["is_error"], json!(false));
+    let text = public["content"][0]["text"].as_str().unwrap();
+    let inner: Value = serde_json::from_str(text).unwrap();
+    let row = &inner["data"][0];
+    assert_eq!(row["Секрет"], json!("[SECRET_REMOVED]"), "{text}");
+    assert!(
+        row["Выражение"]
+            .as_str()
+            .is_some_and(|token| token.starts_with("[MASK:v1:UNVERIFIED_STRING:")),
+        "{text}"
+    );
+    // КОЛИЧЕСТВО(*) без маркера остаётся числом без маскирования.
+    assert_eq!(row["К"], json!(27), "{text}");
+}
+//++agent TASK-225

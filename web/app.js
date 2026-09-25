@@ -1270,6 +1270,9 @@ async function adminPage() {
 
   // Основное
   let dbModeOn = true;
+  //++agent TASK-225 [25.09.2026] состояние тумблера строгого режима.
+  let dbStrictOn = true;
+  //++agent TASK-225
   const ttlToFields = (seconds, numId, unitId) => {
     for (const unit of [86400, 3600, 60]) {
       if (seconds >= unit && seconds % unit === 0) {
@@ -1312,6 +1315,12 @@ async function adminPage() {
     const sw = $('#dbMode');
     sw.classList.toggle('on', dbModeOn);
     sw.lastElementChild.textContent = dbModeOn ? 'Включено' : 'Выключено';
+    //++agent TASK-225 [25.09.2026]
+    dbStrictOn = db.strict_mode !== false;
+    const strictSw = $('#dbStrict');
+    strictSw.classList.toggle('on', dbStrictOn);
+    strictSw.lastElementChild.textContent = dbStrictOn ? 'Включён' : 'Выключен';
+    //++agent TASK-225
     ttlToFields(db.mapping_ttl_seconds, '#ttlMapNum', '#ttlMapUnit');
     ttlToFields(db.history_ttl_seconds, '#ttlHistNum', '#ttlHistUnit');
     ttlHints();
@@ -1331,6 +1340,23 @@ async function adminPage() {
       $('#dbMode').lastElementChild.textContent = 'Включено';
     }
   });
+  //++agent TASK-225 [25.09.2026]
+  // Выключение строгого режима меняет поведение на жёсткий отказ —
+  // спрашиваем подтверждение как при выключении маскирования.
+  $('#dbStrict').addEventListener('click', () => {
+    if (dbStrictOn) {
+      askConfirm('Выключить строгий режим?', 'Запросы с непроверенными колонками будут снова отклоняться вместо возврата маскированных значений.', () => {
+        dbStrictOn = false;
+        $('#dbStrict').classList.remove('on');
+        $('#dbStrict').lastElementChild.textContent = 'Выключен';
+      });
+    } else {
+      dbStrictOn = true;
+      $('#dbStrict').classList.add('on');
+      $('#dbStrict').lastElementChild.textContent = 'Включён';
+    }
+  });
+  //++agent TASK-225
   //++agent TASK-224 [08.10.2026] обе пары полей влияют на effective-hint.
   for (const id of ['#ttlMapNum', '#ttlMapUnit', '#ttlHistNum', '#ttlHistUnit']) {
     $(id).addEventListener('input', ttlHints);
@@ -1364,6 +1390,9 @@ async function adminPage() {
           mode: dbModeOn ? 'enabled' : 'disabled',
           mapping_ttl_seconds: mapping,
           history_ttl_seconds: historyTtl,
+          //++agent TASK-225 [25.09.2026]
+          strict_mode: dbStrictOn,
+          //++agent TASK-225
         }),
       });
       await loadDatabases();

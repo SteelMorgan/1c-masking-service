@@ -35,6 +35,9 @@ const CALL_CONTEXTS_MIGRATION: &str = include_str!("../../migrations/0009_call_c
 // прихода миграций на merge не гарантирован.
 const TOOL_AUTO_CLASS_MIGRATION: &str =
     include_str!("../../migrations/0011_tool_auto_classification.sql");
+// Миграция 0012 (строгий режим lineage): колонка strict_mode в databases,
+// тот же поколоночный контракт применения, что у 0011.
+const STRICT_MODE_MIGRATION: &str = include_str!("../../migrations/0012_strict_mode.sql");
 //++agent TASK-225
 
 pub enum HistoryWrite {
@@ -138,9 +141,28 @@ impl SqliteStorage {
             |row| row.get(0),
         )?;
         if !has_tool_auto_class {
-            apply_tool_auto_class_migration(&transaction, TOOL_AUTO_CLASS_MIGRATION)?;
+            apply_add_column_migration(
+                &transaction,
+                "tool_classifications",
+                TOOL_AUTO_CLASS_MIGRATION,
+            )?;
             transaction.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        // Миграция 0012 (строгий режим): та же поколоночная стратегия —
+        // пропустить существующую колонку strict_mode, громко упасть при
+        // несовместимом типе. default 1 соответствует решению «default ON».
+        let has_strict_mode: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=12)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_strict_mode {
+            apply_add_column_migration(&transaction, "databases", STRICT_MODE_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?1)",
                 [Utc::now().to_rfc3339()],
             )?;
         }
@@ -847,7 +869,7 @@ fn load_database(
     database_id: Uuid,
 ) -> rusqlite::Result<Option<DatabaseSettings>> {
     connection.query_row(
-        "SELECT mode,mapping_ttl_seconds,history_ttl_seconds,active_policy_id,active_cache_version FROM databases WHERE id=?1",
+        "SELECT mode,mapping_ttl_seconds,history_ttl_seconds,active_policy_id,active_cache_version,strict_mode FROM databases WHERE id=?1",
         [database_id.to_string()], |row| {
             let mode: String = row.get(0)?;
             Ok(DatabaseSettings {
@@ -856,6 +878,7 @@ fn load_database(
                 history_ttl_seconds: row.get::<_, i64>(2)?.max(1) as u64,
                 active_policy_id: row.get(3)?,
                 active_cache_version: row.get::<_, Option<i64>>(4)?.map(|value| value.max(0) as u64),
+                strict_mode: row.get::<_, i64>(5)? != 0,
             })
         },
     ).optional()
@@ -1268,19 +1291,22 @@ fn audit_call_denied(
 //++agent TASK-225
 
 //++agent TASK-225 [25.09.2026]
-/// Поколоночное применение миграции `ALTER TABLE tool_classifications
-/// ADD COLUMN ...` (файл 0011): колонки, уже созданные миграцией 0010
-/// (порядок прихода миграций на merge не гарантирован), пропускаются;
-/// колонка с несовпадающим типом — ошибка запуска сервиса, а не тихий
-/// пропуск (иначе `tool_class` молча ломался бы на каждом вызове).
-fn apply_tool_auto_class_migration(
+/// Поколоночное применение миграций вида `ALTER TABLE <table>
+/// ADD COLUMN ...` (файлы 0011/0012): колонки, уже созданные
+/// параллельной миграцией (порядок прихода миграций на merge не
+/// гарантирован), пропускаются; колонка с несовпадающим типом —
+/// ошибка запуска сервиса, а не тихий пропуск. Имя таблицы —
+/// внутренняя константа вызова, не ввод пользователя.
+fn apply_add_column_migration(
     transaction: &rusqlite::Transaction<'_>,
+    table: &str,
     ddl: &str,
 ) -> rusqlite::Result<()> {
     let mut existing = std::collections::HashMap::new();
     {
-        let mut statement = transaction
-            .prepare("SELECT name, type FROM pragma_table_info('tool_classifications')")?;
+        let mut statement = transaction.prepare(&format!(
+            "SELECT name, type FROM pragma_table_info('{table}')"
+        ))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1301,7 +1327,7 @@ fn apply_tool_auto_class_migration(
             continue;
         }
         // Форма оператора зафиксирована файлом миграции:
-        // `ALTER TABLE tool_classifications ADD COLUMN <name> <type> ...`
+        // `ALTER TABLE <table> ADD COLUMN <name> <type> ...`
         let mut words = statement.split_whitespace();
         let column = words
             .find(|word| word.eq_ignore_ascii_case("column"))

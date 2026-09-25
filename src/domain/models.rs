@@ -163,6 +163,12 @@ pub struct DatabaseSettings {
     pub history_ttl_seconds: u64,
     pub active_policy_id: Option<String>,
     pub active_cache_version: Option<u64>,
+    //++agent TASK-225 [25.09.2026]
+    /// Строгий режим lineage: `unverified`-колонки execute_query
+    /// возвращаются с полностью маскированными значениями вместо отказа.
+    /// Хранится в `databases.strict_mode`, по умолчанию включён.
+    //++agent TASK-225
+    pub strict_mode: bool,
 }
 
 #[derive(Debug, Clone)]
