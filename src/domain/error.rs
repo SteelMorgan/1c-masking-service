@@ -127,6 +127,17 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
+        //++agent TASK-225 [25.09.2026]
+        // Единая точка error-логирования: все ответы-ошибки сервиса видны
+        // в журнале по correlation_id без дополнительной инструментации
+        // каждого обработчика.
+        tracing::warn!(
+            event = "service_error",
+            code = self.code.as_str(),
+            status = %self.status.as_u16(),
+            correlation_id = %self.correlation_id,
+        );
+        //++agent TASK-225
         let envelope = ErrorEnvelope {
             error: ErrorBody {
                 code: self.code.as_str(),

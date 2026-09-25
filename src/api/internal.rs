@@ -82,7 +82,17 @@ async fn preflight(
 ) -> Result<Json<PreflightResponse>, ServiceError> {
     let Json(request) = bounded_json(payload)?;
     let correlation_id = request.correlation_id;
-    tokio::time::timeout(
+    //++agent TASK-225 [25.09.2026]
+    // Точечный request-лог: только идентификаторы и решение — аргументы
+    // и результаты вызовов в лог не идут (там могут быть данные до маскирования).
+    tracing::info!(
+        event = "call_preflight",
+        %correlation_id,
+        database_id = %request.database_id,
+        tool = %request.tool_name,
+    );
+    //++agent TASK-225
+    let response = tokio::time::timeout(
         std::time::Duration::from_secs(bounded_env_u64(
             "MASKING_PREFLIGHT_TIMEOUT_SECONDS",
             3,
@@ -92,8 +102,13 @@ async fn preflight(
         state.masking.preflight(request),
     )
     .await
-    .map_err(|_| ServiceError::new(crate::domain::ErrorCode::MaskingTimeout, correlation_id))?
-    .map(Json)
+    .map_err(|_| ServiceError::new(crate::domain::ErrorCode::MaskingTimeout, correlation_id))??;
+    tracing::info!(
+        event = "call_preflight_done",
+        %correlation_id,
+        decision = response.decision,
+    );
+    Ok(Json(response))
 }
 
 async fn finalize(
@@ -102,6 +117,19 @@ async fn finalize(
 ) -> Result<Json<FinalizeResponse>, ServiceError> {
     let Json(request) = bounded_json(payload)?;
     let correlation_id = request.correlation_id;
+    //++agent TASK-225 [25.09.2026]
+    let outcome_kind = match &request.outcome {
+        crate::domain::FinalizeOutcome::ToolResult { .. } => "tool_result",
+        crate::domain::FinalizeOutcome::TransportError { .. } => "transport_error",
+    };
+    tracing::info!(
+        event = "call_finalize",
+        %correlation_id,
+        database_id = %request.database_id,
+        tool = %request.tool_name,
+        outcome = outcome_kind,
+    );
+    //++agent TASK-225
     tokio::time::timeout(
         std::time::Duration::from_secs(bounded_env_u64(
             "MASKING_FINALIZE_TIMEOUT_SECONDS",
@@ -121,6 +149,14 @@ async fn terminal(
     payload: Result<Json<TerminalEventRequest>, JsonRejection>,
 ) -> Result<Json<TerminalEventResponse>, ServiceError> {
     let Json(request) = bounded_json(payload)?;
+    //++agent TASK-225 [25.09.2026]
+    tracing::info!(
+        event = "call_terminal",
+        correlation_id = %request.correlation_id,
+        tool = %request.tool_name,
+        error_code = %request.error_code,
+    );
+    //++agent TASK-225
     state.masking.record_terminal_event(request).map(Json)
 }
 

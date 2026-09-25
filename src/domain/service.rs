@@ -60,6 +60,12 @@ pub struct MaskingService {
     database_workers: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
     per_database_workers: usize,
     engine: MaskEngine,
+    //++agent TASK-225 [25.09.2026]
+    // Дедуп лога feed-pull отказов: transient-ошибка повторяется каждый
+    // тик, журналировать надо факт отказа intent-а (created_at + код), а
+    // не каждый повтор попытки.
+    feed_pull_log_dedup: Mutex<HashMap<Uuid, (String, &'static str)>>,
+    //++agent TASK-225
 }
 
 struct CachedResponse {
@@ -107,6 +113,7 @@ impl MaskingService {
             database_workers: Mutex::new(HashMap::new()),
             per_database_workers: bounded_env_usize("MASKING_PER_DATABASE_WORKERS", 4, 1, 100),
             engine: MaskEngine::new(),
+            feed_pull_log_dedup: Mutex::new(HashMap::new()),
         }
     }
 
@@ -300,12 +307,13 @@ impl MaskingService {
                 )
             }
         };
+        //++agent TASK-225 [25.09.2026]
+        // Отказ по классу deny-pending-review пишется отдельным путём:
+        // та же durable-запись, но с учётом tool_classifications
+        // (auto_added/first_seen_at/denied_count) в одной транзакции.
+        //++agent TASK-225
         if class == ToolClass::DenyPendingReview {
-            return self.persist_preflight_denial(
-                &request,
-                &settings,
-                ErrorCode::ToolPendingReview,
-            );
+            return self.persist_pending_review_denial(&request, &settings);
         }
         if class == ToolClass::DataMask && settings.mode == DatabaseMode::Enabled {
             let policy = match self
@@ -325,21 +333,43 @@ impl MaskingService {
                 );
             }
         }
-        let mut mappings = self.mappings.write().await;
-        let arguments = match self.engine.resolve_tokens(
-            &request.arguments,
-            request.database_id,
-            &request.chat_id,
-            &mut mappings,
-        ) {
-            Ok(arguments) => arguments,
-            Err(_) => {
-                drop(mappings);
-                return self.persist_preflight_denial(
-                    &request,
-                    &settings,
-                    ErrorCode::MaskTokenInvalid,
-                );
+        //++agent TASK-225 [25.09.2026]
+        // Обратная расшифровка токенов в аргументах — только для
+        // data-mask при Enabled: подстановка реальных значений в вызов,
+        // чей ответ будет замаскирован. Для metadata-bypass и data-mask
+        // вне Enabled само наличие [MASK:v1:...] — попытка оракула
+        // (резолв вернул бы сырьё в незамаскированный ответ или просто
+        // протечку идентификатора) — отказ MASK_TOKEN_INVALID до 1С.
+        //++agent TASK-225
+        let can_resolve = class == ToolClass::DataMask && settings.mode == DatabaseMode::Enabled;
+        let arguments = if can_resolve {
+            let mut mappings = self.mappings.write().await;
+            match self.engine.resolve_tokens(
+                &request.arguments,
+                request.database_id,
+                &request.chat_id,
+                &mut mappings,
+            ) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    drop(mappings);
+                    return self.persist_preflight_denial(
+                        &request,
+                        &settings,
+                        ErrorCode::MaskTokenInvalid,
+                    );
+                }
+            }
+        } else {
+            match self.engine.contains_tokens(&request.arguments) {
+                Ok(false) => request.arguments.clone(),
+                _ => {
+                    return self.persist_preflight_denial(
+                        &request,
+                        &settings,
+                        ErrorCode::MaskTokenInvalid,
+                    );
+                }
             }
         };
         Ok(PreflightResponse {
@@ -926,6 +956,61 @@ impl MaskingService {
         }
         Err(ServiceError::new(code, request.correlation_id))
     }
+
+    //++agent TASK-225 [25.09.2026]
+    /// Отказ TOOL_PENDING_REVIEW: durable-запись истории и авто-учёт
+    /// инструмента в tool_classifications выполняются одной
+    /// storage-операцией (`write_tool_pending_review`, спека §7).
+    fn persist_pending_review_denial(
+        &self,
+        request: &PreflightRequest,
+        settings: &super::DatabaseSettings,
+    ) -> Result<PreflightResponse, ServiceError> {
+        let public_result = safe_terminal_error(
+            ErrorCode::ToolPendingReview.as_str(),
+            request.correlation_id,
+        );
+        // Заголовок — из контекста первого preflight (first-write-wins),
+        // как в persist_preflight_denial: ретрай остаётся идемпотентным.
+        let call_title = self
+            .storage
+            .call_context_text(request.call_id)
+            .ok()
+            .flatten();
+        let report = neutral_report(
+            &public_result,
+            &ReportMeta {
+                title: call_title.as_deref(),
+                schema: None,
+            },
+        );
+        let write = self
+            .storage
+            .write_tool_pending_review(
+                request.database_id,
+                &request.chat_id,
+                request.call_id,
+                &request.tool_name,
+                &public_result,
+                &report,
+                effective_history_ttl(settings),
+                request.correlation_id,
+            )
+            .map_err(|_| {
+                ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
+            })?;
+        if write == TerminalWrite::Conflict {
+            return Err(ServiceError::new(
+                ErrorCode::TerminalAlreadyRecorded,
+                request.correlation_id,
+            ));
+        }
+        Err(ServiceError::new(
+            ErrorCode::ToolPendingReview,
+            request.correlation_id,
+        ))
+    }
+    //++agent TASK-225
 }
 
 fn bounded_env_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {
@@ -956,22 +1041,29 @@ fn validate_common(
     Ok(())
 }
 
+//++agent TASK-225 [25.09.2026]
+// Политика имени зеркалирует manager-side valid_terminal (gate.rs):
+// непустое, ≤128 байт — без ограничения алфавита. Сужение до
+// [A-Za-z0-9_-] отвергало валидные для менеджера имена (кириллица,
+// ':'), а outbox менеджера ретраит строго с головы — один
+// недоставленный terminal-ивент навсегда блокировал очередь.
+//++agent TASK-225
 fn valid_terminal_tool_name(tool_name: &str) -> bool {
-    !tool_name.is_empty()
-        && tool_name.len() <= 128
-        && tool_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    !tool_name.is_empty() && tool_name.len() <= 128
 }
 
 //++agent TASK-222 [05.10.2026]
 // Контракт Р2: `result` — непрозрачный бизнес-JSON; сервис не навязывает
 // форму ToolCallResult, проверяет только объект и отсутствие опасных форм
 // отчётов. Публичную обёртку строит `wrap_tool_result` на выходе.
+//++agent TASK-225 [25.09.2026]
+// `result` конверта — непрозрачный JSON: скаляры (в т.ч. JSON-строка
+// бизнес-результата validate_query) валидны и идут в text дословно.
+// Небезопасные формы проверяются только внутри контейнеров.
 fn validate_tool_result(result: &Value) -> Result<(), ()> {
-    result.as_object().ok_or(())?;
     reject_unsafe_report_shapes(result, 0)
 }
+//++agent TASK-225
 
 //++agent TASK-221 [23.09.2026 18:30:00]
 // Query rows require an unambiguous canonical source for every public column.
@@ -1019,14 +1111,47 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
         return false;
     }
     let mut sources_by_name = HashMap::new();
+    //++agent TASK-225 [25.09.2026]
+    // Безисточниковые колонки от границы (контракт ДопускиКолонок):
+    // `sources` пуст + `sourceless` ∈ {count,literal,parameter,value,
+    // composite} → колонка допустима, а её значения проверяются по
+    // строкам ниже (примитивы; для count — только числа). Маркер
+    // `unverified` — отказ в любом виде: строгий режим обработки
+    // непроверенных колонок — отдельный шаг, до него сервис обязан
+    // закрывать выдачу при неизвестном evidence.
+    //++agent TASK-225
+    let mut sourceless_by_name = HashMap::new();
     for column in columns {
         let Some(name) = column.get("name").and_then(Value::as_str) else {
             return false;
         };
+        if column.get("unverified").is_some() {
+            return false;
+        }
         let Some(sources) = column.get("sources").and_then(Value::as_array) else {
             return false;
         };
-        if name.is_empty() || sources.is_empty() || sources_by_name.contains_key(name) {
+        if name.is_empty()
+            || sources_by_name.contains_key(name)
+            || sourceless_by_name.contains_key(name)
+        {
+            return false;
+        }
+        if sources.is_empty() {
+            let Some(kind) = column.get("sourceless").and_then(Value::as_str) else {
+                return false;
+            };
+            if !matches!(
+                kind,
+                "count" | "literal" | "parameter" | "value" | "composite"
+            ) {
+                return false;
+            }
+            sourceless_by_name.insert(name, kind);
+            continue;
+        }
+        // `sourceless` при непустом sources — противоречивое evidence.
+        if column.get("sourceless").is_some() {
             return false;
         }
         let mut paths = HashSet::new();
@@ -1040,6 +1165,9 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
     }
     let mut evidenced = HashMap::<&str, HashSet<&str>>::new();
     for item in &field_sources.lineage {
+        if item.get("unverified").is_some() {
+            return false;
+        }
         let Some(name) = item
             .get("column")
             .or_else(|| item.get("result_name"))
@@ -1068,14 +1196,47 @@ fn valid_query_lineage(result: &Value, field_sources: &super::FieldSources) -> b
     row_sets.into_iter().all(|rows| {
         rows.iter().all(|row| {
             row.as_object().is_some_and(|fields| {
-                fields
-                    .keys()
-                    .all(|name| sources_by_name.contains_key(name.as_str()))
+                fields.iter().all(|(name, value)| {
+                    if let Some(&kind) = sourceless_by_name.get(name.as_str()) {
+                        sourceless_cell_valid(value, kind)
+                    } else {
+                        sources_by_name.contains_key(name.as_str())
+                    }
+                })
             })
         })
     })
 }
 //++agent TASK-221
+
+//++agent TASK-225 [25.09.2026]
+/// Значение ячейки безисточниковой колонки: только JSON-примитив
+/// (число/строка/булево/null); для `count` — строго число. Согласованность
+/// с фактическим типом платформы обеспечивает граница (ДопускиКолонок),
+/// сервис проверяет лишь примитивность формы — объект/массив мог бы
+/// нести в себе разыменованные данные.
+/// Исключение: `value`/`composite` могут нести непустое `ЗНАЧЕНИЕ(...)` —
+/// граница сериализует ссылку плоским объектом `_objectRef` (само
+/// описание: UUID, имя типа, представление — без разыменованных полей);
+/// строковые поля такого объекта проходят обычное маскирование в движке.
+/// Форма строго ограничена: `_objectRef: true` и только примитивные поля.
+fn sourceless_cell_valid(value: &Value, kind: &str) -> bool {
+    match kind {
+        "count" => value.is_number(),
+        "value" | "composite" => match value {
+            Value::Array(_) => false,
+            Value::Object(object) => {
+                object.get("_objectRef") == Some(&Value::Bool(true))
+                    && object
+                        .values()
+                        .all(|field| !matches!(field, Value::Object(_) | Value::Array(_)))
+            }
+            _ => true,
+        },
+        _ => !matches!(value, Value::Object(_) | Value::Array(_)),
+    }
+}
+//++agent TASK-225
 
 fn reject_unsafe_report_shapes(value: &Value, depth: usize) -> Result<(), ()> {
     if depth > 64 {
@@ -1139,9 +1300,39 @@ fn safe_terminal_error(code: &str, correlation_id: Uuid) -> Value {
 // Публичная форма результата инструмента (контракт Р2): замаскированное
 // бизнес-значение уходит агенту в content[0].text; is_error выводится из
 // `success:false` в теле результата.
+//++agent TASK-225 [25.09.2026]
+// Для opaque-результатов (без конверта границы данных) менеджер передаёт
+// весь ToolCallResult — его `is_error:true` лежит прямо в JSON и тоже
+// сохраняется наружу.
+//++agent TASK-225
+//++agent TASK-225 [25.09.2026]
+// Бизнес-result бывает JSON-строкой (validate_query и другие
+// metadata-bypass инструменты возвращают сериализованный JSON из BSL).
+// Её нельзя сериализовать повторно — to_string дал бы экранированный
+// литерал `"{\"valid\":...}"`; в text уходит само строковое значение.
+// Opaque-результат (ToolCallResult без конверта границы) уже находится в
+// публичной форме — повторная обёртка вложила бы весь объект в text;
+// он возвращается как есть (is_error/isError сохраняются внутри).
+//++agent TASK-225
 fn wrap_tool_result(masked: &Value) -> Value {
-    let is_error = masked.get("success") == Some(&Value::Bool(false));
-    let text = serde_json::to_string(masked).unwrap_or_else(|_| "null".to_owned());
+    if masked
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| block.get("type").and_then(Value::as_str).is_some())
+        })
+    {
+        return masked.clone();
+    }
+    let is_error = masked.get("success") == Some(&Value::Bool(false))
+        || masked.get("is_error") == Some(&Value::Bool(true));
+    let text = match masked {
+        Value::String(text) => text.clone(),
+        _ => serde_json::to_string(masked).unwrap_or_else(|_| "null".to_owned()),
+    };
     json!({
         "content": [{"type": "text", "text": text}],
         "is_error": is_error

@@ -29,6 +29,13 @@ const DROP_V2_FEED_MIGRATION: &str = include_str!("../../migrations/0008_drop_v2
 //++agent TASK-224 [08.10.2026] итерация 4
 const CALL_CONTEXTS_MIGRATION: &str = include_str!("../../migrations/0009_call_contexts.sql");
 //++agent TASK-224
+//++agent TASK-225 [25.09.2026]
+// DDL приведён для аудита; применяется поколоночно из initialize —
+// миграция 0010 (основная фаза TASK-225) содержит те же ALTER, и порядок
+// прихода миграций на merge не гарантирован.
+const TOOL_AUTO_CLASS_MIGRATION: &str =
+    include_str!("../../migrations/0011_tool_auto_classification.sql");
+//++agent TASK-225
 
 pub enum HistoryWrite {
     Inserted(Uuid),
@@ -119,6 +126,25 @@ impl SqliteStorage {
             )?;
         }
         //++agent TASK-224
+        //++agent TASK-225 [25.09.2026]
+        // Миграция 0011 применяется поколоночно: те же колонки объявлены в
+        // миграции 0010 основной фазы TASK-225, а порядок прихода на merge
+        // не гарантирован — увидев уже созданную колонку, пропускаем её,
+        // но проверяем тип (тип, несовместимый со спекой, — громкая ошибка
+        // на старте, а не тихая поломка tool_class).
+        let has_tool_auto_class: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=11)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_tool_auto_class {
+            apply_tool_auto_class_migration(&transaction, TOOL_AUTO_CLASS_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        //++agent TASK-225
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
             [Utc::now().to_rfc3339()],
@@ -226,10 +252,16 @@ impl SqliteStorage {
             return Err(rusqlite::Error::InvalidQuery);
         }
         self.with_connection(|connection| {
+            //++agent TASK-225 [25.09.2026]
+            // Решение администратора снимает auto_added=0 и сохраняет
+            // счётчик отказов/first_seen_at (спека §7): INSERT ветвь —
+            // свежая строка без истории отказов; ON CONFLICT ветвь —
+            // denied_count/first_seen_at/last_denied_at не трогаем.
+            //++agent TASK-225
             connection.execute(
-                "INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at",
+                "INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at,auto_added)
+                 VALUES (?1,?2,?3,?4,?5,0)
+                 ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at,auto_added=0",
                 params![database_id.to_string(), tool_name, class.as_str(), reviewer, Utc::now().to_rfc3339()],
             )?;
             Ok(())
@@ -481,108 +513,84 @@ impl SqliteStorage {
         history_ttl_seconds: u64,
         correlation_id: Uuid,
     ) -> rusqlite::Result<TerminalWrite> {
+        //++agent TASK-225 [25.09.2026]
+        // Тело вынесено в write_scoped_terminal_tx — та же tx-логика
+        // переиспользуется write_tool_pending_review (учёт классификации
+        // и запись отказа живут в одной IMMEDIATE-транзакции, спека §7).
+        //++agent TASK-225
         self.with_connection(|connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let unscoped_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM unscoped_terminal_events WHERE call_id=?1)",
-                [call_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if unscoped_exists {
-                transaction.commit()?;
-                return Ok(TerminalWrite::Conflict);
-            }
-            let existing = transaction
-                .query_row(
-                    "SELECT h.database_id,h.chat_id,h.tool_name,h.outcome,
-                            h.public_result_json,h.report_json,a.code,a.correlation_id
-                     FROM history h
-                     LEFT JOIN audit_events a ON a.history_id=h.id AND a.action='call.denied'
-                     WHERE h.call_id=?1",
-                    [call_id.to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let matching_call_count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM history WHERE call_id=?1",
-                [call_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if matching_call_count > 1 {
-                transaction.commit()?;
-                return Ok(TerminalWrite::Conflict);
-            }
-            let public_json = serde_json::to_string(public_result)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let report_json =
-                serde_json::to_string(report).map_err(|_| rusqlite::Error::InvalidQuery)?;
-            if let Some((stored_db, stored_chat, stored_tool, outcome, stored_public, stored_report, code, correlation)) = existing
-            {
-                let expected_correlation = correlation_id.to_string();
-                transaction.commit()?;
-                return Ok(if stored_db == database_id.to_string()
-                    && stored_chat == chat_id
-                    && stored_tool == tool_name
-                    && outcome == "terminal_denial"
-                    && stored_public == public_json
-                    && stored_report == report_json
-                    && code.as_deref() == Some(error_code)
-                    && correlation.as_deref() == Some(expected_correlation.as_str())
-                {
-                    TerminalWrite::Existing
-                } else {
-                    TerminalWrite::Conflict
-                });
-            }
-            let id = Uuid::new_v4();
-            let created_at = Utc::now();
-            let expires_at = created_at
-                + Duration::seconds(history_ttl_seconds.min(i64::MAX as u64) as i64);
-            let reasons = serde_json::to_string(&[format!("service:terminal:{error_code}")])
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            transaction.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id)
-                 VALUES (?1,?2,?3,?4,?5,'terminal_denial',0,?6,?7,?8,?9,?10,NULL)",
-                params![
-                    id.to_string(),
-                    database_id.to_string(),
-                    chat_id,
-                    call_id.to_string(),
-                    tool_name,
-                    reasons,
-                    public_json,
-                    report_json,
-                    created_at.to_rfc3339(),
-                    expires_at.to_rfc3339()
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
-                 VALUES ('service',NULL,'call.denied',?1,?2,?3,'denied',?4,?5,?6)",
-                params![
-                    database_id.to_string(),
-                    chat_id,
-                    id.to_string(),
-                    error_code,
-                    correlation_id.to_string(),
-                    created_at.to_rfc3339()
-                ],
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let write = write_scoped_terminal_tx(
+                &transaction,
+                database_id,
+                chat_id,
+                call_id,
+                tool_name,
+                error_code,
+                public_result,
+                report,
+                history_ttl_seconds,
+                correlation_id,
             )?;
             transaction.commit()?;
-            Ok(TerminalWrite::Inserted)
+            Ok(write)
         })
     }
+
+    //++agent TASK-225 [25.09.2026]
+    /// Отказ `deny-pending-review` (спека §7): в одной IMMEDIATE-транзакции
+    /// фиксирует terminal-запись истории И учёт инструмента в
+    /// `tool_classifications` (новое имя → строка auto_added=1 с
+    /// first_seen_at/denied_count; повторный отказ → denied_count+1).
+    /// Сбой учёта не меняет решение — запись отказа в историю коммитится
+    /// в любом случае (ошибка логируется, не пробрасывается).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_tool_pending_review(
+        &self,
+        database_id: Uuid,
+        chat_id: &str,
+        call_id: Uuid,
+        tool_name: &str,
+        public_result: &Value,
+        report: &Value,
+        history_ttl_seconds: u64,
+        correlation_id: Uuid,
+    ) -> rusqlite::Result<TerminalWrite> {
+        self.with_connection(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let write = write_scoped_terminal_tx(
+                &transaction,
+                database_id,
+                chat_id,
+                call_id,
+                tool_name,
+                "TOOL_PENDING_REVIEW",
+                public_result,
+                report,
+                history_ttl_seconds,
+                correlation_id,
+            )?;
+            if let Err(error) = account_pending_review_denial(
+                &transaction,
+                database_id,
+                chat_id,
+                tool_name,
+                correlation_id,
+                write,
+            ) {
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    error = %error,
+                    "tool auto-classification accounting failed; denial kept"
+                );
+            }
+            transaction.commit()?;
+            Ok(write)
+        })
+    }
+    //++agent TASK-225
 
     pub fn write_unscoped_terminal(
         &self,
@@ -1025,3 +1033,289 @@ fn valid_filter_scalar(value: &Value) -> bool {
 fn valid_filter_operand(value: &Value) -> bool {
     serde_json::to_string(value).is_ok_and(|json| json.len() <= 4096)
 }
+
+//++agent TASK-225 [25.09.2026]
+/// Тело `write_scoped_terminal` на уровне открытой транзакции — позволяет
+/// `write_tool_pending_review` дописать учёт классификации в ту же tx.
+#[allow(clippy::too_many_arguments)]
+fn write_scoped_terminal_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    database_id: Uuid,
+    chat_id: &str,
+    call_id: Uuid,
+    tool_name: &str,
+    error_code: &str,
+    public_result: &Value,
+    report: &Value,
+    history_ttl_seconds: u64,
+    correlation_id: Uuid,
+) -> rusqlite::Result<TerminalWrite> {
+    let unscoped_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM unscoped_terminal_events WHERE call_id=?1)",
+        [call_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if unscoped_exists {
+        return Ok(TerminalWrite::Conflict);
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT h.database_id,h.chat_id,h.tool_name,h.outcome,
+                    h.public_result_json,h.report_json,a.code,a.correlation_id
+             FROM history h
+             LEFT JOIN audit_events a ON a.history_id=h.id AND a.action='call.denied'
+             WHERE h.call_id=?1",
+            [call_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let matching_call_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM history WHERE call_id=?1",
+        [call_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if matching_call_count > 1 {
+        return Ok(TerminalWrite::Conflict);
+    }
+    let public_json =
+        serde_json::to_string(public_result).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let report_json = serde_json::to_string(report).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if let Some((
+        stored_db,
+        stored_chat,
+        stored_tool,
+        outcome,
+        stored_public,
+        stored_report,
+        code,
+        correlation,
+    )) = existing
+    {
+        let expected_correlation = correlation_id.to_string();
+        return Ok(
+            if stored_db == database_id.to_string()
+                && stored_chat == chat_id
+                && stored_tool == tool_name
+                && outcome == "terminal_denial"
+                && stored_public == public_json
+                && stored_report == report_json
+                && code.as_deref() == Some(error_code)
+                && correlation.as_deref() == Some(expected_correlation.as_str())
+            {
+                TerminalWrite::Existing
+            } else {
+                TerminalWrite::Conflict
+            },
+        );
+    }
+    let id = Uuid::new_v4();
+    let created_at = Utc::now();
+    let expires_at =
+        created_at + Duration::seconds(history_ttl_seconds.min(i64::MAX as u64) as i64);
+    let reasons = serde_json::to_string(&[format!("service:terminal:{error_code}")])
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    transaction.execute(
+        "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id)
+         VALUES (?1,?2,?3,?4,?5,'terminal_denial',0,?6,?7,?8,?9,?10,NULL)",
+        params![
+            id.to_string(),
+            database_id.to_string(),
+            chat_id,
+            call_id.to_string(),
+            tool_name,
+            reasons,
+            public_json,
+            report_json,
+            created_at.to_rfc3339(),
+            expires_at.to_rfc3339()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+         VALUES ('service',NULL,'call.denied',?1,?2,?3,'denied',?4,?5,?6)",
+        params![
+            database_id.to_string(),
+            chat_id,
+            id.to_string(),
+            error_code,
+            correlation_id.to_string(),
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(TerminalWrite::Inserted)
+}
+
+/// Учёт отказа `deny-pending-review` в `tool_classifications` (спека §7):
+/// `counted` — это новый отказ (Insert), а не идемпотентный ретрай
+/// существующего call_id (Existing): повторная доставка не считается дважды.
+/// Обновление предикатировано `class='deny-pending-review'` — не затирает
+/// параллельно принятую классификацию администратора. Имя вне авто-алфавита
+/// и превышение лимита 500 — отказ фиксируется в истории в любом случае,
+/// а в учёте отражается только audit-событие со спец-кодом.
+fn account_pending_review_denial(
+    transaction: &rusqlite::Transaction<'_>,
+    database_id: Uuid,
+    chat_id: &str,
+    tool_name: &str,
+    correlation_id: Uuid,
+    counted: TerminalWrite,
+) -> rusqlite::Result<()> {
+    let counted = counted == TerminalWrite::Inserted;
+    let now = Utc::now().to_rfc3339();
+    if !valid_auto_tool_name(tool_name) {
+        if counted {
+            audit_call_denied(
+                transaction,
+                database_id,
+                chat_id,
+                "TOOL_NAME_INVALID",
+                correlation_id,
+            )?;
+        }
+        return Ok(());
+    }
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT class FROM tool_classifications WHERE database_id=?1 AND tool_name=?2",
+            params![database_id.to_string(), tool_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing.as_deref() {
+        Some("deny-pending-review") if counted => {
+            transaction.execute(
+                "UPDATE tool_classifications
+                 SET denied_count=denied_count+1, last_denied_at=?3
+                 WHERE database_id=?1 AND tool_name=?2 AND class='deny-pending-review'",
+                params![database_id.to_string(), tool_name, now],
+            )?;
+        }
+        Some(_) => {}
+        None => {
+            let auto_count: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM tool_classifications WHERE database_id=?1 AND auto_added=1",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if auto_count >= 500 {
+                if counted {
+                    audit_call_denied(
+                        transaction,
+                        database_id,
+                        chat_id,
+                        "TOOL_AUTOADD_LIMIT",
+                        correlation_id,
+                    )?;
+                }
+            } else {
+                transaction.execute(
+                    "INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at,auto_added,first_seen_at,denied_count,last_denied_at)
+                     VALUES (?1,?2,'deny-pending-review',NULL,?3,1,?3,1,?3)",
+                    params![database_id.to_string(), tool_name, now],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Спека §7: имя инструмента для авто-регистрации ограничено
+/// `[A-Za-z0-9_.:-]{1,128}` — сужение публичного набора, запрещающее
+/// вставку управляющих/мусорных имён в справочник классификации.
+fn valid_auto_tool_name(tool_name: &str) -> bool {
+    !tool_name.is_empty()
+        && tool_name.len() <= 128
+        && tool_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+/// audit-событие отказа вызова (call.denied) внутри открытой транзакции —
+/// зеркало `audit_denial`, но без подмены outcome по существующему ответу:
+/// используется для спец-кодов TOOL_NAME_INVALID/TOOL_AUTOADD_LIMIT,
+/// не привязанных к history-записи.
+fn audit_call_denied(
+    transaction: &rusqlite::Transaction<'_>,
+    database_id: Uuid,
+    chat_id: &str,
+    code: &str,
+    correlation_id: Uuid,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+         VALUES ('service',NULL,'call.denied',?1,?2,NULL,'denied',?3,?4,?5)",
+        params![
+            database_id.to_string(),
+            chat_id,
+            code,
+            correlation_id.to_string(),
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+//++agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+/// Поколоночное применение миграции `ALTER TABLE tool_classifications
+/// ADD COLUMN ...` (файл 0011): колонки, уже созданные миграцией 0010
+/// (порядок прихода миграций на merge не гарантирован), пропускаются;
+/// колонка с несовпадающим типом — ошибка запуска сервиса, а не тихий
+/// пропуск (иначе `tool_class` молча ломался бы на каждом вызове).
+fn apply_tool_auto_class_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    ddl: &str,
+) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashMap::new();
+    {
+        let mut statement = transaction
+            .prepare("SELECT name, type FROM pragma_table_info('tool_classifications')")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, declared_type) in rows {
+            existing.insert(name, declared_type);
+        }
+    }
+    for statement in ddl.split(';') {
+        let statement = statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        // Форма оператора зафиксирована файлом миграции:
+        // `ALTER TABLE tool_classifications ADD COLUMN <name> <type> ...`
+        let mut words = statement.split_whitespace();
+        let column = words
+            .find(|word| word.eq_ignore_ascii_case("column"))
+            .and_then(|_| words.next())
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        let declared_type = words.next().ok_or(rusqlite::Error::InvalidQuery)?;
+        match existing.get(column) {
+            Some(actual) if !actual.eq_ignore_ascii_case(declared_type) => {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Some(_) => {}
+            None => transaction.execute_batch(statement)?,
+        }
+    }
+    Ok(())
+}
+//++agent TASK-225

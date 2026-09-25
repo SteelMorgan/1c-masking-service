@@ -329,6 +329,27 @@ impl MaskEngine {
         replace_tokens(value, &resolved, 0).map_err(|_| ProcessingError)
     }
 
+    //++agent TASK-225 [25.09.2026]
+    /// Проверка «в аргументах есть mask-токен» без обращения к mapping
+    /// store — для классов, которым резолв запрещён (metadata-bypass,
+    /// data-mask вне режима Enabled): то же ограничение bounds и тот же
+    /// обход, что у `resolve_tokens`, но возвращает только факт наличия.
+    /// Ошибка bounds трактуется вызывающим как невалидные аргументы.
+    pub fn contains_tokens(&self, value: &Value) -> Result<bool, ProcessingError> {
+        validate_value_bounds(
+            value,
+            self.max_depth,
+            self.max_strings,
+            self.max_rows,
+            self.max_text_bytes,
+        )
+        .map_err(|_| ProcessingError)?;
+        let mut unique = HashSet::new();
+        collect_tokens(value, &self.token, &mut unique, 0).map_err(|_| ProcessingError)?;
+        Ok(!unique.is_empty())
+    }
+    //++agent TASK-225
+
     pub fn resolve_tokens_for_batch(
         &self,
         value: &Value,

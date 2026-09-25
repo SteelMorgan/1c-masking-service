@@ -24,6 +24,11 @@ pub struct DatabaseSummary {
     /// `null`, когда очередь пуста. Stage label без feed данных — только
     /// состояние очереди.
     pub refresh_stage: Option<String>,
+    //++agent TASK-225 [25.09.2026]
+    /// B2: число авто-добавленных инструментов, ждущих классификации
+    /// (COUNT(*) WHERE auto_added=1).
+    //++agent TASK-225
+    pub new_tools_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,11 +138,22 @@ pub struct UserAccessPatch {
     pub status: UserStatus,
 }
 
+//++agent TASK-225 [25.09.2026]
+// GET-форма по спеке B10: поля учёта авто-регистрации (auto_added,
+// first_seen_at, denied_count, last_denied_at) видны администратору —
+// без них список не отличал бы авто-добавленные отзывы от решений.
+//++agent TASK-225
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolClassification {
     pub tool_name: String,
     pub class: String,
+    pub reviewer: Option<String>,
+    pub updated_at: String,
+    pub auto_added: bool,
+    pub first_seen_at: Option<String>,
+    pub denied_count: i64,
+    pub last_denied_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

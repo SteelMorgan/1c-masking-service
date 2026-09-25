@@ -2537,3 +2537,775 @@ async fn call_title_never_persists_raw_secrets_from_arguments() {
 }
 //--agent TASK-224
 //--agent TASK-224
+
+//++agent TASK-225 [25.09.2026]
+// Фаза «все вызовы через маскировщик»: неизвестный инструмент отклоняется
+// как deny-pending-review и авто-регистрируется в очереди классификации
+// (спека §7); mask-токены в аргументах раскрываются только для data-mask
+// при Enabled.
+
+/// Снимок строки tool_classifications:
+/// (class, auto_added, denied_count, first_seen_at, last_denied_at).
+type ClassificationRow = (String, i64, i64, Option<String>, Option<String>);
+
+/// Классификация инструмента прямым чтением строки tool_classifications.
+fn classification_row(
+    storage: &SqliteStorage,
+    database_id: Uuid,
+    tool_name: &str,
+) -> Option<ClassificationRow> {
+    use rusqlite::OptionalExtension;
+    storage
+        .with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT class,auto_added,denied_count,first_seen_at,last_denied_at
+                     FROM tool_classifications WHERE database_id=?1 AND tool_name=?2",
+                    rusqlite::params![database_id.to_string(), tool_name],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+        })
+        .unwrap()
+}
+
+fn audit_code_count(storage: &SqliteStorage, code: &str) -> i64 {
+    storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action='call.denied' AND code=?1",
+                [code],
+                |row| row.get(0),
+            )
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn unknown_tool_is_denied_auto_registered_and_counted() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let storage = &state.storage;
+
+    // Первый вызов неизвестного инструмента — отказ до 1С + авто-строка.
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "totally_unknown_tool".to_owned(),
+            arguments: json!({"a": 1}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ToolPendingReview);
+    let (class, auto_added, denied_count, first_seen_at, last_denied_at) =
+        classification_row(storage, database_id, "totally_unknown_tool").unwrap();
+    assert_eq!(class, "deny-pending-review");
+    assert_eq!(auto_added, 1);
+    assert_eq!(denied_count, 1);
+    let first_seen = first_seen_at.expect("first_seen_at set on insert");
+    assert!(last_denied_at.is_some());
+
+    // Повторный вызов (другой call_id) — счётчик растёт, first_seen_at
+    // неизменен. Идемпотентный ретрай той же пары (call_id, correlation_id)
+    // не считается дважды.
+    let retry_call = Uuid::new_v4();
+    let retry_correlation = Uuid::new_v4();
+    for (call_id, correlation_id) in [
+        (Uuid::new_v4(), Uuid::new_v4()),
+        (retry_call, retry_correlation),
+        (retry_call, retry_correlation),
+    ] {
+        let error = state
+            .masking
+            .preflight(PreflightRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id,
+                database_id,
+                chat_id: "chat-a".to_owned(),
+                tool_name: "totally_unknown_tool".to_owned(),
+                arguments: json!({"a": 2}),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ToolPendingReview);
+    }
+    let (_, _, denied_count, first_seen_at, _) =
+        classification_row(storage, database_id, "totally_unknown_tool").unwrap();
+    assert_eq!(denied_count, 3);
+    assert_eq!(first_seen_at.as_deref(), Some(first_seen.as_str()));
+
+    // Решение администратора: auto_added=0, счётчик отказов сохраняется.
+    storage
+        .set_tool_classification(
+            database_id,
+            "totally_unknown_tool",
+            onec_masking_service::domain::ToolClass::MetadataBypass,
+            "admin-1",
+        )
+        .unwrap();
+    let (class, auto_added, denied_count, _, _) =
+        classification_row(storage, database_id, "totally_unknown_tool").unwrap();
+    assert_eq!(class, "metadata-bypass");
+    assert_eq!(auto_added, 0);
+    assert_eq!(denied_count, 3);
+
+    // Классифицированный инструмент пропускается preflight.
+    let allowed = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "totally_unknown_tool".to_owned(),
+            arguments: json!({"a": 3}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(allowed.decision, "allow");
+}
+
+#[tokio::test]
+async fn invalid_tool_name_is_denied_audited_and_not_registered() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let storage = &state.storage;
+    let before = audit_code_count(storage, "TOOL_NAME_INVALID");
+
+    // Имя вне авто-алфавита спеки §7 (пробелы/кириллица): отказ остаётся
+    // TOOL_PENDING_REVIEW, строка в справочник не пишется — только audit.
+    for tool_name in ["bad tool!", "кириллица_имя"] {
+        let error = state
+            .masking
+            .preflight(PreflightRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id: Uuid::new_v4(),
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "chat-a".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: json!({}),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ToolPendingReview);
+        assert!(classification_row(storage, database_id, tool_name).is_none());
+    }
+    assert_eq!(audit_code_count(storage, "TOOL_NAME_INVALID"), before + 2);
+}
+
+#[tokio::test]
+async fn auto_registration_limit_denies_without_new_row() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let storage = &state.storage;
+    // Лимит спеки §7: 500 авто-строк на базу — досеваем прямо в SQLite.
+    storage
+        .with_connection(|connection| {
+            for index in 0..500 {
+                connection.execute(
+                    "INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at,auto_added,first_seen_at,denied_count,last_denied_at)
+                     VALUES (?1,?2,'deny-pending-review',NULL,'2026-09-25T00:00:00Z',1,'2026-09-25T00:00:00Z',1,'2026-09-25T00:00:00Z')",
+                    rusqlite::params![database_id.to_string(), format!("auto_tool_{index}")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let before = audit_code_count(storage, "TOOL_AUTOADD_LIMIT");
+
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "over_limit_tool".to_owned(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ToolPendingReview);
+    assert!(classification_row(storage, database_id, "over_limit_tool").is_none());
+    assert_eq!(audit_code_count(storage, "TOOL_AUTOADD_LIMIT"), before + 1);
+}
+
+#[tokio::test]
+async fn unconfigured_database_denies_before_auto_registration() {
+    // Спека §7: для только созданной (unconfigured) базы отказ —
+    // ACTION_REQUIRED, авто-регистрация инструментов не выполняется.
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "brand_new_tool".to_owned(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ActionRequired);
+    assert!(classification_row(&storage, database_id, "brand_new_tool").is_none());
+}
+
+#[tokio::test]
+async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let raw = "Скрытова Анна Петровна";
+
+    // Минтим токен: finalize data-mask результата создаёт маппинг для
+    // chat-a; токен извлекаем из публичной (замаскированной) выдачи.
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"ФИО": raw}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[{"name":"ФИО","sources":["Справочник.People.FullName"]}]}),
+                lineage: vec![
+                    json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    let masked: Value = serde_json::from_str(
+        response.public_result["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let token = masked["data"][0]["ФИО"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("[MASK:v1:FIO:"));
+
+    // data-mask + Enabled: валидный токен раскрывается в аргументах.
+    let allowed = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"link": token}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(allowed.decision, "allow");
+    assert_eq!(allowed.arguments["link"], json!(raw));
+
+    // Токен чужого чата — отказ, подстановки нет.
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-b".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"link": token}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MaskTokenInvalid);
+
+    // metadata-bypass: само наличие токена — отказ до ухода в 1С
+    // (get_metadata — metadata-bypass по встроенной классификации).
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "get_metadata".to_owned(),
+            arguments: json!({"link": token}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MaskTokenInvalid);
+
+    // data-mask вне Enabled (режим Disabled) — токены не раскрываются.
+    assert!(storage_flip_to_disabled(&state.storage, database_id));
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"link": token}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MaskTokenInvalid);
+}
+
+fn storage_flip_to_disabled(storage: &SqliteStorage, database_id: Uuid) -> bool {
+    storage
+        .set_database_mode(database_id, DatabaseMode::Disabled)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+
+    // metadata-bypass инструмент с непрозрачным результатом (весь
+    // ToolCallResult как JSON, field_sources пустые) — проходит
+    // финализацию, публичная форма оборачивается сервисом.
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "get_metadata".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "content": [{"type": "text", "text": "metadata answer"}],
+                    "is_error": true
+                }),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.public_result["is_error"], json!(true));
+    let text = response.public_result["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("metadata answer"), "{text}");
+
+    // Opaque execute_query без field_sources: lineage обязателен —
+    // отказ в безопасную форму, а не проход сырых данных.
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "content": [{"type": "text", "text": "raw query rows"}]
+                }),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.public_result["is_error"], json!(true));
+    let text = response.public_result["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!text.contains("raw query rows"), "{text}");
+}
+
+#[tokio::test]
+async fn terminal_event_accepts_manager_valid_tool_names() {
+    // Outbox менеджера ретраит строго с головы: terminal-ивент с именем,
+    // допустимым на стороне менеджера (непустое, ≤128 байт), обязан быть
+    // принят сервисом — иначе очередь встаёт навсегда. Кириллица и ':'
+    // допустимы для terminal-записи (но не для авто-регистрации, см. §7).
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    for tool_name in ["биг_ПолучитьДанные", "ns:tool_name", "tool-with-dash"] {
+        let response = state
+            .masking
+            .record_terminal_event(onec_masking_service::domain::TerminalEventRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id: Uuid::new_v4(),
+                correlation_id: Uuid::new_v4(),
+                tool_name: tool_name.to_owned(),
+                error_code: "TOOL_PENDING_REVIEW".to_owned(),
+                scope: onec_masking_service::domain::TerminalScope {
+                    kind: onec_masking_service::domain::TerminalScopeKind::Verified,
+                    database_id: Some(database_id),
+                    chat_id: Some("chat-a".to_owned()),
+                },
+            })
+            .unwrap();
+        assert_eq!(response.status, "recorded");
+    }
+}
+//++agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+// Безисточниковые колонки от границы (контракт ДопускиКолонок):
+// schema.columns[i].sourceless ∈ {count,literal,parameter,value,
+// composite} при пустом sources допускает колонку; значения во всех
+// строках обязаны быть JSON-примитивами, для count — только числа.
+// `unverified` и неизвестные виды — отказ.
+
+#[tokio::test]
+async fn sourceless_columns_with_primitive_values_pass_lineage_check() {
+    for (kind, value) in [
+        ("count", json!(5)),
+        ("count", json!(0)),
+        ("literal", json!("строка-литерал")),
+        ("parameter", json!(true)),
+        ("value", json!(null)),
+        ("composite", json!(12.5)),
+        // Непустое ЗНАЧЕНИЕ(...)/композит с ссылкой: граница сериализует
+        // ссылку плоским объектом _objectRef — форма допускается, поля
+        // дальше маскируются движком.
+        (
+            "value",
+            json!({"_objectRef": true, "УникальныйИдентификатор":
+                   "00000000-0000-0000-0000-000000000000",
+                   "ТипОбъекта": "ПеречислениеСсылка.big_OKX_OrderSides",
+                   "Представление": "buy"}),
+        ),
+        (
+            "composite",
+            json!({"_objectRef": true, "УникальныйИдентификатор":
+                   "00000000-0000-0000-0000-000000000000",
+                   "ТипОбъекта": "СправочникСсылка.big_MarketAccounts",
+                   "Представление": "demo"}),
+        ),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id: Uuid::new_v4(),
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "chat-sourceless".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({"success": true, "data": [{"Кол": value}]}),
+                },
+                field_sources: FieldSources {
+                    schema: json!({"columns":[{"name":"Кол","sources":[],"sourceless":kind}]}),
+                    lineage: vec![],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            response.public_result["is_error"],
+            json!(false),
+            "kind={kind}"
+        );
+        let text = response.public_result["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("\"Кол\""), "kind={kind}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn sourceless_columns_fail_closed_on_violations() {
+    let raw = "sensitive-sourceless-marker-value";
+    for (column, value, lineage, note) in [
+        // count допускает только числа: строка и null — отказ.
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"count"}),
+            json!("не-число"),
+            vec![],
+            "count with string",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"count"}),
+            json!(null),
+            vec![],
+            "count with null",
+        ),
+        // Примитивность формы: объект/массив в ячейке — отказ.
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"literal"}),
+            json!({"x":1}),
+            vec![],
+            "literal with object value",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"parameter"}),
+            json!([1, 2]),
+            vec![],
+            "parameter with array value",
+        ),
+        // Неизвестный вид sourceless, отсутствие sourceless, маркеры
+        // unverified (строгий режим — следующий шаг), противоречивое
+        // evidence (sourceless при непустых sources) — отказ.
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"smth_else"}),
+            json!("ok"),
+            vec![],
+            "unknown sourceless kind",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"unverified"}),
+            json!("ok"),
+            vec![],
+            "unverified as kind",
+        ),
+        (
+            json!({"name":"Кол","sources":[]}),
+            json!("ok"),
+            vec![],
+            "empty sources without sourceless",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"literal","unverified":true}),
+            json!("ok"),
+            vec![],
+            "unverified marker on column",
+        ),
+        (
+            json!({"name":"Кол","sources":["Справочник.Test.APIKey"],"sourceless":"literal"}),
+            json!("ok"),
+            vec![],
+            "sourceless with non-empty sources",
+        ),
+        // Объект в ячейке допустим только в форме _objectRef и только для
+        // value/composite: чужой объект, неплоская вложенность и ref-форма
+        // в literal/parameter/count — отказ.
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"value"}),
+            json!({"not_ref": "x"}),
+            vec![],
+            "value with non-ref object",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"value"}),
+            json!({"_objectRef": true, "Представление": {"nested": 1}}),
+            vec![],
+            "value ref with nested object field",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"literal"}),
+            json!({"_objectRef": true, "Представление": "buy"}),
+            vec![],
+            "literal with ref-shaped object",
+        ),
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"count"}),
+            json!({"_objectRef": true}),
+            vec![],
+            "count with ref-shaped object",
+        ),
+        // Поддельное lineage для безисточниковой колонки и lineage-элемент
+        // с маркером unverified — отказ.
+        (
+            json!({"name":"Кол","sources":[],"sourceless":"literal"}),
+            json!("ok"),
+            vec![json!({"column":"Кол","source_path":"Справочник.Test.APIKey"})],
+            "lineage for sourceless column",
+        ),
+        (
+            json!({"name":"Кол","sources":["Справочник.Test.APIKey"]}),
+            json!("ok"),
+            vec![json!({"column":"Кол","source_path":"Справочник.Test.APIKey","unverified":true})],
+            "unverified marker in lineage",
+        ),
+    ] {
+        let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+        let call_id = Uuid::new_v4();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "chat-sourceless".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({"success": true, "data": [{"Кол": value}], "note": raw}),
+                },
+                field_sources: FieldSources {
+                    schema: json!({"columns":[column]}),
+                    lineage,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.public_result["is_error"], json!(true), "{note}");
+        assert!(
+            !serde_json::to_string(&response.public_result)
+                .unwrap()
+                .contains(raw),
+            "{note}"
+        );
+        state
+            .storage
+            .with_connection(|connection| {
+                let stored: String = connection.query_row(
+                    "SELECT public_result_json || report_json || mask_reasons_json FROM history WHERE call_id=?1",
+                    [call_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                assert!(!stored.contains(raw), "{note}");
+                assert!(stored.contains("service:query_lineage_incomplete"), "{note}");
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sourceless_column_values_are_masked_like_regular_columns() {
+    // Словарь/правила применяются к безисточниковым колонкам так же, как
+    // к колонкам с источником (спека: «маскирование — как у прочих»).
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                rules: vec![PolicyRule {
+                    selector: RuleSelector::Name,
+                    pattern: "СекретныйЛитерал".to_owned(),
+                    action: RuleAction::Mask,
+                    category: "TEST".to_owned(),
+                    priority: 0,
+                }],
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let raw = "sensitive-literal-under-rule";
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-sourceless".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"СекретныйЛитерал": raw}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[{"name":"СекретныйЛитерал","sources":[],"sourceless":"literal"}]}),
+                lineage: vec![],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.public_result["is_error"], json!(false));
+    let public = serde_json::to_string(&response.public_result).unwrap();
+    assert!(!public.contains(raw));
+    assert!(public.contains("[MASK:v1:TEST:"));
+}
+//++agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+// Двойная сериализация: бизнес-result metadata-bypass инструмента —
+// JSON-строка (BSL возвращает сериализованный JSON). В text должна
+// уйти сама строка, а не экранированный литерал `"{\"valid\":...}"`.
+#[tokio::test]
+async fn string_business_result_goes_to_text_verbatim() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let storage = state.storage.clone();
+    storage
+        .set_tool_classification(
+            database_id,
+            "validate_query",
+            onec_masking_service::domain::ToolClass::MetadataBypass,
+            "admin-test",
+        )
+        .unwrap();
+    let (_, call_id, correlation_id) = request_ids();
+    let business = "{\n\"valid\": true,\n\"message\": \"ok\"\n}";
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "validate_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!(business),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
+    let text = response.public_result["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text, business);
+    // text — валидный JSON сам по себе (парсится как объект, не строка).
+    assert!(serde_json::from_str::<Value>(text).unwrap().is_object());
+}
+
+// Opaque-результат без конверта границы — уже ToolCallResult; повторная
+// обёртка вложила бы весь объект в text. Возвращается как есть.
+#[tokio::test]
+async fn opaque_tool_call_result_passes_through_without_rewrap() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .storage
+        .set_tool_classification(
+            database_id,
+            "infobase_info",
+            onec_masking_service::domain::ToolClass::MetadataBypass,
+            "admin-test",
+        )
+        .unwrap();
+    let (_, call_id, correlation_id) = request_ids();
+    let opaque = json!({
+        "content": [{"type": "text", "text": "{\"platform\":\"8.3.27\"}"}],
+        "isError": false
+    });
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id,
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "infobase_info".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: opaque.clone(),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.public_result, opaque);
+}
+//++agent TASK-225

@@ -38,9 +38,14 @@ impl HumanDataStore for SqliteHumanDataStore {
             // refresh_stage: живой durable intent ('full') — pull в работе;
             // иначе 'active' при активной cache_generations строке; NULL —
             // snapshot ещё не собран. Stage label без feed данных.
+            //++agent TASK-225 [25.09.2026]
+            // new_tools_count (B2): сколько инструментов базы авто-
+            // добавлены как deny-pending-review и ждут классификации.
+            //++agent TASK-225
             let mut statement = connection.prepare(
                 "SELECT d.id,COALESCE(d.display_label,d.id),d.display_label,d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
-                        COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END)
+                        COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END),
+                        (SELECT COUNT(*) FROM tool_classifications t WHERE t.database_id=d.id AND t.auto_added=1)
                  FROM databases d
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
                  LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
@@ -56,6 +61,7 @@ impl HumanDataStore for SqliteHumanDataStore {
                     mapping_ttl_seconds: row.get::<_, i64>(4)?.max(1) as u64,
                     history_ttl_seconds: row.get::<_, i64>(5)?.max(1) as u64,
                     refresh_stage: row.get(6)?,
+                    new_tools_count: row.get(7)?,
                 })
             })?.collect();
             //++agent TASK-222
@@ -262,7 +268,11 @@ impl HumanDataStore for SqliteHumanDataStore {
         &self,
         database_id: Uuid,
     ) -> Result<Vec<ToolClassification>, HumanDataError> {
-        self.storage.with_connection(|c| { let mut s=c.prepare("SELECT tool_name,class FROM tool_classifications WHERE database_id=?1 ORDER BY tool_name")?; let rows=s.query_map([database_id.to_string()], |r| Ok(ToolClassification{tool_name:r.get(0)?,class:r.get(1)?}))?.collect(); rows }).map_err(|_| HumanDataError::Unavailable)
+        //++agent TASK-225 [25.09.2026]
+        // Полная форма по спеке B10 — администратор видит, какие строки
+        // добавлены автоматически (auto_added) и сколько отказов набрано.
+        //++agent TASK-225
+        self.storage.with_connection(|c| { let mut s=c.prepare("SELECT tool_name,class,reviewer,updated_at,auto_added,first_seen_at,denied_count,last_denied_at FROM tool_classifications WHERE database_id=?1 ORDER BY tool_name")?; let rows=s.query_map([database_id.to_string()], |r| Ok(ToolClassification{tool_name:r.get(0)?,class:r.get(1)?,reviewer:r.get(2)?,updated_at:r.get(3)?,auto_added:r.get::<_,i64>(4)?!=0,first_seen_at:r.get(5)?,denied_count:r.get(6)?,last_denied_at:r.get(7)?}))?.collect(); rows }).map_err(|_| HumanDataError::Unavailable)
     }
 
     fn update_tool_classification(
@@ -282,7 +292,11 @@ impl HumanDataStore for SqliteHumanDataStore {
         //++agent TASK-222 [05.10.2026]
         // Tool class читается из durable-хранилища на каждый вызов — RAM
         // snapshot его не содержит, refresh intent не нужен.
-        self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at",params![database_id.to_string(),tool_name,patch.class,actor.user_id.to_string(),now])?; audit(&tx,actor,"tool.update",database_id,correlation_id,&now)?; tx.commit() }).map_err(sql_error)
+        //++agent TASK-225 [25.09.2026]
+        // PUT администратора: auto_added=0 (решение принято), denied_count/
+        // first_seen_at/last_denied_at сохраняются (спека §7).
+        //++agent TASK-225
+        self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at,auto_added) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at,auto_added=0",params![database_id.to_string(),tool_name,patch.class,actor.user_id.to_string(),now])?; audit(&tx,actor,"tool.update",database_id,correlation_id,&now)?; tx.commit() }).map_err(sql_error)
         //++agent TASK-222
     }
 

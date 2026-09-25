@@ -240,6 +240,34 @@ impl MaskingService {
                     let _ = self
                         .storage
                         .audit_feed_pull_failed(intent.database_id, error.code());
+                    //++agent TASK-225 [25.09.2026]
+                    // Transient-отказы повторяются каждый тик без внешних
+                    // симптомов — нужен журнальный след, иначе висячий pull
+                    // невиден до ручного запроса к audit_events. Пишем
+                    // один раз на instance intent-а (created_at) + код,
+                    // иначе застрявший pull спамит лог каждым тиком.
+                    {
+                        let key = (intent.created_at.clone(), error.code());
+                        let should_log = self
+                            .feed_pull_log_dedup
+                            .lock()
+                            .map(|mut dedup| {
+                                let changed = dedup.get(&intent.database_id) != Some(&key);
+                                if changed {
+                                    dedup.insert(intent.database_id, key);
+                                }
+                                changed
+                            })
+                            .unwrap_or(false);
+                        if should_log {
+                            tracing::warn!(
+                                event = "feed_pull_failed",
+                                database_id = %intent.database_id,
+                                code = error.code(),
+                            );
+                        }
+                    }
+                    //++agent TASK-225
                 }
             }
         }
