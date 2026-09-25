@@ -149,10 +149,12 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--hover)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .split{display:grid;grid-template-columns:260px 1fr;gap:20px}
 /* списки-навигаторы (базы, чаты, записи) */
-.list{display:flex;flex-direction:column;gap:2px;margin-bottom:18px}
-.list button{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:var(--radius-sm);padding:9px 11px;cursor:pointer;line-height:1.45;min-width:0;overflow:hidden}
-.list button:hover{background:var(--hover)}
-.list button.on{background:var(--surface);border-color:var(--line);box-shadow:var(--shadow),inset 2px 0 0 var(--accent)}
+/*++agent TASK-224 [25.09.2026 10:00:00] карточки списков: невыбранные тоже с фоном и рамкой (замечание пользователя: пункты без границ не читаются как карточки). */
+.list{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
+.list button{display:block;width:100%;text-align:left;background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--radius-sm);padding:9px 11px;cursor:pointer;line-height:1.45;min-width:0;overflow:hidden}
+.list button:hover{background:var(--hover);border-color:var(--faint)}
+.list button.on{background:var(--surface);border-color:var(--accent);box-shadow:var(--shadow),inset 3px 0 0 var(--accent)}
+/*++agent TASK-224*/
 .list button b{font-weight:600}
 .list button .tag{margin-top:4px}
 .list .empty{text-align:left;padding:8px 11px}
