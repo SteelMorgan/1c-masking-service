@@ -5,6 +5,7 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{
+    api::human::model::{refresh_error_text, RefreshStatus},
     auth::Principal,
     domain::{
         DatabaseMode, ErrorCode, MaskingService, PolicyRule, PolicySnapshot, RuleAction,
@@ -19,6 +20,20 @@ use super::{
     HumanDataError, HumanDataStore, MetadataNode, MetadataNodesPage, NeutralReport,
     PolicyRuleInput, PolicySummary, ToolClassification, ToolClassificationPatch,
 };
+
+//++agent TASK-225 [26.09.2026] M-5: отказ legacy-activate — либо
+// неподтверждённые ослабления (409 WEAKENING_NOT_CONFIRMED), либо
+// цель не в статусе draft (409 CONFLICT: откат идёт через B7r).
+enum LegacyActivateRejection {
+    Weakenings(Vec<String>),
+    NotDraft,
+    //++agent TASK-225 [26.09.2026] ревью-2 N-4
+    /// Целевая версия по (number, id) не нашлась — fail-closed: барьер
+    /// ослаблений не пропускается молча, активация отклоняется.
+    TargetMissing,
+    //++agent TASK-225
+}
+//++agent TASK-225
 
 pub struct SqliteHumanDataStore {
     storage: Arc<SqliteStorage>,
@@ -46,7 +61,11 @@ impl HumanDataStore for SqliteHumanDataStore {
                 "SELECT d.id,COALESCE(d.display_label,d.id),d.display_label,d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
                         COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END),
                         (SELECT COUNT(*) FROM tool_classifications t WHERE t.database_id=d.id AND t.auto_added=1),
-                        d.strict_mode
+                        d.strict_mode,
+                        i.state,i.attempts,i.next_attempt_at,i.last_error_code,i.first_failed_at,
+                        d.last_refresh_error_code,d.last_refresh_error_at,d.last_refresh_ok_at,
+                        (SELECT p.version FROM policies p WHERE p.database_id=d.id AND p.status='active'),
+                        (SELECT p.version FROM policies p WHERE p.database_id=d.id AND p.status='draft')
                  FROM databases d
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
                  LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
@@ -54,6 +73,42 @@ impl HumanDataStore for SqliteHumanDataStore {
                  ORDER BY COALESCE(d.display_label,d.id)",
             )?;
             let rows = statement.query_map([], |row| {
+                //++agent TASK-225 [25.09.2026]
+                // §8.4: свод состояния refresh. Приоритет intent-строки
+                // (needs_attention/retrying/running); при отсутствии
+                // intent-а детерминированная ошибка из databases даёт
+                // "failed"; иначе "idle". Текст ошибки — по §8.3.
+                let intent_state: Option<String> = row.get(9)?;
+                let attempts: i64 = row.get::<_, Option<i64>>(10)?.unwrap_or(0);
+                let next_attempt_at: Option<String> = row.get(11)?;
+                let intent_error: Option<String> = row.get(12)?;
+                let first_failed_at: Option<String> = row.get(13)?;
+                let db_error: Option<String> = row.get(14)?;
+                let last_success_at: Option<String> = row.get(16)?;
+                let needs_attention = intent_state.as_deref() == Some("needs_attention");
+                let refresh_state = match intent_state.as_deref() {
+                    Some("needs_attention") => "needs_attention",
+                    Some(_) if attempts > 0 => "retrying",
+                    Some(_) => "running",
+                    None if db_error.is_some() => "failed",
+                    None => "idle",
+                };
+                let last_error_code = intent_error.or(db_error);
+                let last_error_text = last_error_code.as_deref().map(|code| {
+                    refresh_error_text(code, needs_attention, attempts, first_failed_at.as_deref())
+                });
+                let refresh = RefreshStatus {
+                    state: refresh_state.to_owned(),
+                    attempts,
+                    next_attempt_at,
+                    last_error_code,
+                    last_error_text,
+                    first_failed_at,
+                    last_success_at,
+                };
+                let active_version: Option<i64> = row.get(17)?;
+                let draft_version: Option<i64> = row.get(18)?;
+                //++agent TASK-225
                 Ok(DatabaseSummary {
                     id: parse_uuid(row.get(0)?)?,
                     label: row.get(1)?,
@@ -65,7 +120,14 @@ impl HumanDataStore for SqliteHumanDataStore {
                     new_tools_count: row.get(7)?,
                     //++agent TASK-225 [25.09.2026]
                     strict_mode: row.get::<_, i64>(8)? != 0,
+                    refresh,
+                    //++agent TASK-225 [26.09.2026]
+                    // B2: setup_state — unconfigured (нет версий), draft
+                    // (есть черновик), active — активная без черновика.
                     //++agent TASK-225
+                    setup_state: setup_state(active_version, draft_version),
+                    active_version,
+                    draft_version,
                 })
             })?.collect();
             //++agent TASK-222
@@ -293,6 +355,13 @@ impl HumanDataStore for SqliteHumanDataStore {
         {
             return Err(HumanDataError::Conflict);
         }
+        //++agent TASK-225 [26.09.2026]
+        // B10: серверный барьер к диалогу С4 — metadata-bypass исключает
+        // инструмент из маскирования, подтверждение обязательно.
+        //++agent TASK-225
+        if patch.class == "metadata-bypass" && !patch.confirm_bypass {
+            return Err(HumanDataError::BypassNotConfirmed);
+        }
         //++agent TASK-222 [05.10.2026]
         // Tool class читается из durable-хранилища на каждый вызов — RAM
         // snapshot его не содержит, refresh intent не нужен.
@@ -403,7 +472,7 @@ impl HumanDataStore for SqliteHumanDataStore {
         database_id: Uuid,
         config: DictionaryConfig,
         correlation_id: Uuid,
-    ) -> Result<(), HumanDataError> {
+    ) -> Result<i64, HumanDataError> {
         if !matches!(config.mode.as_str(), "all" | "part")
             || config.selectors.is_empty()
             || config.selectors.len() > 100
@@ -428,31 +497,96 @@ impl HumanDataStore for SqliteHumanDataStore {
         {
             return Err(HumanDataError::Conflict);
         }
-        let selectors =
-            serde_json::to_string(&config.selectors).map_err(|_| HumanDataError::Conflict)?;
-        //++agent TASK-222 [05.10.2026]
-        // Config и intent коммитятся атомарно: следующий pull видит
-        // согласованную пару. Refresh всегда 'full' — manifest устаревает
-        // вместе с остальным содержимым snapshot.
-        self.storage.with_connection(|connection| {
-            let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let now=Utc::now().to_rfc3339();
-            transaction.execute(
-                "INSERT INTO dictionary_configs(id,database_id,mode,source_paths_json,filter_ast_json,updated_at) VALUES (?1,?2,?3,?4,NULL,?5)
-                 ON CONFLICT(database_id) DO UPDATE SET id=excluded.id,mode=excluded.mode,source_paths_json=excluded.source_paths_json,filter_ast_json=NULL,updated_at=excluded.updated_at",
-                params![config.id.to_string(),database_id.to_string(),config.mode,selectors,now],
-            )?;
-            upsert_intent_tx(
-                &transaction,
-                database_id,
-                "dictionary_config",
-                Some(actor.user_id),
-                &now,
-            )?;
-            audit(&transaction,actor,"dictionary.update",database_id,correlation_id,&now)?;
-            transaction.commit()
-        }).map_err(sql_error)
-        //++agent TASK-222
+        //++agent TASK-225 [26.09.2026] M-4: legacy PUT dictionaries
+        // переписывается на правку черновика (spec §4) — активная
+        // версия не трогается, intent/pull не пересобираются до
+        // активации черновика. Черновик создаётся из активной при
+        // отсутствии. Ответ тот же + draft_version.
+        self.storage
+            .with_connection(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now = Utc::now().to_rfc3339();
+                let draft = crate::storage::setup::load_version(
+                    &transaction,
+                    database_id,
+                    &crate::storage::setup::VersionRef::Draft,
+                )?;
+                let (draft_id, draft_version) = match draft {
+                    Some(draft) => (draft.id, draft.version),
+                    None => {
+                        let active = crate::storage::setup::load_version(
+                            &transaction,
+                            database_id,
+                            &crate::storage::setup::VersionRef::Active,
+                        )?;
+                        let content = active
+                            .as_ref()
+                            .map(crate::storage::setup::stored_version_content)
+                            .unwrap_or_else(crate::storage::setup::empty_content);
+                        crate::storage::setup::insert_draft(
+                            &transaction,
+                            database_id,
+                            "legacy_dictionaries",
+                            None,
+                            Some(actor.user_id),
+                            &content,
+                            &now,
+                        )?
+                    }
+                };
+                let dictionary = crate::domain::setup::VersionDictionary {
+                    mode: config.mode.clone(),
+                    sources: config
+                        .selectors
+                        .iter()
+                        .map(|selector| crate::domain::setup::DictionarySourceSpec {
+                            source_path: selector.source_path.clone(),
+                            category: selector.category.clone(),
+                            filter_ast: selector.filter_ast.clone(),
+                            reason: String::new(),
+                            estimated_values: None,
+                        })
+                        .collect(),
+                };
+                transaction.execute(
+                    //++agent TASK-225 [26.09.2026] review: content_hash сбрасываем
+                    // в NULL — fill_content_hashes пересчитает по новому
+                    // содержимому; иначе draft_hash/If-Match устаревают
+                    // молча (дыра оптимистичной конкурентности).
+                    "UPDATE policies SET dictionary_json=?2,updated_at=?3,content_hash=NULL WHERE id=?1",
+                    params![
+                        draft_id.to_string(),
+                        crate::storage::setup::dictionary_to_json(&dictionary),
+                        now,
+                    ],
+                )?;
+                crate::storage::setup::fill_content_hashes(&transaction, &database_id.to_string())?;
+                crate::storage::setup::journal_insert(
+                    &transaction,
+                    database_id,
+                    "human",
+                    Some(actor.user_id),
+                    "draft_edit",
+                    Some(draft_version),
+                    None,
+                    None,
+                    Some(serde_json::json!({"area":"dictionary","via":"legacy"})),
+                    &now,
+                )?;
+                audit(
+                    &transaction,
+                    actor,
+                    "dictionary.update",
+                    database_id,
+                    correlation_id,
+                    &now,
+                )?;
+                transaction.commit()?;
+                Ok(draft_version)
+            })
+            .map_err(sql_error)
+        //++agent TASK-225
     }
 
     fn list_policies(&self, database_id: Uuid) -> Result<Vec<PolicySummary>, HumanDataError> {
@@ -474,7 +608,24 @@ impl HumanDataStore for SqliteHumanDataStore {
         {
             return Err(HumanDataError::Conflict);
         }
-        self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let version:i64=tx.query_row("SELECT COALESCE(MAX(version),0)+1 FROM policies WHERE database_id=?1",[database_id.to_string()],|r|r.get(0))?; let id=Uuid::new_v4(); let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO policies(id,database_id,version,status,created_at) VALUES (?1,?2,?3,'draft',?4)",params![id.to_string(),database_id.to_string(),version,now])?; for rule in &request.rules { tx.execute("INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,action,category,priority,enabled,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,1,?8)",params![Uuid::new_v4().to_string(),id.to_string(),rule.selector_kind,rule.selector_value,rule.action,rule.category,rule.priority,now])?; } audit(&tx,actor,"policy.create",database_id,correlation_id,&now)?; tx.commit()?; Ok(PolicySummary{id,version:version as u64,status:"draft".into(),rules:request.rules}) }).map_err(sql_error)
+        //++agent TASK-225 [26.09.2026] §4 legacy POST /policies → черновик;
+        // максимум один draft на базу (индекс policies_one_draft) — вторая
+        // попытка это 409 DRAFT_EXISTS, а не SQLITE_CONSTRAINT; гонка с
+        // параллельным созданием ловится по ConstraintViolation на INSERT.
+        let has_draft: bool = self
+            .storage
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM policies WHERE database_id=?1 AND status='draft')",
+                    [database_id.to_string()],
+                    |r| r.get(0),
+                )
+            })
+            .map_err(sql_error)?;
+        if has_draft {
+            return Err(HumanDataError::DraftExists);
+        }
+        self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let version:i64=tx.query_row("SELECT COALESCE(MAX(version),0)+1 FROM policies WHERE database_id=?1",[database_id.to_string()],|r|r.get(0))?; let id=Uuid::new_v4(); let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO policies(id,database_id,version,status,created_at,updated_at,origin,created_by) VALUES (?1,?2,?3,'draft',?4,?4,'manual',?5)",params![id.to_string(),database_id.to_string(),version,now,actor.user_id.to_string()])?; for rule in &request.rules { tx.execute("INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,action,category,priority,enabled,created_at,reason) VALUES (?1,?2,?3,?4,?5,?6,?7,1,?8,'legacy')",params![Uuid::new_v4().to_string(),id.to_string(),rule.selector_kind,rule.selector_value,rule.action,rule.category,rule.priority,now])?; } crate::storage::setup::fill_content_hashes(&tx,&database_id.to_string())?; crate::storage::setup::journal_insert(&tx,database_id,"human",Some(actor.user_id),"draft_create",Some(version),None,None,None,&now)?; audit(&tx,actor,"policy.create",database_id,correlation_id,&now)?; tx.commit()?; Ok(PolicySummary{id,version:version as u64,status:"draft".into(),rules:request.rules}) }).map_err(|error| match error { rusqlite::Error::SqliteFailure(ref failure, _) if failure.code == rusqlite::ErrorCode::ConstraintViolation => HumanDataError::DraftExists, _ => sql_error(error) })
     }
 
     fn activate_policy<'a>(
@@ -489,7 +640,7 @@ impl HumanDataStore for SqliteHumanDataStore {
             //++agent TASK-221 2026-09-23
             // Пока менеджер не получает версионированную политику до вызова 1С,
             // произвольный Secret нельзя активировать без риска пропуска значения через него.
-            let (version, rules) = self.storage.with_connection(|c| {
+            let outcome = self.storage.with_connection(|c| {
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let version: i64 = tx.query_row(
                     "SELECT version FROM policies WHERE id=?1 AND database_id=?2",
@@ -500,33 +651,192 @@ impl HumanDataStore for SqliteHumanDataStore {
                 if rules.iter().any(|rule| rule.action == "secret") {
                     return Ok(None);
                 }
-                let now = Utc::now().to_rfc3339();
-                tx.execute("UPDATE policies SET status='retired' WHERE database_id=?1 AND status='active'",[database_id.to_string()])?;
-                tx.execute("UPDATE policies SET status='active' WHERE id=?1 AND database_id=?2",params![policy_id.to_string(),database_id.to_string()])?;
-                tx.execute("UPDATE databases SET active_policy_id=?1,updated_at=?2 WHERE id=?3",params![policy_id.to_string(),now,database_id.to_string()])?;
-                //++agent TASK-222 [05.10.2026]
-                // Смена policy меняет Mask allowlist All-expansion и правила
-                // snapshot — intent 'full' в той же tx, pull пересоберёт.
-                upsert_intent_tx(
+                //++agent TASK-225 [26.09.2026]
+                // §4 legacy-activate: та же перепроверка ослаблений, что у
+                // B7 — без подтверждений ослабляющий черновик не
+                // активируется (серверный барьер нельзя обойти старым
+                // маршрутом). diff считается активная→целевая версия.
+                let target = crate::storage::setup::load_version(
                     &tx,
                     database_id,
-                    "policy_activate",
+                    &crate::storage::setup::VersionRef::Number(version),
+                )?
+                .filter(|version| version.id == policy_id);
+                let active = crate::storage::setup::load_version(
+                    &tx,
+                    database_id,
+                    &crate::storage::setup::VersionRef::Active,
+                )?;
+                //++agent TASK-225 [26.09.2026] ревью-2 N-4: target=None
+                // (номер+id не сошлись) — fail-closed: пропускать барьер
+                // ослаблений молча нельзя, активация отклоняется.
+                let Some(target) = target else {
+                    return Ok(Some(Err(LegacyActivateRejection::TargetMissing)));
+                };
+                //++agent TASK-225
+                {
+                    //++agent TASK-225 [26.09.2026] M-2/M-3: expandable
+                    // (F9) + текущие режимы инструментов — тот же
+                    // контекст, что у B5/B7.
+                    let manifest = self.masking.metadata_manifest_view(database_id, |items| {
+                        (
+                            items
+                                .iter()
+                                .map(|item| item.source_path.to_lowercase())
+                                .collect::<std::collections::HashSet<_>>(),
+                            items
+                                .iter()
+                                .filter(|item| {
+                                    crate::domain::metadata_expandable_basics(item)
+                                })
+                                .map(|item| item.source_path.clone())
+                                .collect::<std::collections::HashSet<_>>(),
+                        )
+                    });
+                    let (manifest_paths, manifest_expandable) = match manifest {
+                        Some((_, (paths, expandable))) => (Some(paths), Some(expandable)),
+                        None => (None, None),
+                    };
+                    let (known_tools, tool_modes) = tx
+                        .prepare(
+                            "SELECT tool_name,class FROM tool_classifications WHERE database_id=?1",
+                        )
+                        .and_then(|mut statement| {
+                            let pairs: Vec<(String, String)> = statement
+                                .query_map([database_id.to_string()], |row| {
+                                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            Ok((
+                                pairs.iter().map(|(name, _)| name.clone()).collect(),
+                                pairs,
+                            ))
+                        })
+                        .map(|(names, pairs)| {
+                            (
+                                Some(names),
+                                Some(pairs.into_iter().collect::<std::collections::HashMap<_, _>>()),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    let context = crate::domain::setup::DiffContext {
+                        manifest_paths,
+                        manifest_expandable,
+                        known_tools,
+                        tool_modes,
+                        source_stats: crate::storage::setup::last_source_stats(
+                            &tx,
+                            database_id,
+                        )?,
+                        database_mismatch: false,
+                    };
+                    //++agent TASK-225
+                    //++agent TASK-225 [26.09.2026] B-1: отсутствие активной
+                    // версии ≠ отсутствие проверки — diff считается от
+                    // empty_content, как в B7 (иначе первое включение
+                    // KEEP/ослаблений проходило бы без подтверждения).
+                    let from = active
+                        .as_ref()
+                        .map(crate::storage::setup::stored_version_content)
+                        .unwrap_or_else(crate::storage::setup::empty_content);
+                    //++agent TASK-225
+                    let diff = crate::domain::setup::compute_diff(
+                        &from,
+                        //++agent TASK-225 [26.09.2026] review MAJOR-5:
+                        // NULL-словарь legacy-черновика = «не задано» →
+                        // наследуем словарь активной; иначе барьер видел
+                        // фантомные SOURCE_REMOVED без канала подтверждения.
+                        &crate::storage::setup::stored_version_content_for_to(
+                            &target, &from,
+                        ),
+                        &context,
+                    );
+                    let missing: Vec<String> = diff
+                        .changes
+                        .iter()
+                        .filter(|change| {
+                            change.change_class
+                                == crate::domain::setup::ChangeClass::Weakening
+                        })
+                        .map(|change| change.id.clone())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Ok(Some(Err(LegacyActivateRejection::Weakenings(
+                            missing,
+                        ))));
+                    }
+                }
+                //++agent TASK-225 [26.09.2026] M-5: активация только через
+                // общий activate_draft_tx — draft-статус обязателен
+                // (retired напрямую не поднимается: откат идёт через
+                // B7r-копию в черновик). Внутри: зеркало
+                // dictionary_configs, применение tools_json (M-1),
+                // activated_at/by, intent, та же тx, что у B7.
+                let now = Utc::now().to_rfc3339();
+                let status: String = tx.query_row(
+                    "SELECT status FROM policies WHERE id=?1",
+                    [policy_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if status != "draft" {
+                    tx.rollback()?;
+                    return Ok(Some(Err(LegacyActivateRejection::NotDraft)));
+                }
+                crate::storage::setup::activate_draft_tx(
+                    &tx,
+                    database_id,
+                    policy_id,
                     Some(actor_id),
+                    None,
                     &now,
                 )?;
-                //++agent TASK-222
+                crate::storage::setup::fill_content_hashes(&tx, &database_id.to_string())?;
+                crate::storage::setup::journal_insert(
+                    &tx,
+                    database_id,
+                    "human",
+                    Some(actor_id),
+                    "activate",
+                    Some(version),
+                    None,
+                    None,
+                    None,
+                    &now,
+                )?;
                 let principal=Principal{user_id:actor_id,role:crate::auth::Role::Admin,auth_epoch:0};
                 audit(&tx,&principal,"policy.activate",database_id,correlation_id,&now)?;
                 tx.commit()?;
-                Ok(Some((version, rules)))
-            }).map_err(sql_error)?.ok_or(HumanDataError::SecretPolicyUnsupported)?;
-            //--agent TASK-221
+                //++agent TASK-225
+                Ok(Some(Ok((version, rules))))
+            }).map_err(sql_error)?;
+            //++agent TASK-225 [26.09.2026] §4: legacy-activate проходит
+            // барьер ослаблений — Ok(None)=F8 secret, Err(ids)=WNC.
+            let (version, rules) = match outcome {
+                Some(Ok(pair)) => pair,
+                Some(Err(LegacyActivateRejection::Weakenings(missing))) => {
+                    return Err(HumanDataError::WeakeningNotConfirmed(missing));
+                }
+                Some(Err(LegacyActivateRejection::NotDraft)) => {
+                    return Err(HumanDataError::Conflict);
+                }
+                //++agent TASK-225 [26.09.2026] ревью-2 N-4
+                Some(Err(LegacyActivateRejection::TargetMissing)) => {
+                    return Err(HumanDataError::NotFound);
+                }
+                //++agent TASK-225
+                None => return Err(HumanDataError::SecretPolicyUnsupported),
+            };
+            //++agent TASK-225
+            //++agent TASK-221
             self.masking
                 .set_policy_snapshot(
                     database_id,
                     PolicySnapshot {
                         version,
                         rules: rules.into_iter().map(domain_rule).collect(),
+                        //++agent TASK-225 [26.09.2026] §6.1.
+                        policy_id: Some(policy_id),
+                        //++agent TASK-225
                         ..PolicySnapshot::default()
                     },
                 )
@@ -538,6 +848,21 @@ impl HumanDataStore for SqliteHumanDataStore {
 
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+//++agent TASK-225 [26.09.2026]
+/// B2 `setup_state`: активная без черновика — "active"; черновик (с
+/// активной или без) — "draft"; без версий — "unconfigured".
+//++agent TASK-225
+fn setup_state(active: Option<i64>, draft: Option<i64>) -> String {
+    if draft.is_some() {
+        "draft"
+    } else if active.is_some() {
+        "active"
+    } else {
+        "unconfigured"
+    }
+    .to_owned()
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -653,7 +978,7 @@ fn search_metadata_nodes(
 }
 //--agent TASK-224
 
-fn sql_error(e: rusqlite::Error) -> HumanDataError {
+pub(crate) fn sql_error(e: rusqlite::Error) -> HumanDataError {
     if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
         HumanDataError::NotFound
     } else {
@@ -661,7 +986,7 @@ fn sql_error(e: rusqlite::Error) -> HumanDataError {
     }
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &rusqlite::Transaction<'_>,
     a: &Principal,
     action: &str,
@@ -686,10 +1011,16 @@ fn upsert_intent_tx(
     actor_id: Option<Uuid>,
     now: &str,
 ) -> rusqlite::Result<()> {
+    //++agent TASK-225 [25.09.2026]
+    // §8.1: явная постановка intent (Admin-мутация, POST /refresh) —
+    // новая серия попыток: attempts/state/next_attempt_at сбрасываются,
+    // в том числе вывод из needs_attention.
+    //++agent TASK-225
     tx.execute(
         "INSERT INTO v2_refresh_intents(database_id,phase,reason,actor_id,created_at)
          VALUES (?1,'full',?2,?3,?4) ON CONFLICT(database_id) DO UPDATE SET
-         phase='full',reason=excluded.reason,actor_id=excluded.actor_id,created_at=excluded.created_at",
+         phase='full',reason=excluded.reason,actor_id=excluded.actor_id,created_at=excluded.created_at,
+         attempts=0,state='pending',next_attempt_at=NULL",
         params![
             database_id.to_string(),
             reason,
@@ -711,7 +1042,9 @@ fn valid_rule(r: &PolicyRuleInput) -> bool {
         && r.category.len() <= 64
         && (r.selector_kind != "regex" || regex::Regex::new(&r.selector_value).is_ok())
 }
-fn load_rules(
+//++agent TASK-225 [26.09.2026] MINOR-5: pub(crate) — B7 перечитывает
+// правила активированной версии для set_policy_snapshot.
+pub(crate) fn load_rules(
     c: &rusqlite::Connection,
     id: Uuid,
     db: Uuid,
@@ -724,7 +1057,7 @@ fn load_rules(
     if !exists {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
-    let mut s=c.prepare("SELECT selector_kind,selector_value,action,category,priority FROM policy_rules WHERE policy_id=?1 AND enabled=1 ORDER BY priority,id")?;
+    let mut s=c.prepare("SELECT selector_kind,selector_value,action,category,priority,id FROM policy_rules WHERE policy_id=?1 AND enabled=1 ORDER BY priority,id")?;
     let rows = s
         .query_map([id.to_string()], |r| {
             Ok(PolicyRuleInput {
@@ -733,6 +1066,11 @@ fn load_rules(
                 action: r.get(2)?,
                 category: r.get(3)?,
                 priority: r.get(4)?,
+                //++agent TASK-225 [26.09.2026] §6.1
+                rule_id: r
+                    .get::<_, String>(5)
+                    .ok()
+                    .and_then(|t| Uuid::parse_str(&t).ok()),
             })
         })?
         .collect();
@@ -762,7 +1100,9 @@ fn load_policies(c: &rusqlite::Connection, db: Uuid) -> rusqlite::Result<Vec<Pol
         })
         .collect()
 }
-fn domain_rule(r: PolicyRuleInput) -> PolicyRule {
+//++agent TASK-225 [26.09.2026] MINOR-5: B7 зовёт из setup.rs —
+// единый маппинг правил снимка после активации.
+pub(crate) fn domain_rule(r: PolicyRuleInput) -> PolicyRule {
     PolicyRule {
         selector: match r.selector_kind.as_str() {
             "source_path" => RuleSelector::SourcePath,
@@ -779,5 +1119,7 @@ fn domain_rule(r: PolicyRuleInput) -> PolicyRule {
         },
         category: r.category,
         priority: r.priority,
+        //++agent TASK-225 [26.09.2026] §6.1
+        rule_id: r.rule_id,
     }
 }

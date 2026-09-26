@@ -1,5 +1,8 @@
 mod handlers;
 mod model;
+//++agent TASK-225 [26.09.2026] §4: версионированная настройка (B3-B13).
+pub mod setup;
+//++agent TASK-225
 mod sqlite;
 
 use std::sync::Arc;
@@ -26,6 +29,11 @@ pub struct HumanState {
     pub data: Arc<dyn HumanDataStore>,
     /// Exact public HTTPS origin, for example `https://masking.example.test`.
     pub expected_origin: String,
+    //++agent TASK-225 [26.09.2026]
+    /// §4: версионированная настройка — конкретный фасад (транзакции +
+    /// RAM-снимки), не входит в dyn HumanDataStore.
+    //++agent TASK-225
+    pub setup: setup::SetupService,
 }
 
 pub fn router(state: Arc<HumanState>) -> Router {
@@ -108,6 +116,72 @@ pub fn router(state: Arc<HumanState>) -> Router {
             "/api/v1/admin/databases/{id}/policies/{policy_id}/activate",
             post(handlers::activate_policy),
         )
+        //++agent TASK-225 [26.09.2026]
+        // §4: версионированная настройка (B3–B8, B11). B9/B13 — в
+        // существующих маршрутах history/metadata.
+        //++agent TASK-225
+        .route(
+            "/api/v1/admin/databases/{id}/setup/export",
+            get(|state, path, headers, query| async move {
+                setup::export_setup(state, path, headers, query, false).await
+            }),
+        )
+        .route(
+            "/api/v1/databases/{id}/setup/export",
+            get(|state, path, headers, query| async move {
+                setup::export_setup(state, path, headers, query, true).await
+            }),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/imports",
+            post(setup::import_setup),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/diff",
+            get(setup::diff_setup),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/draft",
+            post(setup::draft_create)
+                .get(setup::draft_get)
+                .delete(setup::draft_delete),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/draft/revert",
+            post(setup::draft_revert),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/draft/{area}",
+            axum::routing::put(setup::draft_put_area),
+        )
+        //++agent TASK-225 [26.09.2026] D2: список версий (автор/дата) и
+        // чтение конкретной версии — просмотр без записи в журнал.
+        .route(
+            "/api/v1/admin/databases/{id}/setup/versions",
+            get(setup::version_list),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/versions/{version}",
+            get(setup::version_get),
+        )
+        //++agent TASK-225
+        .route(
+            "/api/v1/admin/databases/{id}/setup/activate",
+            post(setup::activate_setup),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/rollback",
+            post(setup::rollback_setup),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/dry-run",
+            post(setup::dry_run_setup),
+        )
+        .route(
+            "/api/v1/admin/databases/{id}/setup/journal",
+            get(setup::setup_journal),
+        )
+        .route("/api/v1/history/{id}/reasons", get(setup::history_reasons))
         .route("/", get(handlers::index_page))
         .route("/viewer", get(handlers::viewer_page))
         .route("/admin", get(handlers::admin_page))

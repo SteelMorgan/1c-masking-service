@@ -30,6 +30,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/calls/preflight", post(preflight))
         .route("/internal/v1/calls/finalize", post(finalize))
         .route("/internal/v1/calls/terminal", post(terminal))
+        //++agent TASK-225 [26.09.2026]
+        // ОВ-2/Б12: read-only экспорт настройки для MCP-инструмента
+        // менеджера — JSON §1 активной версии, без значений словаря.
+        .route("/internal/v1/setup/export", get(setup_export))
+        //--agent TASK-225
         .route("/internal/v1/health/live", get(live))
         .route("/internal/v1/health/ready", get(ready))
         .layer(DefaultBodyLimit::max(bounded_env_usize(
@@ -179,6 +184,128 @@ fn bounded_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<Json<T>, S
         ServiceError::new(code, Uuid::nil())
     })
 }
+
+//++agent TASK-225 [26.09.2026]
+/// ОВ-2/Б12: параметры `GET /internal/v1/setup/export` — база обязательна,
+/// `include_tools=1` добавляет секцию tools (снимок версии либо текущие
+/// классификации). Параметра версии нет: агент видит только активную.
+#[derive(Deserialize)]
+struct SetupExportQuery {
+    database_id: Uuid,
+    include_tools: Option<u8>,
+}
+
+/// ОВ-2/Б12: сборка и аудит экспорта. Отказ при отсутствии базы/активной
+/// версии — `NO_ACTIVE_VERSION` (404), при сбое хранилища — `SERVICE_NOT_READY`.
+async fn setup_export(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SetupExportQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let correlation_id = Uuid::new_v4();
+    let database_id = query.database_id;
+    let include_tools = query.include_tools.unwrap_or(0) != 0;
+    tracing::info!(
+        event = "setup_export",
+        %correlation_id,
+        %database_id,
+        include_tools,
+    );
+    let exported = state
+        .storage
+        .with_connection(|connection| {
+            setup_export_body(connection, database_id, include_tools, correlation_id)
+        })
+        .map_err(|error| {
+            tracing::warn!(event = "setup_export_failed", %correlation_id, %database_id, %error);
+            ServiceError::new(crate::domain::ErrorCode::ServiceNotReady, correlation_id)
+        })?;
+    exported
+        .map(Json)
+        .ok_or_else(|| ServiceError::new(crate::domain::ErrorCode::NoActiveVersion, correlation_id))
+}
+
+/// Тело §1 активной версии + строки аудита (`setup.export` с actor_kind
+/// `agent`) и setup_journal (`export`, version, sha256 выгрузки) в одной
+/// транзакции. `Ok(None)` — базы или активной версии нет.
+fn setup_export_body(
+    connection: &mut rusqlite::Connection,
+    database_id: Uuid,
+    include_tools: bool,
+    correlation_id: Uuid,
+) -> rusqlite::Result<Option<Value>> {
+    use crate::storage::setup::{
+        current_tools, journal_insert, load_version, stored_version_content, VersionRef,
+    };
+    use rusqlite::OptionalExtension;
+    use sha2::Digest;
+
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let database: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT display_label FROM databases WHERE id=?1",
+            [database_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(label) = database else {
+        return Ok(None);
+    };
+    let Some(version) = load_version(&transaction, database_id, &VersionRef::Active)? else {
+        return Ok(None);
+    };
+    let content = stored_version_content(&version);
+    //++agent TASK-225 [26.09.2026] MINOR-2: тело §1-файла собирает общая
+    // export_file_json (та же, что у human-экспорта) — формы больше не
+    // расходятся. Снимок tools_json у версии может отсутствовать
+    // (версии до 0010) — тогда отдаём текущие классификации.
+    let tools = if include_tools {
+        match &content.tools {
+            Some(specs) => Some(specs.clone()),
+            None => Some(current_tools(&transaction, database_id)?),
+        }
+    } else {
+        None
+    };
+    let body = crate::api::human::setup::export_file_json(
+        &content,
+        database_id,
+        label.as_deref(),
+        version.version,
+        tools,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    // sha256 — от сериализованного тела ответа (те же байты, что уйдут
+    // клиенту): serde_json::to_string детерминирован для json!-макроса.
+    let serialized = serde_json::to_string(&body).unwrap_or_default();
+    let sha256 = format!("{:x}", sha2::Sha256::digest(serialized.as_bytes()));
+    let now = chrono::Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT INTO audit_events(actor_kind,action,database_id,outcome,code,correlation_id,created_at)
+         VALUES ('agent','setup.export',?1,'success',?2,?3,?4)",
+        rusqlite::params![
+            database_id.to_string(),
+            format!("version={} sha256={sha256}", version.version),
+            correlation_id.to_string(),
+            now,
+        ],
+    )?;
+    journal_insert(
+        &transaction,
+        database_id,
+        "agent",
+        None,
+        "export",
+        Some(version.version),
+        None,
+        Some(&sha256),
+        None,
+        &now,
+    )?;
+    transaction.commit()?;
+    Ok(Some(body))
+}
+//--agent TASK-225
 
 async fn live() -> Json<Value> {
     Json(json!({"status":"live"}))

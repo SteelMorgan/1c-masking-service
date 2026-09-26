@@ -100,14 +100,90 @@ reveal старых записей в принципе невозможен.
 - immutable policy versions: `GET/POST .../{id}/policies`,
   `POST .../{id}/policies/{policy_id}/activate`.
 
+
 Tool class допускает только `data-mask`, `metadata-bypass` и
 `deny-pending-review`. Dictionary endpoint принимает только configuration:
 `mode` и до 100 selectors вида `{source_path, category, filter_ast}`. Категория
 обязательна для каждого selector, а его AST ограничен операциями `and`, `or`,
-`not`, `eq`, `ne`, `in`; raw dictionary values не являются частью API и не сохраняются. Policy rules
+`not`, `eq`, `ne`, `in`; raw dictionary values не являются частью API и не сохраняются.
+Форма операндов AST: `and`/`or` — `{op,args:[…]}`, `not` — `{op:"not",arg:…}`,
+`eq`/`ne` — `{op,field,value}` (скаляр), `in` — `{op:"in",field,values:[…]}`
+(массив ≤100 скаляров; **`values`, не `value`**). Policy rules
 принимают только известные selector/action, а regex компилируется до записи.
 Для `mode=all` допускается ровно один selector с `source_path="*"`; для
 `mode=part` wildcard запрещён.
+
+<!--++agent TASK-225 [26.09.2026] §4-->
+## Версионированная настройка (setup)
+
+Версия настройки (`policies`) объединяет правила, словарь
+(`dictionary_json`) и инструменты (`tools_json`); статусы `draft`
+(≤1 на базу), `active` (≤1), `retired`. Откат — копия архивной версии
+новым черновиком, архив не мутирует.
+
+- `GET .../{id}/setup/export?version=active|draft|<n>&include_tools=0|1` —
+  выгрузка `masking-setup/v1` (`Content-Disposition` attachment,
+  `Cache-Control: no-store`); также `GET /api/v1/databases/{id}/setup/export`.
+- `POST .../{id}/setup/imports?replace_draft=0|1` — импорт файла в
+  черновик; `409 DRAFT_EXISTS` при `replace_draft=0`.
+- `GET .../{id}/setup/diff?from=active|<n>&to=draft|<n>` —
+  классифицированный diff §3 (`weakening|strengthening|neutral` +
+  warnings §3.6).
+- Черновик: `POST .../setup/draft {from:"active"|"empty"}`,
+  `GET .../setup/draft`, `PUT .../setup/draft/{dictionary|rules|tools}`
+  и `DELETE` — все под `If-Match: "<draft_hash>"` (`409 DRAFT_CHANGED`);
+  `POST .../setup/draft/revert {change_ids,warning_ids}` — возврат
+  элементов к состоянию active / исключение предупреждений.
+- `POST .../setup/activate {version,draft_hash,confirmed_weakenings,
+  accepted_strengthenings,excluded_warnings,comment?}` — серверная
+  перепроверка diff в одной транзакции: `409 WEAKENING_NOT_CONFIRMED`,
+  `409 STALE_CONFIRMATION`, `400 WARNING_NOT_EXCLUDABLE`,
+  `409 DRAFT_CHANGED`, `409 SECRET_POLICY_UNSUPPORTED` (F8).
+- `POST .../setup/rollback {version,replace_draft}` — `201`, черновик
+  `origin='rollback'` (только неактивная версия: активная →
+  `409 VERSION_IS_ACTIVE`).
+- `GET .../setup/versions` — список версий `{version,status,origin,
+  author,created_at,activated_at?,discarded_at?}` для экрана истории;
+  `GET .../setup/versions/{version}` — полное содержимое версии
+  (`dictionary/rules/tools`). Оба маршрута read-only: не пишут
+  журнал и audit.
+- `POST .../setup/dry-run {version:"draft"|<n>, limit:1..50}` — §5: сухой
+  прогон последних записей истории активной версией и целевой;
+  `409 DRY_RUN_BUSY`. Ответ без значений: `records[]` с маскированной
+  сеткой `grid{columns,cells[]}` — у ячейки только координаты
+  (block/row/column) и статусы `before|after ∈ open|masked|secret|
+  unknown` + `reason` (pointer), ни значений, ни токенов; счётчики
+  `became_masked|became_open|unevaluable`, `timing` (median/p_max/
+  over_budget на версию, `dictionary_memory`, `top_sources`),
+  `dictionary_not_loaded`, `skipped[].mapping_expired`. Пустая история →
+  `{history_empty:true, reason:"no_records"|"no_lineage"}`.
+- `GET .../setup/journal?limit` — журнал `setup_versions_journal`.
+- `GET .../setup/draft`, PUT'ы и activate пишут строки журнала и audit
+  в одной транзакции.
+- `GET /api/v1/history/{id}/reasons` (Viewer) — §6.3: детальные причины
+  по ячейкам (`detailed:true`, `policy_version`, `policy_state`,
+  `active_version`, `reasons[]` с `cells`-счётчиками и `link.admin_path`,
+  `cells[]` — только координаты); старая запись без `mask_detail_json` →
+  `{detailed:false, legacy_reasons:[…]}`; истёкшая запись →
+  `410 HISTORY_EXPIRED`.
+- `GET .../{id}/metadata?fields_of=<объект>` (B13) — поля объекта из
+  RAM-manifest (`{object, fields:[{name,type,password_mode}],
+  manifest_ready}`), без значений.
+- `GET .../admin/databases` дополнительно отдаёт `setup_state`,
+  `active_version`, `draft_version`; `PATCH` принимает `strict_mode`
+  (строгий режим §8.1, по умолчанию включён).
+
+Legacy-маршруты продолжают работать поверх версий: `PUT dictionaries`
+правит черновик (создаёт из активной при отсутствии) и отвечает
+`{draft_version}` — активная политика не мутирует; `POST policies`
+создаёт черновик (`409 DRAFT_EXISTS`); `POST policies/{id}/activate`
+активирует **только черновик** (любой другой статус цели → `409`,
+retired поднимается лишь через `setup/rollback` + `setup/activate`)
+и проходит ту же проверку ослаблений, что и B7 — при наличии
+неподтверждённых ослаблений `409 WEAKENING_NOT_CONFIRMED`;
+`PUT tools/{tool}` с `class:"metadata-bypass"` требует
+`confirm_bypass:true` (`400 BYPASS_NOT_CONFIRMED`).
+<!----agent TASK-225-->
 
 `POST /admin/users` и оба invitation-маршрута возвращают
 `{user_id,login,role,activation_token,activation_url,expires_in_seconds}`;

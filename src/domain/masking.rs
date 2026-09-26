@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexBuilder};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -32,6 +33,11 @@ pub struct PolicyRule {
     pub action: RuleAction,
     pub category: String,
     pub priority: i64,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: связь с policy_rules.id — детальные причины ячеек ссылаются
+    /// на правило; встроенные правила (секретные пути) — None.
+    //++agent TASK-225
+    pub rule_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +45,31 @@ pub struct PolicySnapshot {
     pub version: i64,
     pub rules: Vec<PolicyRule>,
     pub dictionary: HashMap<String, String>,
+    //++agent TASK-225 [26.09.2026] D8: категория → source_path источника
+    /// словаря (§6.3: причина `dictionary` несёт `source_path` для
+    /// link/panel UI). Заполняется при pull из `FeedDictionaryValue`;
+    /// у категории с несколькими источниками — первый по порядку feed.
+    //++agent TASK-225
+    pub dictionary_sources: HashMap<String, String>,
+    //++agent TASK-225 [25.09.2026]
+    /// §5a.2: предпостроенный индекс словаря (Aho-Corasick). Строится вне
+    /// горячего пути при замене снимка; `None` — fallback на прямой
+    /// перебор `dictionary` (тестовые снимки, пустой словарь).
+    //++agent TASK-225
+    pub dictionary_index: Option<std::sync::Arc<DictionaryIndex>>,
     pub metadata_sources: Vec<FeedMetadataItem>,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: id строки `policies` активной версии — пишется в
+    /// `history.policy_id` для связи записи с версией (B9).
+    //++agent TASK-225
+    pub policy_id: Option<Uuid>,
+    //++agent TASK-225 [26.09.2026] review MINOR-9
+    /// Отпечаток содержимого `dictionary` (XOR-свертка хешей записей —
+    /// порядок итерации не важен). 0 = «не посчитан»; вычисляется вне
+    /// write-блокировки. Сравнение отпечатков вместо O(n) `HashMap::eq`
+    /// под `policy_cache.write()`.
+    //++agent TASK-225
+    pub dictionary_fingerprint: u64,
     pub ready: bool,
 }
 
@@ -49,17 +79,352 @@ impl Default for PolicySnapshot {
             version: 1,
             rules: Vec::new(),
             dictionary: HashMap::new(),
+            dictionary_sources: HashMap::new(),
+            dictionary_index: None,
             metadata_sources: Vec::new(),
+            policy_id: None,
+            dictionary_fingerprint: 0,
             ready: true,
         }
     }
 }
+
+//++agent TASK-225 [26.09.2026] review MINOR-9
+/// Дешёвый отпечаток словаря: XOR хешей отдельных записей — порядок
+/// итерации HashMap не влияет. Только in-memory (сравнение «тот же
+/// словарь» при слиянии снимков), не персистится.
+pub fn dictionary_fingerprint(dictionary: &HashMap<String, String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    dictionary.iter().fold(0u64, |acc, (key, value)| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+        acc ^ hasher.finish()
+    })
+}
+//--agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+/// §5a.2: индекс словаря на Aho-Corasick. `automaton` — только
+/// не-keep значения (LeftmostLongest — детерминированный выбор при
+/// пересекающихся значениях): keep-значение не заменяет текст и не
+/// должно глушить mask-совпадение внутри него (семантика legacy-скана,
+/// B-3). `keep_automaton` — отдельный Standard-автомат по
+/// keep-значениям для фиксации причины `dictionary:<cat>` (legacy
+/// записывал её и при keep; overlapping-итерация видит все совпадения,
+/// включая перекрытые keep-значения разных категорий). N-2: линейный
+/// `contains` на каждую keep-запись — O(keep×текст) на строку, тот же
+/// порядок сложности, от которого уходит §5a. `entries` —
+/// значение/категория/предвычисленное действие; `automaton_entry`/
+/// `keep_entry`/`secret_entry` отображают pattern_id автоматов в
+/// `entries`. `secret_automaton` — Standard-автомат по secret-значениям:
+/// проход «любое совпадение удаляет строку» должен видеть и перекрытые
+/// совпадения, которые LeftmostLongest отбрасывает.
+pub struct DictionaryIndex {
+    automaton: std::sync::Arc<aho_corasick::AhoCorasick>,
+    /// pattern_id основного автомата → индекс в `entries`.
+    automaton_entry: Vec<usize>,
+    /// Standard-автомат по keep-значениям (в основной не входят);
+    /// `Arc` — переиспользование в `with_actions` при неизменном
+    /// keep-множестве; None — keep-записей нет.
+    keep_automaton: Option<std::sync::Arc<aho_corasick::AhoCorasick>>,
+    /// pattern_id keep-автомата → индекс в `entries`.
+    keep_entry: Vec<usize>,
+    secret_automaton: Option<aho_corasick::AhoCorasick>,
+    /// pattern_id secret-автомата → индекс в `entries`.
+    secret_entry: Vec<usize>,
+    entries: Vec<DictionaryEntry>,
+}
+
+#[derive(Debug)]
+struct DictionaryEntry {
+    // Arc<str>: пересчёт действий (with_actions) клонирует ссылки,
+    // а не сами значения словаря.
+    value: std::sync::Arc<str>,
+    category: std::sync::Arc<str>,
+    action: RuleAction,
+}
+
+impl std::fmt::Debug for DictionaryIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DictionaryIndex")
+            .field("entries", &self.entries.len())
+            .field("secret_entries", &self.secret_entry.len())
+            .finish()
+    }
+}
+
+impl DictionaryIndex {
+    /// Строит автоматы по значениям словаря и правилам снимка.
+    /// `None` — словарь пуст (индекс не нужен).
+    pub fn build(
+        dictionary: &HashMap<String, String>,
+        rules: &[PolicyRule],
+    ) -> Option<std::sync::Arc<Self>> {
+        let entries: Vec<DictionaryEntry> = dictionary
+            .iter()
+            .filter(|(value, _)| !value.is_empty())
+            .map(|(value, category)| DictionaryEntry {
+                value: std::sync::Arc::from(value.as_str()),
+                category: std::sync::Arc::from(category.as_str()),
+                action: Self::action_for(rules, category),
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(Self::assemble(entries)))
+    }
+
+    /// Пересчёт действий при смене правил без нового pull. Автоматы
+    /// переиспользуются, пока не-keep/keep множества значений не
+    /// изменились; при переходе категории keep↔не-keep (B-3) автоматы
+    /// пересобираются — значения те же, множества другие.
+    pub fn with_actions(&self, rules: &[PolicyRule]) -> std::sync::Arc<Self> {
+        let entries: Vec<DictionaryEntry> = self
+            .entries
+            .iter()
+            .map(|entry| DictionaryEntry {
+                value: entry.value.clone(),
+                category: entry.category.clone(),
+                action: Self::action_for(rules, &entry.category),
+            })
+            .collect();
+        let active_ids = Self::active_entry_ids(&entries);
+        let (automaton, automaton_entry) = if active_ids == self.automaton_entry {
+            (self.automaton.clone(), self.automaton_entry.clone())
+        } else {
+            (
+                std::sync::Arc::new(Self::build_automaton(
+                    &entries,
+                    &active_ids,
+                    aho_corasick::MatchKind::LeftmostLongest,
+                )),
+                active_ids,
+            )
+        };
+        let keep_ids = Self::keep_entry_ids(&entries);
+        let keep_automaton = if keep_ids == self.keep_entry {
+            self.keep_automaton.clone()
+        } else {
+            Self::build_keep_automaton(&entries, &keep_ids)
+        };
+        let mut index = Self {
+            automaton,
+            automaton_entry,
+            keep_automaton,
+            keep_entry: keep_ids,
+            secret_automaton: None,
+            secret_entry: Vec::new(),
+            entries,
+        };
+        index.rebuild_secret();
+        std::sync::Arc::new(index)
+    }
+
+    /// §5: память автоматов + вектора записей — для отчёта сухого
+    /// прогона (`timing.dictionary_memory.automaton_bytes`).
+    pub fn heap_bytes(&self) -> u64 {
+        let mut total = self.automaton.memory_usage() as u64;
+        if let Some(keep) = &self.keep_automaton {
+            total += keep.memory_usage() as u64;
+        }
+        if let Some(secret) = &self.secret_automaton {
+            total += secret.memory_usage() as u64;
+        }
+        // entries: Arc-указатели + строки значений/категорий.
+        total += self
+            .entries
+            .iter()
+            .map(|entry| entry.value.len() + entry.category.len() + 48)
+            .sum::<usize>() as u64;
+        total
+    }
+
+    /// Действие категории — тот же `strongest_dictionary_action`,
+    /// по списку правил без полного снимка.
+    fn action_for(rules: &[PolicyRule], category: &str) -> RuleAction {
+        rules
+            .iter()
+            .filter(|rule| {
+                rule.selector == RuleSelector::Dictionary && wildcard_match(&rule.pattern, category)
+            })
+            .max_by_key(|rule| (rule.action, rule.priority))
+            .map_or(RuleAction::Mask, |rule| rule.action)
+    }
+
+    fn assemble(entries: Vec<DictionaryEntry>) -> Self {
+        let active_ids = Self::active_entry_ids(&entries);
+        let automaton = Self::build_automaton(
+            &entries,
+            &active_ids,
+            aho_corasick::MatchKind::LeftmostLongest,
+        );
+        let keep_ids = Self::keep_entry_ids(&entries);
+        let mut index = Self {
+            automaton: std::sync::Arc::new(automaton),
+            automaton_entry: active_ids,
+            keep_automaton: Self::build_keep_automaton(&entries, &keep_ids),
+            keep_entry: keep_ids,
+            secret_automaton: None,
+            secret_entry: Vec::new(),
+            entries,
+        };
+        index.rebuild_secret();
+        index
+    }
+
+    /// Индексы записей, попадающих в основной автомат (всё, кроме keep).
+    fn active_entry_ids(entries: &[DictionaryEntry]) -> Vec<usize> {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.action != RuleAction::Keep)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Индексы keep-записей — для keep-автомата фиксации причин.
+    fn keep_entry_ids(entries: &[DictionaryEntry]) -> Vec<usize> {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.action == RuleAction::Keep)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn build_automaton(
+        entries: &[DictionaryEntry],
+        ids: &[usize],
+        kind: aho_corasick::MatchKind,
+    ) -> aho_corasick::AhoCorasick {
+        aho_corasick::AhoCorasickBuilder::new()
+            .match_kind(kind)
+            .build(ids.iter().map(|id| entries[*id].value.as_ref()))
+            .expect("dictionary automaton build")
+    }
+
+    /// Секрет-проход требует overlapping-семантики (любое совпадение,
+    /// даже перекрытое более длинным): отдельный автомат Standard-семантики
+    /// только по secret-значениям — их обычно мало.
+    fn rebuild_secret(&mut self) {
+        let secret_ids: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.action == RuleAction::Secret)
+            .map(|(id, _)| id)
+            .collect();
+        if secret_ids.is_empty() {
+            self.secret_automaton = None;
+            self.secret_entry = Vec::new();
+            return;
+        }
+        self.secret_automaton = Some(
+            aho_corasick::AhoCorasickBuilder::new()
+                .match_kind(aho_corasick::MatchKind::Standard)
+                .build(secret_ids.iter().map(|id| self.entries[*id].value.as_ref()))
+                .expect("secret automaton build"),
+        );
+        self.secret_entry = secret_ids;
+    }
+
+    /// Первое secret-совпадение в `text` — для прохода «вся строка
+    /// [SECRET_REMOVED]». Возвращает категорию совпавшего значения.
+    fn find_secret(&self, text: &str) -> Option<&str> {
+        let automaton = self.secret_automaton.as_ref()?;
+        let mat = automaton.find(text)?;
+        Some(&self.entries[self.secret_entry[mat.pattern().as_usize()]].category)
+    }
+
+    /// Непересекающиеся совпадения словаря (leftmost-longest):
+    /// `(start, end, entry_id)` в порядке следования в `text`.
+    fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+        self.automaton.find_iter(text).map(|mat| {
+            (
+                mat.start(),
+                mat.end(),
+                self.automaton_entry[mat.pattern().as_usize()],
+            )
+        })
+    }
+
+    /// Keep-автомат по `ids` (Standard — overlapping-итерация);
+    /// `None` — keep-записей нет, сканировать нечего.
+    fn build_keep_automaton(
+        entries: &[DictionaryEntry],
+        ids: &[usize],
+    ) -> Option<std::sync::Arc<aho_corasick::AhoCorasick>> {
+        if ids.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(Self::build_automaton(
+            entries,
+            ids,
+            aho_corasick::MatchKind::Standard,
+        )))
+    }
+
+    /// Индексы keep-записей, чьи значения встречаются в `text`
+    /// (для фиксации причины `dictionary:<cat>`; текст не меняется).
+    /// Standard-автомат с overlapping-итерацией — семантика
+    /// legacy-перебора: видны и перекрытые keep-значения разных
+    /// категорий. Повторные совпадения одного значения выдаются на
+    /// каждую позицию — дедупликация на вызывающей стороне.
+    fn keep_matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = usize> + 'a {
+        self.keep_automaton
+            .iter()
+            .flat_map(move |automaton| automaton.find_overlapping_iter(text))
+            .map(|mat| self.keep_entry[mat.pattern().as_usize()])
+    }
+
+    fn entry(&self, entry_id: usize) -> &DictionaryEntry {
+        &self.entries[entry_id]
+    }
+}
+
+//++agent TASK-225
+
+//++agent TASK-225 [26.09.2026]
+/// §6.1: структурная причина маскирования — строка `code` совпадает с
+/// legacy `mask_reasons_json`; `kind` = rule|dictionary|builtin;
+/// `rule_id` — ссылка на policy_rules.id (встроенные — None).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReasonEntry {
+    pub code: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: путь источника — для `source_path`-правил это `pattern`
+    /// (точный путь); у dictionary-причин остаётся `category`.
+    //++agent TASK-225
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+//++agent TASK-225
 
 #[derive(Debug)]
 pub struct MaskingOutput {
     pub value: Value,
     pub candidates: Vec<MappingCandidate>,
     pub reasons: HashSet<String>,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: дедуплицированные причины и привязка ячеек —
+    /// (json_pointer, reason_idx). Только для записей истории нового
+    /// формата; значений ячеек тут нет.
+    //++agent TASK-225
+    pub reason_entries: Vec<ReasonEntry>,
+    pub cell_reasons: Vec<(String, u32)>,
 }
 
 pub struct MaskEngine {
@@ -90,6 +455,14 @@ struct WalkContext<'a> {
     mappings: &'a MappingStore,
     candidates: Vec<MappingCandidate>,
     reasons: HashSet<String>,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: текущий JSON-pointer обхода и таблица причин
+    /// (reason_index — дедупликация по сериализованному entry).
+    //++agent TASK-225
+    pointer: String,
+    reason_entries: Vec<ReasonEntry>,
+    reason_index: HashMap<String, u32>,
+    cell_reasons: Vec<(String, u32)>,
     strings_seen: usize,
     cells_seen: usize,
     evidence: HashMap<String, FieldEvidence>,
@@ -198,6 +571,12 @@ impl MaskEngine {
             mappings,
             candidates: Vec::new(),
             reasons: HashSet::new(),
+            //++agent TASK-225 [26.09.2026]
+            pointer: String::new(),
+            reason_entries: Vec::new(),
+            reason_index: HashMap::new(),
+            cell_reasons: Vec::new(),
+            //++agent TASK-225
             strings_seen: 0,
             cells_seen: 0,
             evidence,
@@ -211,6 +590,10 @@ impl MaskEngine {
             value,
             candidates: context.candidates,
             reasons: context.reasons,
+            //++agent TASK-225 [26.09.2026]
+            reason_entries: context.reason_entries,
+            cell_reasons: context.cell_reasons,
+            //++agent TASK-225
         })
     }
 
@@ -417,7 +800,18 @@ impl MaskEngine {
                 .get(&name.to_lowercase())
                 .is_some_and(|item| item.unverified)
             {
-                context.reasons.insert(format!("unverified:{name}"));
+                //++agent TASK-225 [26.09.2026]
+                context.record(ReasonEntry {
+                    code: format!("unverified:{name}"),
+                    kind: "builtin".to_owned(),
+                    rule_id: None,
+                    selector: None,
+                    pattern: None,
+                    source_path: None,
+                    category: Some(name.to_owned()),
+                    action: Some("mask".to_owned()),
+                });
+                //++agent TASK-225
                 return plan(
                     context,
                     unverified_category(value),
@@ -431,18 +825,31 @@ impl MaskEngine {
             Value::Object(object) => {
                 let mut output = Map::with_capacity(object.len());
                 for (key, value) in object {
-                    output.insert(
-                        key.clone(),
-                        self.walk(value, Some(key), depth + 1, context)?,
-                    );
+                    //++agent TASK-225 [26.09.2026]
+                    // §6.1: JSON-pointer текущего узла — привязка причин
+                    // к ячейке отчёта. RFC 6901 escape ~0/~1.
+                    //++agent TASK-225
+                    let base = context.pointer.len();
+                    context.pointer.push('/');
+                    context.pointer.push_str(&pointer_escape(key));
+                    let walked = self.walk(value, Some(key), depth + 1, context);
+                    context.pointer.truncate(base);
+                    output.insert(key.clone(), walked?);
                 }
                 Ok(Value::Object(output))
             }
-            Value::Array(array) => array
-                .iter()
-                .map(|value| self.walk(value, field, depth + 1, context))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Value::Array),
+            Value::Array(array) => {
+                let mut output = Vec::with_capacity(array.len());
+                for (index, value) in array.iter().enumerate() {
+                    let base = context.pointer.len();
+                    context.pointer.push('/');
+                    context.pointer.push_str(&index.to_string());
+                    let walked = self.walk(value, field, depth + 1, context);
+                    context.pointer.truncate(base);
+                    output.push(walked?);
+                }
+                Ok(Value::Array(output))
+            }
             Value::String(text) => {
                 context.strings_seen += 1;
                 if context.strings_seen > self.max_strings || text.len() > self.max_text_bytes {
@@ -471,11 +878,11 @@ impl MaskEngine {
             .cloned()
             .unwrap_or_default();
         if self.secret_name.is_match(field) {
-            context.reasons.insert("secret:name".to_owned());
+            context.record(builtin_entry("secret:name", "secret", None));
             return Ok(SECRET_REMOVED.to_owned());
         }
         if self.secret_value.is_match(text) {
-            context.reasons.insert("secret:value".to_owned());
+            context.record(builtin_entry("secret:value", "secret", None));
             return Ok(self
                 .secret_value
                 .replace_all(text, SECRET_REMOVED)
@@ -492,25 +899,48 @@ impl MaskEngine {
             if let Some(rule) = strongest_matching_rule(context.policy, selector, field, &evidence)?
             {
                 if rule.action == RuleAction::Secret {
-                    context.reasons.insert(rule_reason(selector, rule));
+                    context.record(rule_entry(selector, rule));
                     return Ok(SECRET_REMOVED.to_owned());
                 }
             }
         }
-        for (known, category) in &context.policy.dictionary {
+        //++agent TASK-225 [25.09.2026]
+        // §5a.2: секрет-проход словаря. С автоматом — O(len(text)) и
+        // перекрытые совпадения видны (Standard-автомат); снимок без
+        // индекса — прежний полный перебор, семантика та же.
+        if let Some(index) = context.policy.dictionary_index.clone() {
             if Instant::now() > context.deadline {
                 return Err(());
             }
-            if !known.is_empty()
-                && text.contains(known)
-                && strongest_dictionary_action(context.policy, category) == RuleAction::Secret
-            {
-                context
-                    .reasons
-                    .insert(format!("dictionary:{category}:secret"));
+            if let Some(category) = index.find_secret(text) {
+                context.record(dictionary_entry(
+                    context.policy,
+                    format!("dictionary:{category}:secret"),
+                    category,
+                    RuleAction::Secret,
+                ));
                 return Ok(SECRET_REMOVED.to_owned());
             }
+        } else {
+            for (known, category) in &context.policy.dictionary {
+                if Instant::now() > context.deadline {
+                    return Err(());
+                }
+                if !known.is_empty()
+                    && text.contains(known)
+                    && strongest_dictionary_action(context.policy, category) == RuleAction::Secret
+                {
+                    context.record(dictionary_entry(
+                        context.policy,
+                        format!("dictionary:{category}:secret"),
+                        category,
+                        RuleAction::Secret,
+                    ));
+                    return Ok(SECRET_REMOVED.to_owned());
+                }
+            }
         }
+        //++agent TASK-225
         for rule in context.policy.rules.iter().filter(|rule| {
             rule.selector == RuleSelector::Regex && rule.action == RuleAction::Secret
         }) {
@@ -519,27 +949,25 @@ impl MaskEngine {
             }
             let regex = Regex::new(&rule.pattern).map_err(|_| ())?;
             if regex.is_match(text) {
-                context
-                    .reasons
-                    .insert(rule_reason(RuleSelector::Regex, rule));
+                context.record(rule_entry(RuleSelector::Regex, rule));
                 return Ok(SECRET_REMOVED.to_owned());
             }
         }
 
         if (self.fio_name.is_match(field) || self.is_fio_source(&evidence)) && !text.is_empty() {
-            context.reasons.insert("mandatory:fio:name".to_owned());
+            context.record(builtin_entry("mandatory:fio:name", "mask", Some("FIO")));
             return plan(context, "FIO", text);
         }
         let mut rendered = text.to_owned();
         for literal in context.fio_literals.clone() {
             if rendered.contains(&literal) {
-                context.reasons.insert("mandatory:fio:source".to_owned());
+                context.record(builtin_entry("mandatory:fio:source", "mask", Some("FIO")));
                 let replacement = plan(context, "FIO", &literal)?;
                 rendered = rendered.replace(&literal, &replacement);
             }
         }
         if self.fio_value.is_match(&rendered) {
-            context.reasons.insert("mandatory:fio:text".to_owned());
+            context.record(builtin_entry("mandatory:fio:text", "mask", Some("FIO")));
             rendered = replace_matches(&self.fio_value, &rendered, |matched| {
                 plan(context, "FIO", matched)
             })?;
@@ -552,7 +980,7 @@ impl MaskEngine {
         ] {
             if let Some(rule) = strongest_matching_rule(context.policy, selector, field, &evidence)?
             {
-                context.reasons.insert(rule_reason(selector, rule));
+                context.record(rule_entry(selector, rule));
                 match rule.action {
                     RuleAction::Secret => return Ok(SECRET_REMOVED.to_owned()),
                     RuleAction::Mask => return plan(context, &rule.category, &rendered),
@@ -561,21 +989,38 @@ impl MaskEngine {
             }
         }
 
-        for (known, category) in &context.policy.dictionary {
-            if Instant::now() > context.deadline {
-                return Err(());
-            }
-            if !known.is_empty() && rendered.contains(known) {
-                context.reasons.insert(format!("dictionary:{category}"));
-                let action = strongest_dictionary_action(context.policy, category);
-                let replacement = match action {
-                    RuleAction::Secret => SECRET_REMOVED.to_owned(),
-                    RuleAction::Mask => plan(context, category, known)?,
-                    RuleAction::Keep => continue,
-                };
-                rendered = rendered.replace(known, &replacement);
+        //++agent TASK-225 [25.09.2026]
+        // §5a.2: основной проход словаря — автоматные непересекающиеся
+        // (leftmost-longest) совпадения вместо O(|словарь|) перебора.
+        // Замена каждого вхождения детерминированным токеном ≡
+        // `replace` всех вхождений; при пересекающихся значениях выбор
+        // становится детерминированным (самое длинное слева) — зафиксировано
+        // в spec как допустимое отличие от порядка HashMap.
+        if let Some(index) = context.policy.dictionary_index.clone() {
+            rendered = replace_dictionary_matches(&index, &rendered, context)?;
+        } else {
+            for (known, category) in &context.policy.dictionary {
+                if Instant::now() > context.deadline {
+                    return Err(());
+                }
+                if !known.is_empty() && rendered.contains(known) {
+                    let action = strongest_dictionary_action(context.policy, category);
+                    context.record(dictionary_entry(
+                        context.policy,
+                        format!("dictionary:{category}"),
+                        category,
+                        action,
+                    ));
+                    let replacement = match action {
+                        RuleAction::Secret => SECRET_REMOVED.to_owned(),
+                        RuleAction::Mask => plan(context, category, known)?,
+                        RuleAction::Keep => continue,
+                    };
+                    rendered = rendered.replace(known, &replacement);
+                }
             }
         }
+        //++agent TASK-225
         for rule in context.policy.rules.iter().filter(|rule| {
             rule.selector == RuleSelector::Regex && rule.action != RuleAction::Secret
         }) {
@@ -595,7 +1040,23 @@ impl MaskEngine {
                     }
                     RuleAction::Keep => {}
                 }
-                context.reasons.insert(format!("regex:{}", rule.category));
+                context.record(ReasonEntry {
+                    code: format!("regex:{}", rule.category),
+                    kind: "rule".to_owned(),
+                    rule_id: rule.rule_id.map(|id| id.to_string()),
+                    selector: Some("regex".to_owned()),
+                    pattern: Some(rule.pattern.clone()),
+                    source_path: None,
+                    category: Some(rule.category.clone()),
+                    action: Some(
+                        match rule.action {
+                            RuleAction::Secret => "secret",
+                            RuleAction::Mask => "mask",
+                            RuleAction::Keep => "keep",
+                        }
+                        .to_owned(),
+                    ),
+                });
             }
         }
         Ok(rendered)
@@ -708,6 +1169,179 @@ fn strongest_matching_rule<'a>(
         .max_by_key(|rule| (rule.action, rule.priority)))
 }
 
+//++agent TASK-225 [26.09.2026]
+/// §6.1: запись причины текущей ячейки — дедуплицированная таблица
+/// `reason_entries` + привязка (pointer, idx) для mask_detail_json.
+/// Лимит таблицы причин — §6.2 (256): сверху причина деградирует до
+/// legacy-строки `reasons` без детальной записи.
+impl WalkContext<'_> {
+    fn record(&mut self, entry: ReasonEntry) {
+        self.reasons.insert(entry.code.clone());
+        if self.reason_entries.len() >= 256 {
+            return;
+        }
+        let key = serde_json::to_string(&entry).unwrap_or_else(|_| entry.code.clone());
+        let idx = match self.reason_index.get(&key) {
+            Some(idx) => *idx,
+            None => {
+                let idx = self.reason_entries.len() as u32;
+                self.reason_index.insert(key, idx);
+                self.reason_entries.push(entry);
+                idx
+            }
+        };
+        let pair = (self.pointer.clone(), idx);
+        if self.cell_reasons.last() != Some(&pair) {
+            self.cell_reasons.push(pair);
+        }
+    }
+}
+
+/// Причина движка-правила для §6 (kind=rule).
+fn rule_entry(selector: RuleSelector, rule: &PolicyRule) -> ReasonEntry {
+    ReasonEntry {
+        code: rule_reason(selector, rule),
+        kind: "rule".to_owned(),
+        rule_id: rule.rule_id.map(|id| id.to_string()),
+        selector: Some(selector_name_of(selector).to_owned()),
+        pattern: Some(rule.pattern.clone()),
+        source_path: (selector == RuleSelector::SourcePath).then(|| rule.pattern.clone()),
+        category: Some(rule.category.clone()),
+        action: Some(
+            match rule.action {
+                RuleAction::Secret => "secret",
+                RuleAction::Mask => "mask",
+                RuleAction::Keep => "keep",
+            }
+            .to_owned(),
+        ),
+    }
+}
+
+fn builtin_entry(code: &str, action: &str, category: Option<&str>) -> ReasonEntry {
+    ReasonEntry {
+        code: code.to_owned(),
+        kind: "builtin".to_owned(),
+        rule_id: None,
+        selector: None,
+        pattern: None,
+        source_path: None,
+        category: category.map(str::to_owned),
+        action: Some(action.to_owned()),
+    }
+}
+
+fn dictionary_entry(
+    policy: &PolicySnapshot,
+    code: String,
+    category: &str,
+    action: RuleAction,
+) -> ReasonEntry {
+    ReasonEntry {
+        code,
+        kind: "dictionary".to_owned(),
+        rule_id: None,
+        selector: None,
+        pattern: None,
+        //++agent TASK-225 [26.09.2026] D8: путь источника категории
+        // (§6.3) — при его отсутствии в снимке поле опускается, как
+        // прежде остаётся `category`.
+        source_path: policy.dictionary_sources.get(category).cloned(),
+        //++agent TASK-225
+        category: Some(category.to_owned()),
+        action: Some(
+            match action {
+                RuleAction::Secret => "secret",
+                RuleAction::Mask => "mask",
+                RuleAction::Keep => "keep",
+            }
+            .to_owned(),
+        ),
+    }
+}
+
+fn selector_name_of(selector: RuleSelector) -> &'static str {
+    match selector {
+        RuleSelector::SourcePath => "source_path",
+        RuleSelector::Name => "name",
+        RuleSelector::Type => "type",
+        RuleSelector::Dictionary => "dictionary",
+        RuleSelector::Regex => "regex",
+    }
+}
+
+/// RFC 6901 escape для JSON-pointer сегмента.
+fn pointer_escape(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+//++agent TASK-225
+
+//++agent TASK-225 [25.09.2026]
+/// §5a.2: замена словарных совпадений через автомат. Каждое
+/// непересекающееся совпадение: `secret` → врезка `[SECRET_REMOVED]`
+/// (строка целиком уже вырезана секрет-проходом по исходному тексту —
+/// ветка нужна для значений, ставших secret только после замен FIO),
+/// `mask` → детерминированный токен `plan`, `keep` → текст без изменений.
+/// Deadline проверяется не реже раза в 4096 совпадений.
+fn replace_dictionary_matches(
+    index: &DictionaryIndex,
+    rendered: &str,
+    context: &mut WalkContext<'_>,
+) -> Result<String, ()> {
+    let mut output = String::with_capacity(rendered.len());
+    let mut cursor = 0usize;
+    let mut matched = 0u32;
+    for (start, end, entry_id) in index.matches(rendered) {
+        matched += 1;
+        if matched.is_multiple_of(4096) && Instant::now() > context.deadline {
+            return Err(());
+        }
+        let entry = index.entry(entry_id);
+        context.record(dictionary_entry(
+            context.policy,
+            format!("dictionary:{}", entry.category),
+            &entry.category,
+            entry.action,
+        ));
+        output.push_str(&rendered[cursor..start]);
+        match entry.action {
+            RuleAction::Secret => output.push_str(SECRET_REMOVED),
+            RuleAction::Mask => output.push_str(&plan(context, &entry.category, &entry.value)?),
+            // Недостижимо: keep-записей в основном автомате нет (B-3);
+            // ветка оставлена на случай рассинхронизации действий.
+            RuleAction::Keep => output.push_str(&rendered[start..end]),
+        }
+        cursor = end;
+    }
+    //++agent TASK-225 [26.09.2026]
+    // B-3: keep-значения в основной автомат не входят (не глушат mask
+    // внутри себя — семантика legacy-скана), но причину
+    // `dictionary:<cat>` фиксируем, как это делал legacy-перебор.
+    // N-2: перебор заменён keep-автоматом — дедлайн проверяется на шаге
+    // сканирования (сырые совпадения), а причину записываем один раз
+    // на значение, как legacy.
+    let mut keep_seen = HashSet::new();
+    for (step, entry_id) in index.keep_matches(rendered).enumerate() {
+        if (step as u32).is_multiple_of(4096) && Instant::now() > context.deadline {
+            return Err(());
+        }
+        if !keep_seen.insert(entry_id) {
+            continue;
+        }
+        let entry = index.entry(entry_id);
+        context.record(dictionary_entry(
+            context.policy,
+            format!("dictionary:{}", entry.category),
+            &entry.category,
+            entry.action,
+        ));
+    }
+    //++agent TASK-225
+    output.push_str(&rendered[cursor..]);
+    Ok(output)
+}
+//++agent TASK-225
+
 fn strongest_dictionary_action(policy: &PolicySnapshot, category: &str) -> RuleAction {
     policy
         .rules
@@ -740,7 +1374,10 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     {
         return value.to_lowercase().contains(&part.to_lowercase());
     }
-    value.eq_ignore_ascii_case(pattern)
+    //++agent TASK-225 [26.09.2026]
+    // B-2: точное совпадение — без учёта регистра по Unicode
+    // (кириллица тоже; решение spec §12 — только усиливает).
+    value.to_lowercase() == pattern.to_lowercase()
 }
 
 fn plan(context: &mut WalkContext<'_>, category: &str, original: &str) -> Result<String, ()> {

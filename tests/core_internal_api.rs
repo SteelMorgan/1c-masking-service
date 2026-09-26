@@ -634,6 +634,7 @@ async fn all_mode_cold_start_expands_wildcard_selectors_after_metadata_pull() {
                 action: RuleAction::Mask,
                 category: "ORG".to_owned(),
                 priority: 0,
+                rule_id: None,
             }],
         )
         .unwrap();

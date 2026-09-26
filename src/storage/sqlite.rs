@@ -38,12 +38,66 @@ const TOOL_AUTO_CLASS_MIGRATION: &str =
 // Миграция 0012 (строгий режим lineage): колонка strict_mode в databases,
 // тот же поколоночный контракт применения, что у 0011.
 const STRICT_MODE_MIGRATION: &str = include_str!("../../migrations/0012_strict_mode.sql");
+// Миграция 0010 (версии настройки, spec §2.2): ALTER поколоночно по всем
+// таблицам (пересечение с 0011 и порядок merge не гарантированы),
+// перенос данных §2.3, затем уникальные индексы части POST-DATA.
+const SETUP_VERSIONS_MIGRATION: &str = include_str!("../../migrations/0010_setup_versions.sql");
+// Миграция 0013 (§8 backoff + §5a.3 source stats): поколоночное применение,
+// те же ALTER содержит 0010 основной фазы — пропуск существующих колонок.
+const REFRESH_BACKOFF_MIGRATION: &str = include_str!("../../migrations/0013_refresh_backoff.sql");
+// Миграция 0014 (ревью-2 N-1): флаг расшифрованных mask-токенов
+// на записи контекста вызова.
+const MASK_TOKEN_FLAG_MIGRATION: &str = include_str!("../../migrations/0014_mask_token_flag.sql");
 //++agent TASK-225
 
 pub enum HistoryWrite {
     Inserted(Uuid),
     Existing(StoredHistory),
     Conflict,
+}
+
+//++agent TASK-225 [26.09.2026]
+/// §6.1: детальная часть записи истории — причины по ячейкам, lineage
+/// (без значений) и id версии политики. `None` у legacy-вызовов —
+/// колонки остаются NULL, B9 отвечает `detailed:false`.
+//++agent TASK-225
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HistoryDetail<'a> {
+    pub mask_detail_json: Option<&'a str>,
+    pub field_sources_json: Option<&'a str>,
+    pub policy_id: Option<Uuid>,
+}
+
+//++agent TASK-225 [26.09.2026]
+/// B9/§6.3: запись истории для отчёта причин (без значений ячеек).
+//++agent TASK-225
+//++agent TASK-225 [26.09.2026]
+/// §5: запись истории для сухого прогона (B6) — маскированный ответ,
+/// lineage и привязка причин. Значения не покидают сервис.
+//++agent TASK-225
+#[derive(Debug)]
+pub struct DryRunRecord {
+    pub id: Uuid,
+    pub created_at: String,
+    pub tool_name: String,
+    pub chat_id: String,
+    pub call_id: Uuid,
+    pub public_result: Value,
+    pub mapping_batch_id: Option<Uuid>,
+    pub field_sources: Option<String>,
+    pub mask_detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct HistoryReasonsRow {
+    pub database_id: Uuid,
+    pub expires_at: String,
+    pub policy_version: i64,
+    pub policy_id: Option<Uuid>,
+    pub mask_detail_json: Option<String>,
+    pub mask_reasons_json: Option<String>,
+    pub report: Value,
+    pub tool_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +184,21 @@ impl SqliteStorage {
         }
         //++agent TASK-224
         //++agent TASK-225 [25.09.2026]
+        // Миграция 0010 (версии настройки): поколоночные ALTER по всем
+        // затронутым таблицам, затем перенос данных §2.3, затем уникальные
+        // индексы — всё внутри этой же IMMEDIATE-транзакции initialize.
+        let has_setup_versions: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_setup_versions {
+            apply_setup_versions_migration(&transaction, SETUP_VERSIONS_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
         // Миграция 0011 применяется поколоночно: те же колонки объявлены в
         // миграции 0010 основной фазы TASK-225, а порядок прихода на merge
         // не гарантирован — увидев уже созданную колонку, пропускаем её,
@@ -163,6 +232,37 @@ impl SqliteStorage {
             apply_add_column_migration(&transaction, "databases", STRICT_MODE_MIGRATION)?;
             transaction.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        // Миграция 0013 (§8 backoff refresh + статистика источников §5a.3):
+        // мульти-табличный вариант поколоночного применения — целевая таблица
+        // разбирается из каждого ALTER-оператора, существующие колонки
+        // пропускаются, несовместимый тип — ошибка старта.
+        let has_refresh_backoff: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=13)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_refresh_backoff {
+            apply_add_column_migration_set(&transaction, REFRESH_BACKOFF_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        //++agent TASK-225 [26.09.2026] ревью-2 N-1
+        // Миграция 0014 (флаг расшифрованных mask-токенов на контексте
+        // вызова): та же поколоночная стратегия.
+        let has_mask_token_flag: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_mask_token_flag {
+            apply_add_column_migration(&transaction, "call_contexts", MASK_TOKEN_FLAG_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?1)",
                 [Utc::now().to_rfc3339()],
             )?;
         }
@@ -315,6 +415,12 @@ impl SqliteStorage {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let policy_id = Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
+            //++agent TASK-225 [26.09.2026]
+            // §2.2: частичный уникальный индекс одной активной версии —
+            // старая снимается ДО вставки новой, иначе INSERT упирается в
+            // индекс (INSERT до retire не проходит при непустом active).
+            //++agent TASK-225
+            transaction.execute("UPDATE policies SET status='retired' WHERE id=(SELECT active_policy_id FROM databases WHERE id=?1)", [database_id.to_string()])?;
             transaction.execute(
                 "INSERT INTO policies(id,database_id,version,status,created_at) VALUES (?1,?2,?3,'active',?4)",
                 params![policy_id, database_id.to_string(), version, now],
@@ -327,7 +433,6 @@ impl SqliteStorage {
                         action_name(rule.action), rule.category, rule.priority, now],
                 )?;
             }
-            transaction.execute("UPDATE policies SET status='retired' WHERE id=(SELECT active_policy_id FROM databases WHERE id=?1)", [database_id.to_string()])?;
             transaction.execute(
                 "UPDATE databases SET active_policy_id=?2,updated_at=?3 WHERE id=?1",
                 params![database_id.to_string(), policy_id, now],
@@ -400,7 +505,7 @@ impl SqliteStorage {
         };
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT selector_kind, selector_value, action, category, priority
+                "SELECT selector_kind, selector_value, action, category, priority, id
                  FROM policy_rules WHERE policy_id=?1 AND enabled=1 ORDER BY priority, id",
             )?;
             let rules = statement
@@ -427,7 +532,7 @@ impl SqliteStorage {
                 return Ok(None);
             };
             let mut statement = connection.prepare(
-                "SELECT selector_kind,selector_value,action,category,priority
+                "SELECT selector_kind,selector_value,action,category,priority,id
                  FROM policy_rules WHERE policy_id=?1 AND enabled=1 ORDER BY priority,id",
             )?;
             let rules = statement
@@ -463,6 +568,9 @@ impl SqliteStorage {
         history_ttl_seconds: u64,
         mapping_batch_id: Option<Uuid>,
         correlation_id: Uuid,
+        //++agent TASK-225 [26.09.2026] §6.1: детальная запись.
+        detail: Option<&HistoryDetail>,
+        //++agent TASK-225
     ) -> rusqlite::Result<HistoryWrite> {
         self.with_connection(|connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -503,14 +611,19 @@ impl SqliteStorage {
             let created_at = Utc::now();
             let expires_at = created_at + Duration::seconds(history_ttl_seconds.min(i64::MAX as u64) as i64);
             transaction.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id,mask_detail_json,field_sources_json,policy_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![id.to_string(), database_id.to_string(), chat_id, call_id.to_string(), tool_name, outcome,
                     policy_version,
                     serde_json::to_string(mask_reasons).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     serde_json::to_string(public_result).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     serde_json::to_string(report).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    created_at.to_rfc3339(), expires_at.to_rfc3339(), mapping_batch_id.map(|id| id.to_string())],
+                    created_at.to_rfc3339(), expires_at.to_rfc3339(), mapping_batch_id.map(|id| id.to_string()),
+                    //++agent TASK-225 [26.09.2026] §6.1
+                    detail.and_then(|d| d.mask_detail_json),
+                    detail.and_then(|d| d.field_sources_json),
+                    detail.and_then(|d| d.policy_id).map(|id| id.to_string())],
+                //++agent TASK-225
             )?;
             transaction.execute(
                 "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
@@ -767,6 +880,40 @@ impl SqliteStorage {
         })
     }
 
+    //++agent TASK-225 [26.09.2026] ревью-2 N-1
+    /// Флаг «preflight расшифровал ≥1 mask-токен» на контексте вызова.
+    /// Возвращает false, если UPDATE не затронул строку (контекст не
+    /// записан/просрочен): вызывающий при резолве токенов обязан
+    /// отказаться fail-closed — без записанного флага finalize не узнает
+    /// о необходимости гасить свободный текст ошибки.
+    pub fn mark_call_context_mask_tokens(&self, call_id: Uuid) -> rusqlite::Result<bool> {
+        self.with_connection(|connection| {
+            Ok(connection.execute(
+                "UPDATE call_contexts SET had_mask_tokens=1 WHERE call_id=?1",
+                params![call_id.to_string()],
+            )? > 0)
+        })
+    }
+
+    /// Чтение флага расшифрованных mask-токенов. В отличие от title,
+    /// флаг читается без TTL-фильтра: истёкший, но ещё не вытертый
+    /// контекст всё равно говорит правду — flag=1 значит «токены
+    /// резолвились, текст гасить», а его отсутствие при истёкшем TTL
+    /// заставило бы принимать «нет записи» за «нет токенов».
+    pub fn call_context_mask_tokens(&self, call_id: Uuid) -> rusqlite::Result<Option<bool>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT had_mask_tokens FROM call_contexts WHERE call_id=?1",
+                    params![call_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|flag| flag.map(|value| value != 0))
+        })
+    }
+    //++agent TASK-225
+
     /// Startup-очистка: mapping store живёт в RAM, поэтому после рестарта ни
     /// одна запись истории не раскрывается — таблицы history и call_contexts
     /// очищаются полностью. Ошибка fail-soft (maintenance tick доберёт).
@@ -804,6 +951,98 @@ impl SqliteStorage {
             )
         })
     }
+
+    //++agent TASK-225 [26.09.2026]
+    /// §5.1: ≤limit последних tool_result-записей с lineage — выборка
+    /// сухого прогона B6.
+    pub fn dry_run_records(
+        &self,
+        database_id: Uuid,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<DryRunRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,created_at,tool_name,chat_id,call_id,public_result_json,
+                        mapping_batch_id,field_sources_json,mask_detail_json
+                 FROM history
+                 WHERE database_id=?1 AND outcome='tool_result'
+                   AND field_sources_json IS NOT NULL
+                 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let rows =
+                statement.query_map(params![database_id.to_string(), limit as i64], |row| {
+                    let public: String = row.get(5)?;
+                    Ok(DryRunRecord {
+                        id: Uuid::parse_str(&row.get::<_, String>(0)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        created_at: row.get(1)?,
+                        tool_name: row.get(2)?,
+                        chat_id: row.get(3)?,
+                        call_id: Uuid::parse_str(&row.get::<_, String>(4)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        public_result: serde_json::from_str(&public)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        mapping_batch_id: row
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|v| Uuid::parse_str(&v).ok()),
+                        field_sources: row.get(7)?,
+                        mask_detail: row.get(8)?,
+                    })
+                })?;
+            rows.collect()
+        })
+    }
+
+    //++agent TASK-225 [26.09.2026]
+    /// §5.1: есть ли вообще записи `tool_result` — различает причины
+    /// пустого сухого прогона (`no_records` / `no_lineage`).
+    pub fn has_tool_result_records(&self, database_id: Uuid) -> rusqlite::Result<bool> {
+        self.with_connection(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM history
+                 WHERE database_id=?1 AND outcome='tool_result')",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )
+        })
+    }
+    //++agent TASK-225
+
+    /// B9/§6.3: запись истории для отчёта причин — без фильтра срока
+    /// (истёкшая отличается кодом HISTORY_EXPIRED), без chat-scope
+    /// (role-based доступ на уровне API — как reveal).
+    pub fn history_reasons_record(
+        &self,
+        history_id: Uuid,
+    ) -> rusqlite::Result<Option<HistoryReasonsRow>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT database_id,expires_at,policy_version,policy_id,mask_detail_json,mask_reasons_json,report_json,tool_name
+                     FROM history WHERE id=?1",
+                    [history_id.to_string()],
+                    |row| {
+                        let report: String = row.get(6)?;
+                        Ok(HistoryReasonsRow {
+                            database_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            expires_at: row.get(1)?,
+                            policy_version: row.get(2)?,
+                            policy_id: row
+                                .get::<_, Option<String>>(3)?
+                                .and_then(|v| Uuid::parse_str(&v).ok()),
+                            mask_detail_json: row.get(4)?,
+                            mask_reasons_json: row.get(5)?,
+                            report: serde_json::from_str(&report)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            tool_name: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+    //++agent TASK-225
 
     pub fn history_for_reveal(
         &self,
@@ -861,6 +1100,8 @@ fn read_policy_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRule> {
         },
         category: row.get(3)?,
         priority: row.get(4)?,
+        //++agent TASK-225 [26.09.2026] §6.1: id правила — ссылка причины.
+        rule_id: Uuid::parse_str(&row.get::<_, String>(5)?).ok(),
     })
 }
 
@@ -1342,6 +1583,94 @@ fn apply_add_column_migration(
             None => transaction.execute_batch(statement)?,
         }
     }
+    Ok(())
+}
+
+/// Мульти-табличный вариант `apply_add_column_migration` (файл 0013):
+/// целевая таблица разбирается из оператора `ALTER TABLE <table>
+/// ADD COLUMN ...`, операторы группируются по таблице и применяются
+/// поколоночно с теми же гарантиями (пропуск существующих, конфликт
+/// типов — ошибка). Форма операторов зафиксирована файлом миграции.
+fn apply_add_column_migration_set(
+    transaction: &rusqlite::Transaction<'_>,
+    ddl: &str,
+) -> rusqlite::Result<()> {
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for statement in ddl.split(';') {
+        let statement = statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        let mut words = statement.split_whitespace();
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("alter"))
+            || !words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("table"))
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let table = words.next().ok_or(rusqlite::Error::InvalidQuery)?;
+        grouped
+            .entry(table.to_string())
+            .or_default()
+            .push(statement.to_string());
+    }
+    for (table, statements) in grouped {
+        apply_add_column_migration(transaction, &table, &statements.join(";\n"))?;
+    }
+    Ok(())
+}
+
+/// Применение миграции 0010 (версии настройки, spec §2.2–§2.3):
+/// часть до метки `-- == POST-DATA ==` — поколоночные ALTER (любых
+/// таблиц — переиспользуется `apply_add_column_migration_set`) и
+/// CREATE TABLE/INDEX как есть; затем перенос данных §2.3
+/// (`migrate_setup_data`); затем операторы после метки — частичные
+/// уникальные индексы, которым нужна уже нормализованная таблица
+/// `policies`. Всё — в открытой IMMEDIATE-транзакции initialize.
+fn apply_setup_versions_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    ddl: &str,
+) -> rusqlite::Result<()> {
+    let mut parts = ddl.splitn(2, "-- == POST-DATA ==");
+    let schema_ddl = parts.next().unwrap_or_default();
+    let post_ddl = parts.next().unwrap_or_default();
+    let mut alters = String::new();
+    for statement in schema_ddl.split(';') {
+        let statement = statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if statement
+            .split_whitespace()
+            .take(2)
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>()
+            .as_slice()
+            == ["ALTER", "TABLE"]
+        {
+            alters.push_str(statement);
+            alters.push_str(";\n");
+        } else {
+            transaction.execute_batch(statement)?;
+        }
+    }
+    apply_add_column_migration_set(transaction, &alters)?;
+    super::setup::migrate_setup_data(transaction)?;
+    transaction.execute_batch(post_ddl)?;
     Ok(())
 }
 //++agent TASK-225

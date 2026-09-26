@@ -204,12 +204,14 @@ async fn roles_are_checked_server_side_for_reveal_and_admin_routes() {
     let viewer_session = sessions.issue(viewer, Utc::now()).unwrap();
 
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
     let app = human::router(Arc::new(HumanState {
         auth,
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
 
     let reveal = Request::builder()
@@ -252,12 +254,14 @@ async fn admin_user_create_and_access_update_are_audited_without_secrets() {
         .unwrap();
     let admin_session = sessions.issue(admin.clone(), Utc::now()).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking));
     let app = human::router(Arc::new(HumanState {
         auth,
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
 
     let create = Request::builder()
@@ -359,12 +363,14 @@ async fn admin_and_viewer_can_change_own_password_and_rotate_all_sessions() {
     auth.activate("test", &activation, VIEWER_PASSWORD).unwrap();
 
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking));
     let app = human::router(Arc::new(HumanState {
         auth: auth.clone(),
         sessions: sessions.clone(),
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
 
     for (login, old_password, new_password) in [
@@ -452,12 +458,14 @@ async fn password_change_requires_origin_csrf_current_password_and_strong_distin
         .unwrap();
     let session = sessions.issue(principal, Utc::now()).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
     let app = human::router(Arc::new(HumanState {
         auth: auth.clone(),
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
 
     for (origin, csrf, current_password, new_password, expected) in [
@@ -542,6 +550,7 @@ async fn admin_configuration_is_typed_validated_and_audited() {
         "execute_query",
         ToolClassificationPatch {
             class: "data-mask".into(),
+            confirm_bypass: false,
         },
         Uuid::new_v4(),
     )
@@ -552,11 +561,35 @@ async fn admin_configuration_is_typed_validated_and_audited() {
             database_id,
             "unsafe_tool",
             ToolClassificationPatch {
-                class: "allow-all".into()
+                class: "allow-all".into(),
+                confirm_bypass: false,
             },
             Uuid::new_v4(),
         )
         .is_err());
+
+    let policy = data
+        .create_policy(
+            &actor,
+            database_id,
+            CreatePolicyRequest {
+                rules: vec![PolicyRuleInput {
+                    selector_kind: "regex".into(),
+                    selector_value: "Иванов".into(),
+                    action: "mask".into(),
+                    category: "FIO".into(),
+                    priority: 10,
+
+                    rule_id: None,
+                }],
+            },
+            Uuid::new_v4(),
+        )
+        .unwrap();
+    data.activate_policy(&actor, database_id, policy.id, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(data.list_policies(database_id).unwrap()[0].status, "active");
 
     let dictionary = DictionaryConfig {
         id: Uuid::new_v4(),
@@ -569,15 +602,17 @@ async fn admin_configuration_is_typed_validated_and_audited() {
             ),
         }],
     };
-    data.put_dictionary_config(&actor, database_id, dictionary, Uuid::new_v4())
+    //++agent TASK-225 [26.09.2026] M-4: legacy PUT dictionaries пишет в
+    // черновик-копию активной (draft_version в ответе) — активная
+    // версия при этом не меняется (§4 legacy-маршруты).
+    let draft_version = data
+        .put_dictionary_config(&actor, database_id, dictionary, Uuid::new_v4())
         .unwrap();
-    let stored_configs = data.list_dictionary_configs(database_id).unwrap();
-    assert_eq!(stored_configs.len(), 1);
-    assert_eq!(stored_configs[0].selectors[0].category, "FIO");
+    assert!(draft_version >= 1);
     let persisted_json: String = storage
         .with_connection(|connection| {
             connection.query_row(
-                "SELECT source_paths_json FROM dictionary_configs WHERE database_id=?1",
+                "SELECT dictionary_json FROM policies WHERE database_id=?1 AND status='draft'",
                 [database_id.to_string()],
                 |row| row.get(0),
             )
@@ -599,27 +634,6 @@ async fn admin_configuration_is_typed_validated_and_audited() {
     assert!(data
         .put_dictionary_config(&actor, database_id, too_many, Uuid::new_v4())
         .is_err());
-
-    let policy = data
-        .create_policy(
-            &actor,
-            database_id,
-            CreatePolicyRequest {
-                rules: vec![PolicyRuleInput {
-                    selector_kind: "regex".into(),
-                    selector_value: "Иванов".into(),
-                    action: "mask".into(),
-                    category: "FIO".into(),
-                    priority: 10,
-                }],
-            },
-            Uuid::new_v4(),
-        )
-        .unwrap();
-    data.activate_policy(&actor, database_id, policy.id, Uuid::new_v4())
-        .await
-        .unwrap();
-    assert_eq!(data.list_policies(database_id).unwrap()[0].status, "active");
 
     let audit_count: i64 = storage
         .with_connection(|connection| {
@@ -662,6 +676,8 @@ async fn activating_policy_before_first_pull_does_not_make_enabled_database_read
                     action: "mask".into(),
                     category: "FIO".into(),
                     priority: 10,
+
+                    rule_id: None,
                 }],
             },
             Uuid::new_v4(),
@@ -694,7 +710,9 @@ async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy
     let database_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
-    let data = SqliteHumanDataStore::new(storage, masking);
+    //++agent TASK-225 [26.09.2026] storage нужен в цикле для ensure_database.
+    //++agent TASK-225
+    let data = SqliteHumanDataStore::new(storage.clone(), masking);
     let actor = onec_masking_service::auth::Principal {
         user_id: Uuid::new_v4(),
         role: Role::Admin,
@@ -707,6 +725,12 @@ async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy
         ("dictionary", "FIO"),
         ("regex", "synthetic-secret"),
     ] {
+        //++agent TASK-225 [26.09.2026]
+        // §2.2: максимум один draft на базу — каждая итерация получает
+        // свою базу (раньше тест складывал пять черновиков в одну).
+        //++agent TASK-225
+        let database_id = Uuid::new_v4();
+        storage.ensure_database(database_id).unwrap();
         let policy = data
             .create_policy(
                 &actor,
@@ -718,6 +742,8 @@ async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy
                         action: "secret".into(),
                         category: "SECRET".into(),
                         priority: 1,
+
+                        rule_id: None,
                     }],
                 },
                 Uuid::new_v4(),
@@ -752,6 +778,7 @@ async fn secret_policy_activation_http_returns_stable_conflict_code() {
     let database_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
     let policy = data
         .create_policy(
@@ -764,6 +791,8 @@ async fn secret_policy_activation_http_returns_stable_conflict_code() {
                     action: "secret".into(),
                     category: "SECRET".into(),
                     priority: 1,
+
+                    rule_id: None,
                 }],
             },
             Uuid::new_v4(),
@@ -774,6 +803,7 @@ async fn secret_policy_activation_http_returns_stable_conflict_code() {
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
     let request = Request::builder()
         .method("POST")
@@ -803,12 +833,14 @@ fn test_app(
     sessions: Arc<SessionService>,
 ) -> axum::Router {
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
     human::router(Arc::new(HumanState {
         auth,
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }))
 }
 
@@ -1401,6 +1433,7 @@ async fn reveal_returns_report_and_writes_no_audit_event() {
             86_400,
             None,
             Uuid::new_v4(),
+            None,
         )
         .unwrap();
     let history_id = match inserted {
@@ -1623,12 +1656,14 @@ async fn metadata_route_reports_empty_manifest_and_tree_levels() {
     let database_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking.clone()));
     let app = human::router(Arc::new(HumanState {
         auth,
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
     let uri = format!("/api/v1/admin/databases/{database_id}/metadata");
 
@@ -1741,12 +1776,14 @@ async fn metadata_route_bounds_inputs_and_search_output() {
     let database_id = Uuid::new_v4();
     storage.ensure_database(database_id).unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
+    let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking.clone()));
     let app = human::router(Arc::new(HumanState {
         auth,
         sessions,
         data,
         expected_origin: ORIGIN.to_owned(),
+        setup,
     }));
     let uri = format!("/api/v1/admin/databases/{database_id}/metadata");
 
@@ -1828,6 +1865,22 @@ async fn dictionary_configs_mark_stale_selectors_via_manifest() {
     };
     data.put_dictionary_config(&actor, database_id, config, Uuid::new_v4())
         .unwrap();
+    //++agent TASK-225 [26.09.2026] M-4: PUT пишет в черновик — для
+    // проверки in_manifest активируем его (list читает активную, §2.5).
+    let draft_id = storage
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT id FROM policies WHERE database_id=?1 AND status='draft'",
+                [database_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .map(|id| Uuid::parse_str(&id).unwrap())
+        .unwrap();
+    data.activate_policy(&actor, database_id, draft_id, Uuid::new_v4())
+        .await
+        .unwrap();
+    //++agent TASK-225
     let configs = data.list_dictionary_configs(database_id).unwrap();
     assert!(configs[0].selectors.iter().all(|s| s.in_manifest.is_none()));
 

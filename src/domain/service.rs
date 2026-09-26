@@ -11,6 +11,9 @@ use uuid::Uuid;
 //++agent TASK-222 [05.10.2026]
 mod dictionary_feed;
 //++agent TASK-222
+//++agent TASK-225 [26.09.2026] §3.4: предикат F9 для DiffContext.
+pub(crate) use dictionary_feed::metadata_expandable_basics;
+//++agent TASK-225
 
 use crate::storage::{HistoryWrite, SqliteStorage, TerminalWrite};
 
@@ -59,12 +62,16 @@ pub struct MaskingService {
     workers: Arc<Semaphore>,
     database_workers: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
     per_database_workers: usize,
+    //++agent TASK-225 [26.09.2026]
+    // §5.7: один сухой прогон на базу одновременно (409 DRY_RUN_BUSY).
+    //++agent TASK-225
+    dry_run_lock: Mutex<HashSet<Uuid>>,
     engine: MaskEngine,
     //++agent TASK-225 [25.09.2026]
-    // Дедуп лога feed-pull отказов: transient-ошибка повторяется каждый
-    // тик, журналировать надо факт отказа intent-а (created_at + код), а
-    // не каждый повтор попытки.
-    feed_pull_log_dedup: Mutex<HashMap<Uuid, (String, &'static str)>>,
+    // §8.1: параметры backoff pull refresh (env при старте); аудит
+    // неудач ведётся по durable-счётчику attempts в v2_refresh_intents,
+    // отдельная in-memory дедупликация лога больше не нужна.
+    pull_retry: dictionary_feed::PullRetryPolicy,
     //++agent TASK-225
 }
 
@@ -72,6 +79,23 @@ struct CachedResponse {
     value: Value,
     expires_at: chrono::DateTime<Utc>,
 }
+
+//++agent TASK-225 [26.09.2026] M-6: RAII-метка занятости dry-run —
+// флаг снимается при любом выходе из `dry_run`, включая отмену future
+// при отключении клиента (axum дропает запросный future) и panic.
+struct DryRunBusyGuard<'a> {
+    lock: &'a Mutex<HashSet<Uuid>>,
+    database_id: Uuid,
+}
+
+impl Drop for DryRunBusyGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.lock.lock() {
+            busy.remove(&self.database_id);
+        }
+    }
+}
+//++agent TASK-225
 
 impl MaskingService {
     pub fn new(storage: Arc<SqliteStorage>) -> Self {
@@ -112,8 +136,11 @@ impl MaskingService {
             ))),
             database_workers: Mutex::new(HashMap::new()),
             per_database_workers: bounded_env_usize("MASKING_PER_DATABASE_WORKERS", 4, 1, 100),
+            //++agent TASK-225 [26.09.2026]
+            dry_run_lock: Mutex::new(HashSet::new()),
+            //++agent TASK-225
             engine: MaskEngine::new(),
-            feed_pull_log_dedup: Mutex::new(HashMap::new()),
+            pull_retry: dictionary_feed::PullRetryPolicy::from_env(),
         }
     }
 
@@ -207,11 +234,104 @@ impl MaskingService {
         Ok(lock)
     }
 
+    //++agent TASK-225 [26.09.2026]
+    /// RAM-снимок активной версии (для B6 — словарь прогона берётся из
+    /// него, §5.6: новые источники файла не загружены).
+    pub async fn policy_snapshot_view(&self, database_id: Uuid) -> Option<PolicySnapshot> {
+        self.policy_cache.read().await.get(&database_id).cloned()
+    }
+    //++agent TASK-225
+
     pub async fn set_policy_snapshot(&self, database_id: Uuid, mut snapshot: PolicySnapshot) {
+        //++agent TASK-225 [26.09.2026] MINOR-6/§5a.2: тяжёлая сборка
+        // Aho-Corasick индекса — в spawn_blocking ВНЕ write-lock
+        // policy_cache (~10с при 1 млн значений иначе блокирует чтение
+        // всех снимков). Фаза 1: read-lock — нужна ли сборка и для
+        // какого словаря. Фаза 2: spawn_blocking. Фаза 3: write-lock —
+        // merge, built-индекс применяется только если словарь за это
+        // время не подменили (pull мог прийти параллельно).
+        //++agent TASK-225 [26.09.2026] review MINOR-9: отпечаток входного
+        // словаря считаем ДО блокировок — сам по себе O(n), но вне
+        // policy_cache.write (раньше под write-локом был O(n) HashMap::eq).
+        if snapshot.dictionary_fingerprint == 0 && !snapshot.dictionary.is_empty() {
+            snapshot.dictionary_fingerprint =
+                crate::domain::dictionary_fingerprint(&snapshot.dictionary);
+        }
+        // [26.09.2026 review N-3] пересчёт `with_actions` и сборка
+        // индекса — вне write-блокировки кэша: пересборка автомата на
+        // 1M значений ~секунды, под write-локом она блокировала бы все
+        // снимки. Под read-локом берём Arc-ссылки, тяжёлое — в
+        // spawn_blocking; публикуем, только если состояние за это время
+        // не сменилось (отпечаток / Arc-идентичность).
+        let (existing_index, build_for) = {
+            let cache = self.policy_cache.read().await;
+            match cache.get(&database_id) {
+                Some(existing) if snapshot.dictionary.is_empty() => (
+                    existing.dictionary_index.clone(),
+                    (existing.dictionary_index.is_none() && !existing.dictionary.is_empty())
+                        .then(|| existing.dictionary.clone()),
+                ),
+                _ => (None, None),
+            }
+        };
+        let (built_fingerprint, built_index, updated_index) = if let Some(dictionary) = build_for {
+            let rules = snapshot.rules.clone();
+            let for_build = dictionary.clone();
+            let index = tokio::task::spawn_blocking(move || {
+                let fingerprint = crate::domain::dictionary_fingerprint(&for_build);
+                (
+                    crate::domain::DictionaryIndex::build(&for_build, &rules),
+                    fingerprint,
+                )
+            })
+            .await
+            .ok();
+            index
+                .map(|(index, fingerprint)| (Some(fingerprint), index, None))
+                .unwrap_or_default()
+        } else if let Some(index) = existing_index.clone() {
+            let rules = snapshot.rules.clone();
+            let updated = tokio::task::spawn_blocking(move || index.with_actions(&rules))
+                .await
+                .ok();
+            (None, None, updated)
+        } else {
+            (None, None, None)
+        };
+        //++agent TASK-225
         let mut cache = self.policy_cache.write().await;
         if let Some(existing) = cache.get(&database_id) {
             if snapshot.dictionary.is_empty() {
                 snapshot.dictionary = existing.dictionary.clone();
+                snapshot.dictionary_fingerprint = existing.dictionary_fingerprint;
+                //++agent TASK-225 [26.09.2026] D8: пути источников —
+                // атрибуты того же словаря, наследуются вместе с ним.
+                snapshot.dictionary_sources = existing.dictionary_sources.clone();
+                //++agent TASK-225
+                //++agent TASK-225 [25.09.2026]
+                // §5a.2: смена правил без pull — пересчитываем действия
+                // категорий, автомат значений переиспользуется (Arc);
+                // индекса ещё нет (снимок до TASK-225) — строим по месту.
+                // [26.09.2026 MINOR-6] сборка вынесена в spawn_blocking;
+                // built-индекс применяем, только если словарь не сменился
+                // за время сборки (pull мог прийти параллельно).
+                // [26.09.2026 review MINOR-9] сравнение — по отпечатку
+                // (O(1) вместо O(n) HashMap::eq под write-локом).
+                // [26.09.2026 review N-3] `with_actions` тоже вынесен из
+                // write-лока; пересчитанный индекс публикуем, только если
+                // pull не сменил индекс за время пересчёта (Arc::ptr_eq),
+                // иначе — редкий in-lock пересчёт по актуальному.
+                snapshot.dictionary_index = match existing.dictionary_index.as_ref() {
+                    Some(index) => match (&existing_index, &updated_index) {
+                        (Some(used), Some(updated)) if std::sync::Arc::ptr_eq(used, index) => {
+                            Some(updated.clone())
+                        }
+                        _ => Some(index.with_actions(&snapshot.rules)),
+                    },
+                    None => built_index
+                        .filter(|_| built_fingerprint == Some(existing.dictionary_fingerprint)),
+                };
+                //++agent TASK-225
             }
             if snapshot.metadata_sources.is_empty() {
                 snapshot.metadata_sources = existing.metadata_sources.clone();
@@ -350,7 +470,30 @@ impl MaskingService {
                 &request.chat_id,
                 &mut mappings,
             ) {
-                Ok(arguments) => arguments,
+                Ok(arguments) => {
+                    //++agent TASK-225 [26.09.2026] ревью-2 N-1
+                    // Факт резолва хотя бы одного токена — durable-флаг
+                    // на контексте вызова: finalize по нему гасит
+                    // свободный текст ошибок (эхо запроса после резолва
+                    // содержит исходные значения). Запись fail-closed:
+                    // без флага вызов с расшифрованными аргументами к 1С
+                    // не уходит — иначе finalize не узнает о подстановке.
+                    if arguments != request.arguments
+                        && !matches!(
+                            self.storage.mark_call_context_mask_tokens(request.call_id),
+                            Ok(true)
+                        )
+                    {
+                        drop(mappings);
+                        return self.persist_preflight_denial(
+                            &request,
+                            &settings,
+                            ErrorCode::ServiceNotReady,
+                        );
+                    }
+                    //++agent TASK-225
+                    arguments
+                }
                 Err(_) => {
                     drop(mappings);
                     return self.persist_preflight_denial(
@@ -577,6 +720,25 @@ impl MaskingService {
                 None,
             ),
         };
+        //++agent TASK-225 [26.09.2026] ревью-2 N-1
+        // Решение §12: preflight расшифровал mask-токены ⇒ эхо текста
+        // запроса в ошибке разбора содержит исходные значения — свободный
+        // текст не отдаём, только код и позицию. Флаг читается из
+        // durable-контекста вызова (TTL-фильтра нет: истёкшая запись
+        // всё ещё несёт правду). `Ok(None)` — строки нет: либо вызов
+        // миновал preflight (резолв невозможен — mark fail-closed),
+        // либо контекст вытерт рестартом — не отличить ⇒ консервативно
+        // считаем, что токены были. Ошибка чтения — тоже неизвестно.
+        let had_mask_tokens = !matches!(
+            self.storage.call_context_mask_tokens(request.call_id),
+            Ok(Some(false))
+        );
+        let logical_result = if had_mask_tokens {
+            strip_parse_error_text(logical_result)
+        } else {
+            logical_result
+        };
+        //++agent TASK-225
         let policy = self
             .policy_for(request.database_id, &settings, request.correlation_id)
             .await?;
@@ -683,8 +845,13 @@ impl MaskingService {
             );
         }
 
+        //++agent TASK-225 [26.09.2026] §6: причины/привязки ячеек нужны
+        // для mask_detail_json ниже — забираем до move `masked.value`.
+        let reason_entries = masked.reason_entries;
+        let cell_reasons = masked.cell_reasons;
+        //++agent TASK-225
         let fully_masked = masked.value;
-        let mut mask_reasons: Vec<_> = masked.reasons.into_iter().collect();
+        let mut mask_reasons: Vec<_> = masked.reasons.iter().cloned().collect();
         mask_reasons.sort();
         let public_result =
             if settings.mode == DatabaseMode::Enabled && class == ToolClass::DataMask {
@@ -717,6 +884,24 @@ impl MaskingService {
             },
         );
         //--agent TASK-224
+        //++agent TASK-225 [26.09.2026]
+        // §6.1/§6.2: детальная запись — причины по ячейкам отчёта
+        // (координаты из той же раскладки блоков, что neutral_report),
+        // lineage без значений и id версии политики.
+        let detail_text = mask_detail_json(
+            &reason_entries,
+            &cell_reasons,
+            &fully_masked,
+            Some(&request.field_sources.schema),
+            policy.version,
+        );
+        let field_sources_text = serde_json::to_string(&request.field_sources).ok();
+        let detail = crate::storage::HistoryDetail {
+            mask_detail_json: detail_text.as_deref(),
+            field_sources_json: field_sources_text.as_deref(),
+            policy_id: policy.policy_id,
+        };
+        //++agent TASK-225
         let write = self
             .storage
             .write_history(
@@ -732,6 +917,7 @@ impl MaskingService {
                 effective_history_ttl(&settings),
                 (!masked.candidates.is_empty()).then_some(batch_id),
                 request.correlation_id,
+                Some(&detail),
             )
             .map_err(|_| {
                 ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
@@ -790,6 +976,391 @@ impl MaskingService {
         Ok((mappings, terminal, history, audit))
     }
 
+    //++agent TASK-225 [26.09.2026]
+    /// §5: сухой прогон — статусная разница ячеек последних записей
+    /// истории между активной и проверяемой версиями. Значения не
+    /// покидают память прогона; в ответе только координаты и причины.
+    /// Один прогон на базу одновременно (DRY_RUN_BUSY).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dry_run(
+        &self,
+        database_id: Uuid,
+        to: &PolicySnapshot,
+        source_stats: &std::collections::HashMap<String, crate::domain::setup::SourceStat>,
+        draft_sources: &std::collections::HashSet<String>,
+        new_source_estimates: &std::collections::HashMap<String, i64>,
+        limit: u32,
+    ) -> Result<DryRunOutcome, ServiceError> {
+        {
+            let mut busy = self
+                .dry_run_lock
+                .lock()
+                .map_err(|_| ServiceError::new(ErrorCode::MaskingFailed, Uuid::nil()))?;
+            if !busy.insert(database_id) {
+                return Err(ServiceError::new(ErrorCode::DryRunBusy, Uuid::nil()));
+            }
+        }
+        //++agent TASK-225 [26.09.2026] M-6: флаг живёт, пока жив гард —
+        // отмена запросного future при отключении клиента обязана его
+        // снять; снятие после .await оставляло базу в вечном DRY_RUN_BUSY.
+        let _busy_guard = DryRunBusyGuard {
+            lock: &self.dry_run_lock,
+            database_id,
+        };
+        //++agent TASK-225
+        self.dry_run_inner(
+            database_id,
+            to,
+            source_stats,
+            draft_sources,
+            new_source_estimates,
+            limit,
+        )
+        .await
+    }
+
+    async fn dry_run_inner(
+        &self,
+        database_id: Uuid,
+        to: &PolicySnapshot,
+        source_stats: &std::collections::HashMap<String, crate::domain::setup::SourceStat>,
+        draft_sources: &std::collections::HashSet<String>,
+        new_source_estimates: &std::collections::HashMap<String, i64>,
+        limit: u32,
+    ) -> Result<DryRunOutcome, ServiceError> {
+        let deadline = std::time::Instant::now()
+            + Duration::milliseconds(bounded_env_usize(
+                "MASKING_DRY_RUN_TIMEOUT_MS",
+                10_000,
+                500,
+                60_000,
+            ) as i64)
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(10));
+        let budget_ms = bounded_env_usize("MASKING_CHECK_BUDGET_MS", 200, 10, 60_000) as f64;
+        let records = self
+            .storage
+            .dry_run_records(database_id, limit)
+            .map_err(|_| ServiceError::new(ErrorCode::HistoryUnavailable, Uuid::nil()))?;
+        if records.is_empty() {
+            // §5.1: записей нет вовсе → no_records; есть, но все без
+            // lineage (история до §6.1) → no_lineage.
+            let any = self
+                .storage
+                .has_tool_result_records(database_id)
+                .unwrap_or(false);
+            return Ok(DryRunOutcome::Empty(if any {
+                "no_lineage"
+            } else {
+                "no_records"
+            }));
+        }
+        let settings = self
+            .storage
+            .database_settings(database_id)
+            .map_err(|_| ServiceError::new(ErrorCode::MaskingFailed, Uuid::nil()))?
+            .ok_or_else(|| ServiceError::new(ErrorCode::MaskingFailed, Uuid::nil()))?;
+        let active = self
+            .policy_for(database_id, &settings, Uuid::nil())
+            .await
+            .unwrap_or_default();
+
+        let mut records_out = Vec::new();
+        let mut skipped = Vec::new();
+        let mut became_masked = 0u64;
+        let mut became_open = 0u64;
+        let mut unevaluable = 0u64;
+        let mut active_times: Vec<(f64, Uuid)> = Vec::new();
+        let mut draft_times: Vec<(f64, Uuid)> = Vec::new();
+
+        for record in records {
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            let masked_value = unwrap_stored_result(&record.public_result);
+            let schema = record
+                .field_sources
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .map(|fs| fs.get("schema").cloned().unwrap_or(Value::Null));
+            let map = report_pointer_map(&masked_value, schema.as_ref());
+            // Статус ячеек «до»: токен → masked, [SECRET_REMOVED] → secret.
+            let mut before: Vec<(String, &'static str)> = Vec::new();
+            collect_cell_status(&masked_value, "", &mut before);
+            // Восстановление исходных значений по mapping батча записи.
+            let resolved = match record.mapping_batch_id {
+                Some(batch_id) => {
+                    let mut mappings = self.mappings.write().await;
+                    self.engine
+                        .resolve_tokens_for_batch(
+                            &masked_value,
+                            database_id,
+                            &record.chat_id,
+                            batch_id,
+                            &mut mappings,
+                        )
+                        .ok()
+                }
+                None => Some(masked_value.clone()),
+            };
+            let Some(resolved) = resolved else {
+                skipped.push(json!({"history_id": record.id, "reason": "mapping_expired"}));
+                continue;
+            };
+            let field_sources: Value = record
+                .field_sources
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(Value::Null);
+            // Два прогона с замером чистого времени engine.mask.
+            // Изолированный «dry» MappingStore: токены прогона не
+            // публикуются и выбрасываются с окончанием итерации (§5.3).
+            let dry_store = MappingStore::new(MappingLimits::default());
+            let start = std::time::Instant::now();
+            let _after_active = self.engine.mask(
+                &resolved,
+                database_id,
+                &record.chat_id,
+                Uuid::nil(),
+                settings.mapping_ttl_seconds,
+                &active,
+                &dry_store,
+                &field_sources,
+            );
+            let active_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = std::time::Instant::now();
+            let after_draft = self.engine.mask(
+                &resolved,
+                database_id,
+                &record.chat_id,
+                Uuid::nil(),
+                settings.mapping_ttl_seconds,
+                to,
+                &dry_store,
+                &field_sources,
+            );
+            let draft_ms = start.elapsed().as_secs_f64() * 1000.0;
+            active_times.push((active_ms, record.id));
+            draft_times.push((draft_ms, record.id));
+            drop(dry_store);
+
+            let mut cells = Vec::new();
+            //++agent TASK-225 [26.09.2026] D3: маскированная сетка для UI —
+            // ВСЕ оценённые ячейки со статусами до/после и причиной.
+            // Значений и токенов в сетке нет (§5.4: в ответе только
+            // координаты и причины).
+            let mut grid_cells = Vec::new();
+            let mut grid_truncated = false;
+            let mut masked_count = 0u64;
+            let mut open_count = 0u64;
+            if let Ok(after) = after_draft.as_ref() {
+                let mut after_cells = Vec::new();
+                collect_cell_status(&after.value, "", &mut after_cells);
+                let mut reason_idx: HashMap<String, u32> = HashMap::new();
+                for (pointer, idx) in &after.cell_reasons {
+                    reason_idx.entry(pointer.clone()).or_insert(*idx);
+                }
+                let after_map: HashMap<&str, &str> =
+                    after_cells.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+                for (pointer, status_before) in before {
+                    let status_after = if status_before == "secret" {
+                        "unknown" // SECRET_REMOVED необратим
+                    } else {
+                        after_map.get(pointer.as_str()).copied().unwrap_or("open")
+                    };
+                    if status_before == "secret" {
+                        unevaluable += 1;
+                    }
+                    let (block, row, col) = cell_coord(&map, &pointer);
+                    let column = col
+                        .and_then(|index| {
+                            map.columns
+                                .get(block as usize)
+                                .and_then(|cols| cols.get(index as usize))
+                        })
+                        .cloned();
+                    let reason = reason_idx
+                        .get(&pointer)
+                        .and_then(|idx| after.reason_entries.get(*idx as usize))
+                        //++agent TASK-225 [26.09.2026] MINOR-1: у
+                        // source_path-причин отдаём сам путь (pattern
+                        // правила); у прочих — поле опускается, селектор
+                        // вида «dictionary» путём источника не является.
+                        .map(|entry| {
+                            json!({
+                                "kind": entry.kind,
+                                "category": entry.category,
+                                "source_path": entry.source_path,
+                            })
+                        });
+                    //++agent TASK-225
+                    if grid_cells.len() < 20_000 {
+                        grid_cells.push(json!({
+                            "block": block,
+                            "row": row,
+                            "column": column,
+                            "before": status_before,
+                            "after": status_after,
+                            "reason": reason,
+                        }));
+                    } else {
+                        grid_truncated = true;
+                    }
+                    if status_after == status_before || status_before == "secret" {
+                        continue;
+                    }
+                    match (status_before, status_after) {
+                        ("open", "masked") => masked_count += 1,
+                        ("masked", "open") | ("masked", "unknown") => open_count += 1,
+                        _ => {}
+                    }
+                    if cells.len() < 2_000 {
+                        cells.push(json!({
+                            "block": block,
+                            "row": row,
+                            "column": column,
+                            "before": status_before,
+                            "after": status_after,
+                            "reason": reason,
+                        }));
+                    }
+                }
+            }
+            became_masked += masked_count;
+            became_open += open_count;
+            let title = self
+                .storage
+                .call_context_text(record.call_id)
+                .ok()
+                .flatten()
+                .map(|text: String| text.chars().take(200).collect::<String>());
+            records_out.push(json!({
+                "history_id": record.id,
+                "created_at": record.created_at,
+                "tool": record.tool_name,
+                "chat_id": record.chat_id,
+                "title": title,
+                "became_masked": masked_count,
+                "became_open": open_count,
+                "cells": cells,
+                "cells_truncated": masked_count + open_count > 2_000,
+                //++agent TASK-225 [26.09.2026] D3: сетка всех ячеек
+                // (статусы, не значения) + имена колонок по блокам.
+                "grid": {
+                    "columns": map.columns,
+                    "cells": grid_cells,
+                    "truncated": grid_truncated,
+                },
+                //++agent TASK-225
+            }));
+        }
+        let timing = |times: &mut Vec<(f64, Uuid)>| {
+            times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let median = times.get(times.len() / 2).map(|(v, _)| *v).unwrap_or(0.0);
+            let (max, worst) = times.last().cloned().unwrap_or((0.0, Uuid::nil()));
+            (
+                median,
+                max,
+                worst,
+                times.iter().filter(|(v, _)| *v > budget_ms).count(),
+            )
+        };
+        let (a_med, a_max, a_worst, a_over) = timing(&mut active_times);
+        let (d_med, d_max, d_worst, d_over) = timing(&mut draft_times);
+        // §5: память словаря — §5a.3 эмпирика bytes×2 + values×48 по
+        // измеренным источникам последнего pull; для источников черновика
+        // без статистики — estimated_values × средний размер значения.
+        let memory_of = |stat: &crate::domain::setup::SourceStat| -> u64 {
+            (stat.bytes.max(0) as u64).saturating_mul(2) + (stat.values.max(0) as u64) * 48
+        };
+        let active_bytes: u64 = source_stats.values().map(memory_of).sum();
+        let total_values: u64 = source_stats
+            .values()
+            .map(|stat| stat.values.max(0) as u64)
+            .sum();
+        let total_bytes: u64 = source_stats
+            .values()
+            .map(|stat| stat.bytes.max(0) as u64)
+            .sum();
+        let avg_value = total_bytes.checked_div(total_values).unwrap_or(24).max(1);
+        // Черновик: измеренные источники, оставшиеся в `to`, + оценки новых.
+        let draft_measured: u64 = source_stats
+            .iter()
+            .filter(|(path, _)| draft_sources.contains(path.as_str()))
+            .map(|(_, stat)| memory_of(stat))
+            .sum();
+        let draft_estimated: u64 = new_source_estimates
+            .values()
+            .map(|values| (*values as u64).saturating_mul(avg_value))
+            .sum();
+        // top-3 источника по байтам активного словаря (§5).
+        let mut top: Vec<(&String, &crate::domain::setup::SourceStat)> =
+            source_stats.iter().collect();
+        top.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
+        let top_sources: Vec<Value> = top
+            .iter()
+            .take(3)
+            .map(|(path, stat)| {
+                json!({
+                    "source_path": path,
+                    "values": stat.values,
+                    "bytes": stat.bytes,
+                    "share": if total_bytes > 0 {
+                        stat.bytes.max(0) as f64 / total_bytes as f64
+                    } else { 0.0 },
+                })
+            })
+            .collect();
+        let automaton_bytes = to
+            .dictionary_index
+            .as_ref()
+            .map(|index| index.heap_bytes())
+            .unwrap_or(0);
+        let changed = records_out
+            .iter()
+            .filter(|record| {
+                record["became_masked"].as_u64().unwrap_or(0)
+                    + record["became_open"].as_u64().unwrap_or(0)
+                    > 0
+            })
+            .count();
+        Ok(DryRunOutcome::Done(json!({
+            "checked": records_out.len() + skipped.len(),
+            "changed": changed,
+            "skipped": skipped,
+            "totals": {
+                "became_masked": became_masked,
+                "became_open": became_open,
+                "unevaluable_cells": unevaluable,
+            },
+            "records": records_out,
+            "timing": {
+                "active": {
+                    "median_ms": a_med,
+                    "p_max_ms": a_max,
+                    "worst_history_id": a_worst,
+                    "over_budget": a_over,
+                },
+                "draft": {
+                    "median_ms": d_med,
+                    "p_max_ms": d_max,
+                    "worst_history_id": d_worst,
+                    "over_budget": d_over,
+                },
+                "budget_ms": budget_ms,
+                "dictionary_memory": {
+                    "active_bytes": active_bytes,
+                    "draft_estimated_bytes": draft_measured + draft_estimated,
+                    "automaton_bytes": automaton_bytes,
+                    // §5: новые источники оценены по estimated_values файла.
+                    "estimated": !new_source_estimates.is_empty(),
+                },
+                "top_sources": top_sources,
+            },
+        })))
+    }
+    //++agent TASK-225
+
     pub async fn database_ready(&self, database_id: Uuid) -> bool {
         let Ok(Some(settings)) = self.storage.database_settings(database_id) else {
             return false;
@@ -822,6 +1393,12 @@ impl MaskingService {
         Ok(PolicySnapshot {
             version,
             rules,
+            //++agent TASK-225 [26.09.2026] §6.1: связь истории с версией.
+            policy_id: settings
+                .active_policy_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
+            //++agent TASK-225
             // A persisted version without its process-local snapshot is also
             // unready; only feed activation can publish a usable generation.
             ready: false,
@@ -883,6 +1460,9 @@ impl MaskingService {
                 effective_history_ttl(settings),
                 None,
                 request.correlation_id,
+                //++agent TASK-225 [26.09.2026] §6.1: отказы — legacy-запись.
+                None,
+                //++agent TASK-225
             )
             .map_err(|_| {
                 ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
@@ -1390,6 +1970,49 @@ fn safe_terminal_error(code: &str, correlation_id: Uuid) -> Value {
     })
 }
 
+//++agent TASK-225 [26.09.2026] ревью-2 N-1
+/// Решение §12: вызов с расшифрованными mask-токенами не может получить
+/// свободный текст ошибки разбора — эхо текста запроса уже содержит
+/// подставленные исходные значения. Из конверта QUERY_PARSE_ERROR
+/// остаются только код, признак неуспеха и позиция в запросе
+/// (строка/колонка — единственный фрагмент без данных). Позицию
+/// восстанавливаем и из message границы без поля position — фрагмент
+/// `{(строка, колонка)}` берём по форме, не по содержимому.
+fn strip_parse_error_text(result: Value) -> Value {
+    let Some(object) = result.as_object() else {
+        return result;
+    };
+    if object.get("error").and_then(Value::as_str) != Some("QUERY_PARSE_ERROR") {
+        return result;
+    }
+    let mut stripped = serde_json::Map::new();
+    for key in ["success", "error", "position"] {
+        if let Some(value) = object.get(key) {
+            stripped.insert(key.to_owned(), value.clone());
+        }
+    }
+    if !stripped.contains_key("position") {
+        if let Some(position) = object
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(|message| {
+                regex::Regex::new(r"\{(\(\d+,\s*\d+\))\}")
+                    .ok()
+                    .and_then(|pattern| {
+                        pattern
+                            .captures(message)
+                            .and_then(|captures| captures.get(1))
+                            .map(|found| found.as_str().to_owned())
+                    })
+            })
+        {
+            stripped.insert("position".to_owned(), Value::String(position));
+        }
+    }
+    Value::Object(stripped)
+}
+//++agent TASK-225
+
 //++agent TASK-222 [05.10.2026]
 // Публичная форма результата инструмента (контракт Р2): замаскированное
 // бизнес-значение уходит агенту в content[0].text; is_error выводится из
@@ -1484,6 +2107,256 @@ fn effective_history_ttl(settings: &super::DatabaseSettings) -> u64 {
         .min(settings.mapping_ttl_seconds)
 }
 //--agent TASK-224
+
+//++agent TASK-225 [26.09.2026]
+/// §6.1: отображение JSON-pointer маскированного результата в координату
+/// отчёта `(block, row, col_idx)` — та же раскладка блоков и колонок, что
+/// у `neutral_report`. `row`/`col_idx` = None для указателей вне таблиц
+/// ({block, kind:"text"}).
+/// Раскладка отчёта: указатель → координата + имена колонок блоков
+/// (нужны B9 и B6 — ответы несут `column`, а не индекс).
+#[derive(Default)]
+struct ReportMap {
+    cells: HashMap<String, (u32, Option<u32>, Option<u32>)>,
+    columns: Vec<Vec<String>>,
+}
+
+fn report_pointer_map(result: &Value, schema: Option<&Value>) -> ReportMap {
+    let mut map = HashMap::new();
+    let mut columns: Vec<Vec<String>> = Vec::new();
+    let mut block = 0u32;
+    if let Some(content) = result.get("content").and_then(Value::as_array) {
+        for (index, item) in content.iter().enumerate() {
+            let prefix = format!("/content/{index}");
+            match item.get("type").and_then(Value::as_str) {
+                Some("text") if item.get("text").and_then(Value::as_str).is_some() => {
+                    map.insert(prefix, (block, None, None));
+                    columns.push(Vec::new());
+                    block += 1;
+                }
+                Some("json") => {
+                    columns.push(block_pointer_map(
+                        item.get("json").unwrap_or(&Value::Null),
+                        &format!("{prefix}/json"),
+                        block,
+                        schema,
+                        &mut map,
+                    ));
+                    block += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(structured) = result.get("structured_content") {
+        columns.push(block_pointer_map(
+            structured,
+            "/structured_content",
+            block,
+            schema,
+            &mut map,
+        ));
+        block += 1;
+    }
+    if block == 0 {
+        columns.push(block_pointer_map(result, "", block, schema, &mut map));
+    }
+    ReportMap {
+        cells: map,
+        columns,
+    }
+}
+
+/// Раскладка одного блока: таблица → ячейки `prefix/row/key`; иначе —
+/// весь подграф значения ведёт в (block, None, None).
+fn block_pointer_map(
+    value: &Value,
+    prefix: &str,
+    block: u32,
+    schema: Option<&Value>,
+    map: &mut HashMap<String, (u32, Option<u32>, Option<u32>)>,
+) -> Vec<String> {
+    map.insert(prefix.to_owned(), (block, None, None));
+    let rows_path = if value.is_array() {
+        Some(prefix.to_owned())
+    } else {
+        value
+            .get("rows")
+            .and_then(Value::as_array)
+            .map(|_| format!("{prefix}/rows"))
+            .or_else(|| {
+                value
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map(|_| format!("{prefix}/data"))
+            })
+    };
+    let Some(rows_path) = rows_path else {
+        return Vec::new();
+    };
+    let Some(rows) = pointer_value(value, &rows_path[prefix.len()..])
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(objects) = rows
+        .iter()
+        .map(Value::as_object)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Vec::new();
+    };
+    // Порядок колонок ≡ neutral_block: сначала schema.columns, затем
+    // остальные ключи строк по алфавиту (BTreeSet).
+    let mut columns: Vec<String> = Vec::new();
+    if let Some(schema_columns) = schema
+        .and_then(|s| s.get("columns"))
+        .and_then(Value::as_array)
+    {
+        for name in schema_columns
+            .iter()
+            .filter_map(|column| column.get("name").and_then(Value::as_str))
+        {
+            let key = objects
+                .iter()
+                .flat_map(|row| row.keys())
+                .find(|key| key.eq_ignore_ascii_case(name))
+                .cloned()
+                .unwrap_or_else(|| name.to_owned());
+            if !columns.iter().any(|c| c.eq_ignore_ascii_case(&key)) {
+                columns.push(key);
+            }
+        }
+    }
+    let extra: std::collections::BTreeSet<String> = objects
+        .iter()
+        .flat_map(|row| row.keys())
+        .filter(|key| !columns.iter().any(|c| c.eq_ignore_ascii_case(key)))
+        .cloned()
+        .collect();
+    columns.extend(extra);
+    for (row_index, object) in objects.iter().enumerate() {
+        for key in object.keys() {
+            let Some(col) = columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(key))
+            else {
+                continue;
+            };
+            map.insert(
+                format!(
+                    "{}/{row_index}/{}",
+                    rows_path,
+                    key.replace('~', "~0").replace('/', "~1")
+                ),
+                (block, Some(row_index as u32), Some(col as u32)),
+            );
+        }
+    }
+    columns
+}
+
+fn pointer_value<'a>(value: &'a Value, suffix: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in suffix.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        current = current.get(segment.replace("~1", "/").replace("~0", "~"))?;
+    }
+    Some(current)
+}
+
+/// Координата указателя — точное совпадение или ближайший предок
+/// (вложенные значения ячейки ведут в свою ячейку).
+fn cell_coord(map: &ReportMap, pointer: &str) -> (u32, Option<u32>, Option<u32>) {
+    let mut current = pointer;
+    loop {
+        if let Some(coord) = map.cells.get(current) {
+            return *coord;
+        }
+        match current.rfind('/') {
+            Some(0) => current = "",
+            Some(index) => current = &current[..index],
+            None => return (0, None, None),
+        }
+    }
+}
+
+/// §6.2: сборка `mask_detail_json` — компактные кортежи
+/// `[block,row,col,reason_idx]` (row/col = -1 вне таблиц), лимиты
+/// 256 причин (в движке), 20 000 ячеек и 512 КБ JSON.
+fn mask_detail_json(
+    reason_entries: &[super::masking::ReasonEntry],
+    cell_reasons: &[(String, u32)],
+    result: &Value,
+    schema: Option<&Value>,
+    policy_version: i64,
+) -> Option<String> {
+    if reason_entries.is_empty() {
+        return None;
+    }
+    let map = report_pointer_map(result, schema);
+    let mut cells: Vec<[i64; 4]> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (pointer, reason_idx) in cell_reasons {
+        let (block, row, col) = cell_coord(&map, pointer);
+        let tuple = [
+            block as i64,
+            row.map_or(-1, |v| v as i64),
+            col.map_or(-1, |v| v as i64),
+            *reason_idx as i64,
+        ];
+        if seen.insert(tuple) {
+            cells.push(tuple);
+        }
+    }
+    // §6.2: счётчики reasons[].cells считаются по ПОЛНОМУ списку ячеек —
+    // обрезание cells не должно занижать агрегаты.
+    let mut counts = vec![0u64; reason_entries.len()];
+    for tuple in &cells {
+        if let Some(count) = counts.get_mut(tuple[3].max(0) as usize) {
+            *count += 1;
+        }
+    }
+    let mut truncated = false;
+    if cells.len() > 20_000 {
+        cells.truncate(20_000);
+        truncated = true;
+    }
+    let reasons_json: Vec<Value> = reason_entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
+            value["cells"] = counts.get(idx).copied().unwrap_or(0).into();
+            value
+        })
+        .collect();
+    let render = |cells: &[[i64; 4]], truncated: bool| {
+        json!({
+            "v": 1,
+            "policy_version": policy_version,
+            "reasons": reasons_json,
+            "cells": cells,
+            "truncated": truncated,
+        })
+        .to_string()
+    };
+    let mut text = render(&cells, truncated);
+    if text.len() > 512 * 1024 {
+        let mut keep = cells.len();
+        while keep > 0 && text.len() > 512 * 1024 {
+            keep /= 2;
+            text = render(&cells[..keep], true);
+        }
+        cells.truncate(keep);
+        text = render(&cells, true);
+    }
+    Some(text)
+}
+//++agent TASK-225
 
 fn neutral_report(result: &Value, meta: &ReportMeta) -> Value {
     let mut blocks = Vec::new();
@@ -1671,3 +2544,243 @@ fn report_scalar_type(value: &Value) -> &'static str {
 fn canonical_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
 }
+
+//++agent TASK-225 [26.09.2026]
+/// §5: результат сухого прогона — Empty для `history_empty:true` ответа.
+pub enum DryRunOutcome {
+    Empty(&'static str),
+    Done(Value),
+}
+
+/// Снятие обёртки сохранённого публичного ответа: ToolCallResult
+/// `{content:[{type:"text",text}]}` → бизнес-JSON текста; остальное —
+/// само значение (opaque-форма Р2).
+fn unwrap_stored_result(stored: &Value) -> Value {
+    if let Some(text) = stored
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find(|item| item["type"] == "text"))
+        .and_then(|item| item["text"].as_str())
+    {
+        return serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()));
+    }
+    stored.clone()
+}
+
+/// Обход листьев → (pointer, статус): `masked` — токен `[MASK:v1:`,
+/// `secret` — врезка `[SECRET_REMOVED]` (содержится в строке целиком),
+/// иначе `open`.
+fn collect_cell_status(value: &Value, pointer: &str, out: &mut Vec<(String, &'static str)>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_cell_status(value, &format!("{pointer}/{escaped}"), out);
+            }
+        }
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                collect_cell_status(value, &format!("{pointer}/{index}"), out);
+            }
+        }
+        Value::String(text) => {
+            let status = if text.contains("[SECRET_REMOVED]") {
+                "secret"
+            } else if text.contains("[MASK:v1:") {
+                "masked"
+            } else {
+                "open"
+            };
+            out.push((pointer.to_owned(), status));
+        }
+        _ => out.push((pointer.to_owned(), "open")),
+    }
+}
+//++agent TASK-225
+
+//++agent TASK-225 [26.09.2026] M-6
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+
+    /// M-6: отмена future сухого прогона (отключение клиента) обязана
+    /// снять busy-флаг — иначе база навсегда в DRY_RUN_BUSY до рестарта.
+    /// Прогон удерживается в Pending на `mappings.write()` — тест держит
+    /// write-гард, future дропается незавершённым, Drop гарда чистит флаг.
+    #[tokio::test]
+    async fn dry_run_busy_flag_released_when_future_cancelled() {
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        // Конструктор чистит history (purge_ephemeral_history) — записи
+        // снимка прогона вставляются уже после new.
+        let service = MaskingService::new(storage);
+        let database_id = Uuid::new_v4();
+        service
+            .storage
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO databases(id,instance_id,mode,created_at,updated_at)
+                     VALUES (?1,?2,'enabled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    rusqlite::params![database_id.to_string(), Uuid::new_v4().to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,
+                            policy_version,mask_reasons_json,public_result_json,report_json,
+                            created_at,expires_at,mapping_batch_id,field_sources_json)
+                     VALUES (?1,?2,'chat',?3,'execute_query','tool_result',1,'[]',
+                            '{\"content\":[]}','{}','2026-01-02T00:00:00Z',
+                            '2999-01-01T00:00:00Z',?4,'{}')",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        database_id.to_string(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string()
+                    ],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .storage
+                .dry_run_records(database_id, 10)
+                .unwrap()
+                .len(),
+            1,
+            "запись history не попала в выборку dry_run"
+        );
+        let to = PolicySnapshot::default();
+        let source_stats = HashMap::new();
+        let draft_sources = HashSet::new();
+        let new_source_estimates = HashMap::new();
+        // Прогон упрётся в этот же write-лок на этапе разрешения mapping.
+        let hold_mappings = service.mappings.write().await;
+        {
+            let future = service.dry_run(
+                database_id,
+                &to,
+                &source_stats,
+                &draft_sources,
+                &new_source_estimates,
+                10,
+            );
+            tokio::pin!(future);
+            std::future::poll_fn(|context| match future.as_mut().poll(context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => panic!(
+                    "dry_run завершился до mappings.write(): {:?}",
+                    result.map(|_| ()).map_err(|error| error.code)
+                ),
+            })
+            .await;
+            assert!(
+                service.dry_run_lock.lock().unwrap().contains(&database_id),
+                "busy-флаг не выставлен во время прогона"
+            );
+            // drop(future): имитация отключения клиента — axum отменяет
+            // future, снятие возможно только через Drop гарда.
+        }
+        assert!(
+            service.dry_run_lock.lock().unwrap().is_empty(),
+            "busy-флаг завис после отмены dry_run"
+        );
+        drop(hold_mappings);
+        let second = service
+            .dry_run(
+                database_id,
+                &to,
+                &source_stats,
+                &draft_sources,
+                &new_source_estimates,
+                10,
+            )
+            .await;
+        assert!(
+            !matches!(second, Err(ref error) if error.code == ErrorCode::DryRunBusy),
+            "повторный dry-run после отмены вернул DRY_RUN_BUSY"
+        );
+    }
+
+    /// N-3: обновление политики с пустым словарём пересчитывает действия
+    /// на существующем индексе (`with_actions` в spawn_blocking вне
+    /// write-лока кэша) и публикует результат — снимок маскирует по
+    /// НОВЫМ правилам, а не по действиям прежнего индекса.
+    #[tokio::test]
+    async fn policy_update_recomputes_index_actions() {
+        use crate::domain::{DictionaryIndex, PolicyRule, RuleAction, RuleSelector};
+
+        fn dictionary_rule(action: RuleAction) -> PolicyRule {
+            PolicyRule {
+                selector: RuleSelector::Dictionary,
+                pattern: "ORG".to_string(),
+                action,
+                category: "ORG".to_string(),
+                priority: 0,
+                rule_id: None,
+            }
+        }
+
+        let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+        let service = MaskingService::new(storage);
+        let database_id = Uuid::new_v4();
+        let dictionary: HashMap<String, String> =
+            [("СекретноеЗначение".to_string(), "ORG".to_string())]
+                .into_iter()
+                .collect();
+
+        // v1: keep — значение остаётся как есть.
+        let keep_rules = vec![dictionary_rule(RuleAction::Keep)];
+        let index = DictionaryIndex::build(&dictionary, &keep_rules).expect("index");
+        let snapshot = PolicySnapshot {
+            version: 1,
+            rules: keep_rules,
+            dictionary,
+            dictionary_index: Some(index),
+            ready: true,
+            ..PolicySnapshot::default()
+        };
+        service.set_policy_snapshot(database_id, snapshot).await;
+
+        // v2: mask при пустом словаре — пересчёт действий на индексе v1.
+        let update = PolicySnapshot {
+            version: 2,
+            rules: vec![dictionary_rule(RuleAction::Mask)],
+            ready: true,
+            ..PolicySnapshot::default()
+        };
+        service.set_policy_snapshot(database_id, update).await;
+
+        let merged = service
+            .policy_snapshot_view(database_id)
+            .await
+            .expect("snapshot");
+        assert!(!merged.dictionary.is_empty(), "словарь смержен из кэша");
+        assert!(merged.dictionary_index.is_some(), "индекс сохранён");
+
+        // Семантика: новое действие применено — значение маскируется.
+        let engine = MaskEngine::default();
+        let mappings = MappingStore::new(MappingLimits::default());
+        let output = engine
+            .mask(
+                &json!({"columns": ["префикс СекретноеЗначение суффикс"]}),
+                database_id,
+                "chat",
+                Uuid::new_v4(),
+                3600,
+                &merged,
+                &mappings,
+                &json!({}),
+            )
+            .expect("mask");
+        let rendered = serde_json::to_string(&output.value).unwrap();
+        assert!(
+            !rendered.contains("СекретноеЗначение"),
+            "действие keep устарело, значение должно маскироваться: {rendered}"
+        );
+        assert!(
+            output.reasons.iter().any(|code| code == "dictionary:ORG"),
+            "причина dictionary:ORG: {:?}",
+            output.reasons
+        );
+    }
+}
+//++agent TASK-225

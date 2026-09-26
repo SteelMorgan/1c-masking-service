@@ -238,14 +238,31 @@ pub fn empty_feed_responder(name: &str, _: &Value) -> Result<Value, String> {
 }
 
 /// Durable refresh intent 'full' — тот же INSERT, что Admin-мутации/startup.
+/// §8.1: повторная постановка — новая серия попыток (attempts/state/
+/// next_attempt_at сбрасываются как в upsert_intent_tx).
 pub fn enqueue_refresh_intent(storage: &SqliteStorage, database_id: Uuid) {
     storage
         .with_connection(|connection| {
             connection.execute(
                 "INSERT INTO v2_refresh_intents(database_id,phase,reason,actor_id,created_at)
                  VALUES (?1,'full','test',NULL,?2) ON CONFLICT(database_id) DO UPDATE SET
-                 created_at=excluded.created_at",
+                 created_at=excluded.created_at,
+                 attempts=0,state='pending',next_attempt_at=NULL",
                 rusqlite::params![database_id.to_string(), chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// §8.1 backoff: после transient-неудачи intent откладывается на
+/// next_attempt_at — в тестах «время прошло» моделируется сбросом поля.
+pub fn force_intent_due(storage: &SqliteStorage, database_id: Uuid) {
+    storage
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE v2_refresh_intents SET next_attempt_at=NULL WHERE database_id=?1",
+                [database_id.to_string()],
             )?;
             Ok(())
         })

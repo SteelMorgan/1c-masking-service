@@ -33,7 +33,64 @@ pub struct DatabaseSummary {
     /// колонки execute_query маскируются целиком вместо отказа.
     //++agent TASK-225
     pub strict_mode: bool,
+    //++agent TASK-225 [25.09.2026]
+    /// §8.4: состояние refresh pull-модели — очередь intent, backoff,
+    /// последняя ошибка и её текст по таблице §8.3.
+    //++agent TASK-225
+    pub refresh: RefreshStatus,
+    /// B2: состояние настройки `unconfigured|draft|active`, номера
+    /// активной версии и черновика (NULL при отсутствии).
+    //++agent TASK-225
+    pub setup_state: String,
+    pub active_version: Option<i64>,
+    pub draft_version: Option<i64>,
 }
+
+//++agent TASK-225 [25.09.2026]
+/// §8.4: поле `refresh` ответа B2. `state`:
+/// `idle` — очередь пуста, ошибок нет; `running` — intent ждёт ближайшего
+/// тика; `retrying` — серия неудач, повтор по backoff;
+/// `needs_attention` — автоматика остановлена; `failed` — последний pull
+/// завершился детерминированной ошибкой (intent снят).
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshStatus {
+    pub state: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_text: Option<String>,
+    pub first_failed_at: Option<String>,
+    pub last_success_at: Option<String>,
+}
+
+/// §8.3: текст причины последней неудачи для UI. `needs_attention`
+/// добавляет префикс с числом попыток и моментом первой неудачи серии.
+pub(crate) fn refresh_error_text(
+    code: &str,
+    needs_attention: bool,
+    attempts: i64,
+    first_failed_at: Option<&str>,
+) -> String {
+    let base = match code {
+        "MANAGER_UNAVAILABLE" => "Менеджер MCP недоступен: сервис не может получить метаданные и словарь базы. Проверьте, что менеджер запущен и база подключена в нём.".to_owned(),
+        "INTERNAL_TOOL_FAILED" => "База отклонила запрос метаданных/словаря (инструмент выгрузки вернул ошибку). Проверьте журнал регистрации базы.".to_owned(),
+        "STORAGE_UNAVAILABLE" => "Внутреннее хранилище сервиса занято или недоступно. Повтор будет автоматически.".to_owned(),
+        "POLICY_INVALID" => "Действующая настройка содержит правила, которые сервис пока не может применить (например, «Секрет»). Исправьте настройку.".to_owned(),
+        "METADATA_EMPTY" => "База вернула пустой список метаданных.".to_owned(),
+        "FEED_LIMIT_EXCEEDED" | "FEED_DICTIONARY_VALUE_LIMIT" => "Превышен лимит словаря (не более 100 источников / 1 000 000 значений). Сузьте словарь.".to_owned(),
+        "FEED_SECRET_SOURCE_FORBIDDEN" => "В словарь выбран реквизит-пароль или секрет — такие источники запрещены.".to_owned(),
+        other => format!("Не удалось обновить словарь: {other}. Обратитесь к разработчику сервиса."),
+    };
+    if needs_attention {
+        format!(
+            "Автоматические попытки остановлены после {attempts} неудач (с {}). Нажмите «Обновить метаданные», когда причина устранена. {base}",
+            first_failed_at.unwrap_or("—")
+        )
+    } else {
+        base
+    }
+}
+//++agent TASK-225
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatSummary {
@@ -169,6 +226,12 @@ pub struct ToolClassification {
 #[serde(deny_unknown_fields)]
 pub struct ToolClassificationPatch {
     pub class: String,
+    //++agent TASK-225 [26.09.2026]
+    /// B10: `metadata-bypass` — исключение инструмента из маскирования,
+    /// сервер требует явного подтверждения диалога С4.
+    //++agent TASK-225
+    #[serde(default)]
+    pub confirm_bypass: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +310,12 @@ pub struct PolicyRuleInput {
     pub category: String,
     #[serde(default)]
     pub priority: i64,
+    //++agent TASK-225 [26.09.2026]
+    /// §6.1: id строки policy_rules — заполняется только сервером при
+    /// чтении; из запроса не принимается (skip = не десериализуется).
+    //++agent TASK-225
+    #[serde(skip)]
+    pub rule_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +346,21 @@ pub enum HumanDataError {
     )]
     SecretPolicyUnsupported,
     //--agent TASK-221
+    //++agent TASK-225 [26.09.2026]
+    // §4 legacy POST /policies: черновик уже существует — версии хранят
+    // максимум один draft на базу (§2.2 частичный индекс).
+    #[error("draft already exists")]
+    DraftExists,
+    /// B10: metadata-bypass без confirm_bypass:true — серверный барьер
+    /// к подтверждающему диалогу С4 в UI.
+    #[error("metadata-bypass requires confirm_bypass")]
+    BypassNotConfirmed,
+    /// §4 legacy-activate: diff(active, черновик) содержит ослабления —
+    /// без подтверждений B7 они неактивируемы (барьер не обходится
+    /// старым маршрутом).
+    #[error("weakening not confirmed")]
+    WeakeningNotConfirmed(Vec<String>),
+    //++agent TASK-225
     #[error("human data storage is unavailable")]
     Unavailable,
 }
@@ -339,13 +423,16 @@ pub trait HumanDataStore: Send + Sync {
         path: &str,
         query: Option<&str>,
     ) -> Result<MetadataNodesPage, HumanDataError>;
+    /// §4 legacy-маршрут: правка переписывается на секцию dictionary
+    /// черновика (создаётся из активной при отсутствии). Возвращает
+    /// номер версии черновика для `draft_version` в ответе.
     fn put_dictionary_config(
         &self,
         actor: &Principal,
         database_id: Uuid,
         config: DictionaryConfig,
         correlation_id: Uuid,
-    ) -> Result<(), HumanDataError>;
+    ) -> Result<i64, HumanDataError>;
     fn list_policies(&self, database_id: Uuid) -> Result<Vec<PolicySummary>, HumanDataError>;
     fn create_policy(
         &self,

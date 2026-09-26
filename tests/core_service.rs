@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use common::{
     dictionary_page, dictionary_value, empty_feed_responder, enqueue_refresh_intent, failed_page,
-    metadata_item, metadata_page, pending_intent_count, pull_empty_cache, FakeManager,
-    DICTIONARY_TOOL, METADATA_TOOL,
+    force_intent_due, metadata_item, metadata_page, pending_intent_count, pull_empty_cache,
+    FakeManager, DICTIONARY_TOOL, METADATA_TOOL,
 };
 
 fn request_ids() -> (Uuid, Uuid, Uuid) {
@@ -55,6 +55,7 @@ fn expired_history_is_never_loaded_for_idempotent_retry() {
             86_400,
             None,
             Uuid::new_v4(),
+            None,
         )
         .unwrap();
     storage
@@ -232,6 +233,7 @@ async fn canonical_api_key_alias_is_cut_from_every_copy_before_mapping() {
                         action: RuleAction::Mask,
                         category: "TEST".to_owned(),
                         priority: 0,
+                        rule_id: None,
                     }],
                     ..PolicySnapshot::default()
                 },
@@ -466,6 +468,7 @@ async fn secret_dictionary_and_regex_rules_cut_entire_value_without_mapping() {
                         action: RuleAction::Secret,
                         category: "CREDENTIAL".to_owned(),
                         priority: 1,
+                        rule_id: None,
                     }],
                     dictionary,
                     ..PolicySnapshot::default()
@@ -537,6 +540,7 @@ async fn canonical_fio_source_overrides_keep_rule_and_missing_lineage_fails_clos
                     action: RuleAction::Keep,
                     category: "KEEP".to_owned(),
                     priority: 999,
+                    rule_id: None,
                 }],
                 ..PolicySnapshot::default()
             },
@@ -609,6 +613,7 @@ async fn canonical_full_name_source_masks_initials_despite_neutral_alias_and_kee
                     action: RuleAction::Keep,
                     category: "KEEP".to_owned(),
                     priority: 999,
+                    rule_id: None,
                 }],
                 ..PolicySnapshot::default()
             },
@@ -665,6 +670,7 @@ async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
                             action: RuleAction::Keep,
                             category: "KEEP".to_owned(),
                             priority: 999,
+                            rule_id: None,
                         },
                         PolicyRule {
                             selector: RuleSelector::SourcePath,
@@ -672,6 +678,7 @@ async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
                             action,
                             category: "STRICT".to_owned(),
                             priority: 0,
+                            rule_id: None,
                         },
                     ],
                     ..PolicySnapshot::default()
@@ -727,6 +734,7 @@ async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
                         action: RuleAction::Mask,
                         category: "TYPE".to_owned(),
                         priority: 0,
+                        rule_id: None,
                     }],
                     ..PolicySnapshot::default()
                 },
@@ -780,6 +788,7 @@ async fn active_secret_policy_cannot_publish_ready_pull() {
                 action: RuleAction::Secret,
                 category: "SECRET".to_owned(),
                 priority: 1,
+                rule_id: None,
             }],
         )
         .unwrap();
@@ -826,6 +835,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
                         action: RuleAction::Keep,
                         category: "CUSTOMER".to_owned(),
                         priority: 999,
+                        rule_id: None,
                     },
                     PolicyRule {
                         selector: RuleSelector::Name,
@@ -833,6 +843,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
                         action: RuleAction::Mask,
                         category: "CUSTOMER".to_owned(),
                         priority: 0,
+                        rule_id: None,
                     },
                     PolicyRule {
                         selector: RuleSelector::SourcePath,
@@ -840,6 +851,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
                         action: RuleAction::Secret,
                         category: "SECRET_PERSON".to_owned(),
                         priority: -100,
+                        rule_id: None,
                     },
                     PolicyRule {
                         selector: RuleSelector::Dictionary,
@@ -847,6 +859,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
                         action: RuleAction::Secret,
                         category: "SECRET_PERSON".to_owned(),
                         priority: -100,
+                        rule_id: None,
                     },
                 ],
                 dictionary: HashMap::from([(
@@ -1297,10 +1310,19 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
                     action: onec_masking_service::domain::RuleAction::Mask,
                     category: "INN".to_owned(),
                     priority: 10,
+                    rule_id: None,
                 }],
                 dictionary: HashMap::from([("ООО Ромашка".to_owned(), "ORG".to_owned())]),
+                dictionary_sources: HashMap::new(),
+                //++agent TASK-225 [26.09.2026]
+                // §5a: индекс словаря опционален — тестовый снимок идёт
+                // fallback-путём прямого перебора.
+                //++agent TASK-225
+                dictionary_index: None,
                 metadata_sources: Vec::new(),
                 ready: true,
+                policy_id: None,
+                dictionary_fingerprint: 0,
             },
         )
         .await;
@@ -1501,9 +1523,12 @@ async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
 
     // Restart: RAM-снапшот потерян, durable intent уже стоит (его не
     // перезаписывает startup-rewarm), pull поднимает готовность снова.
+    // Transient-неудача выше отложила intent (§8.1 backoff) — делаем его
+    // наступившим, чтобы тик поднял его сразу.
     let restarted = AppState::new(state.storage.clone(), "https://masking.test");
     assert!(!restarted.masking.database_ready(database_id).await);
     assert_eq!(pending_intent_count(&state.storage, database_id), 1);
+    force_intent_due(&state.storage, database_id);
     let recovered = FakeManager::spawn(|name, _| match name {
         METADATA_TOOL => Ok(metadata_page(
             vec![metadata_item(
@@ -1649,6 +1674,10 @@ async fn unavailable_manager_and_call_rejection_keep_durable_intent() {
     assert!(state.masking.database_ready(database_id).await);
 
     // Отказ уровня /internal/v1/tools/call (success:false в конверте).
+    // Новая очередь = новая серия (§8.2: аудируется первая неудача серии):
+    // enqueue сбрасывает attempts и делает intent наступившим, иначе
+    // transient-backoff отложил бы повтор.
+    enqueue_refresh_intent(&state.storage, database_id);
     let rejecting = FakeManager::spawn(|_, _| Err("INTERNAL_TOOL_FORBIDDEN".to_owned()));
     assert_eq!(
         state
@@ -1673,6 +1702,7 @@ async fn unavailable_manager_and_call_rejection_keep_durable_intent() {
     assert_eq!((unavailable, rejected), (1, 1));
 
     // Битая форма страницы — детерминированная ошибка: intent снимается.
+    enqueue_refresh_intent(&state.storage, database_id);
     let malformed = FakeManager::spawn(|name, _| match name {
         METADATA_TOOL => Ok(json!({
             "success": true,
@@ -1864,6 +1894,7 @@ async fn durable_intents_drain_per_database_and_isolate_failures() {
                 action: RuleAction::Secret,
                 category: "SECRET".to_owned(),
                 priority: 0,
+                rule_id: None,
             }],
         )
         .unwrap();
@@ -2200,6 +2231,7 @@ fn source_mask_rule(source_path: &str) -> onec_masking_service::domain::PolicyRu
         action: onec_masking_service::domain::RuleAction::Mask,
         category: "DATA".to_owned(),
         priority: 0,
+        rule_id: None,
     }
 }
 
@@ -2395,6 +2427,7 @@ fn service_start_purges_history_and_call_contexts() {
             86_400,
             None,
             Uuid::new_v4(),
+            None,
         )
         .unwrap();
     storage
@@ -2879,6 +2912,227 @@ fn storage_flip_to_disabled(storage: &SqliteStorage, database_id: Uuid) -> bool 
         .unwrap()
 }
 
+//++agent TASK-225 [26.09.2026] ревью-2 N-1
+// Эксплойт из ревью: `ВЫБРАТЬ "[MASK:…]" КАК` — токен раскрывается на
+// preflight, эхо разбора содержит исходное значение. По решению §12
+// вызов с расшифрованными токенами не получает свободный текст ошибки:
+// только код и позиция — ни в public_result, ни в durable-истории.
+#[tokio::test]
+async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let raw = "Скрытова Анна Петровна";
+
+    // Минтим токен через finalize data-mask результата.
+    let minted = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"ФИО": raw}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[{"name":"ФИО","sources":["Справочник.People.FullName"]}]}),
+                lineage: vec![
+                    json!({"column":"ФИО","source_path":"Справочник.People.FullName"}),
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    let masked: Value =
+        serde_json::from_str(minted.public_result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let token = masked["data"][0]["ФИО"].as_str().unwrap().to_owned();
+
+    // Эксплойт: токен внутри текста запроса + намеренная синтаксическая
+    // ошибка — preflight подставляет исходное значение в запрос.
+    let call_id = Uuid::new_v4();
+    let preflight = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"query": format!("ВЫБРАТЬ \"{token}\" КАК")}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(preflight.decision, "allow");
+    assert_eq!(
+        preflight.arguments["query"],
+        json!(format!("ВЫБРАТЬ \"{raw}\" КАК"))
+    );
+
+    // Граница отвечает QUERY_PARSE_ERROR с эхом запроса — уже с
+    // исходным значением внутри текста.
+    let echo = format!("{{(1, 15)}}: Ожидается имя\nВЫБРАТЬ \"{raw}\" КАК");
+    let finalized = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": false,
+                    "error": "QUERY_PARSE_ERROR",
+                    "message": echo,
+                    "position": "(1, 15)",
+                }),
+            },
+            field_sources: FieldSources {
+                schema: json!({}),
+                lineage: vec![],
+            },
+        })
+        .await
+        .unwrap();
+
+    let public = serde_json::to_string(&finalized.public_result).unwrap();
+    assert!(
+        !public.contains(raw),
+        "исходное значение утекло через QUERY_PARSE_ERROR: {public}"
+    );
+    assert!(
+        !public.contains("message"),
+        "message должен быть снят: {public}"
+    );
+    assert!(public.contains("QUERY_PARSE_ERROR"), "{public}");
+    assert!(public.contains("(1, 15)"), "позиция остаётся: {public}");
+
+    // Durable-история хранит тот же зачищенный результат.
+    let stored = state
+        .storage
+        .load_history(database_id, "chat-a", call_id)
+        .unwrap()
+        .expect("запись истории должна существовать");
+    let stored_text = serde_json::to_string(&stored.public_result).unwrap();
+    assert!(
+        !stored_text.contains(raw),
+        "история содержит сырое значение: {stored_text}"
+    );
+    assert!(!stored_text.contains("message"), "{stored_text}");
+}
+
+// Регрессия: вызов без токенов текст ошибки разбора сохраняет —
+// зачистка включается только флагом расшифрованных токенов.
+#[tokio::test]
+async fn parse_error_without_tokens_keeps_message() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let call_id = Uuid::new_v4();
+    let preflight = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"query": "ВЫБРАТЬ 1 КАК В"}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(preflight.decision, "allow");
+
+    let finalized = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": false,
+                    "error": "QUERY_PARSE_ERROR",
+                    "message": "{(1, 15)}: Ожидается имя\nВЫБРАТЬ 1 КАК <<?>>В",
+                    "position": "(1, 15)",
+                }),
+            },
+            field_sources: FieldSources {
+                schema: json!({}),
+                lineage: vec![],
+            },
+        })
+        .await
+        .unwrap();
+    let public = serde_json::to_string(&finalized.public_result).unwrap();
+    assert!(public.contains("QUERY_PARSE_ERROR"), "{public}");
+    assert!(
+        public.contains("Ожидается имя"),
+        "текст разбора без токенов доходит: {public}"
+    );
+}
+
+// Решение оркестратора по N-1: finalize без записи контекста вызова —
+// неизвестно, резолвились ли токены (строка могла быть вытерта
+// рестартом между preflight и finalize) ⇒ fail-closed: свободный текст
+// ошибки разбора снимается, код и позиция остаются.
+#[tokio::test]
+async fn parse_error_without_context_strips_text() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let call_id = Uuid::new_v4();
+
+    let finalized = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            database_id,
+            chat_id: "chat-noctx".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": false,
+                    "error": "QUERY_PARSE_ERROR",
+                    "message": "{(1, 15)}: Ожидается имя\nВЫБРАТЬ 1 КАК <<?>>В",
+                    "position": "(1, 15)",
+                }),
+            },
+            field_sources: FieldSources {
+                schema: json!({}),
+                lineage: vec![],
+            },
+        })
+        .await
+        .unwrap();
+
+    let public = serde_json::to_string(&finalized.public_result).unwrap();
+    assert!(public.contains("QUERY_PARSE_ERROR"), "{public}");
+    assert!(public.contains("(1, 15)"), "позиция остаётся: {public}");
+    assert!(
+        !public.contains("Ожидается имя"),
+        "без контекста текст не отдаём: {public}"
+    );
+
+    let stored = state
+        .storage
+        .load_history(database_id, "chat-noctx", call_id)
+        .unwrap()
+        .expect("запись истории должна существовать");
+    let stored_text = serde_json::to_string(&stored.public_result).unwrap();
+    assert!(stored_text.contains("QUERY_PARSE_ERROR"), "{stored_text}");
+    assert!(
+        !stored_text.contains("Ожидается имя"),
+        "в истории текст тоже зачищен: {stored_text}"
+    );
+}
+//++agent TASK-225
+
 #[tokio::test]
 async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
@@ -3197,6 +3451,7 @@ async fn sourceless_column_values_are_masked_like_regular_columns() {
                     action: RuleAction::Mask,
                     category: "TEST".to_owned(),
                     priority: 0,
+                    rule_id: None,
                 }],
                 ..PolicySnapshot::default()
             },
@@ -3529,5 +3784,90 @@ async fn strict_mode_keeps_verified_and_secret_columns_unchanged() {
     );
     // КОЛИЧЕСТВО(*) без маркера остаётся числом без маскирования.
     assert_eq!(row["К"], json!(27), "{text}");
+}
+//++agent TASK-225
+//++agent TASK-225 [26.09.2026]
+// Контракт границы: ошибка разбора запроса доходит до агента с платформенным
+// текстом (эхо его запроса); код QUERY_PARSE_ERROR и message проходят
+// через маскировку как обычные строки — словарное значение в тексте режется.
+#[tokio::test]
+async fn query_parse_error_envelope_survives_masking_with_text() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let dict_word = "секретная-строка-225";
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                dictionary: HashMap::from([(dict_word.to_owned(), "TEST".to_owned())]),
+                ready: true,
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let parse_text = "{(1,10)}: Ожидается имя <<?>>В";
+    for (message, survives) in [
+        (json!(parse_text), true),
+        (json!(format!("Ошибка у значения {dict_word}")), false),
+    ] {
+        let call_id = Uuid::new_v4();
+        // Решение оркестратора по N-1: текст доходит только когда
+        // контекст вызова есть и флаг токенов=0 — реальный путь,
+        // preflight перед finalize пишет контекст (флаг не ставится:
+        // в аргументах токенов нет). Без записи контекста — fail-closed,
+        // текст снимается (см. parse_error_without_context_strips_text).
+        state
+            .masking
+            .preflight(PreflightRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "chat-parse".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                arguments: json!({"query": "ВЫБРАТЬ 1"}),
+            })
+            .await
+            .unwrap();
+        let response = state
+            .masking
+            .finalize(FinalizeRequest {
+                schema_version: SCHEMA_VERSION,
+                call_id,
+                correlation_id: Uuid::new_v4(),
+                database_id,
+                chat_id: "chat-parse".to_owned(),
+                tool_name: "execute_query".to_owned(),
+                outcome: FinalizeOutcome::ToolResult {
+                    result: json!({
+                        "success": false,
+                        "error": "QUERY_PARSE_ERROR",
+                        "message": message,
+                    }),
+                },
+                field_sources: FieldSources::default(),
+            })
+            .await
+            .unwrap();
+        let public = serde_json::to_string(&response.public_result).unwrap();
+        assert!(public.contains("QUERY_PARSE_ERROR"), "{public}");
+        if survives {
+            assert!(public.contains("Ожидается имя"), "{public}");
+        }
+        assert!(!public.contains(dict_word), "{public}");
+    }
+    let stored: String = state
+        .storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT group_concat(public_result_json, ';') FROM history
+                 WHERE database_id=?1 AND chat_id='chat-parse'",
+                [database_id.to_string()],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert!(stored.contains("QUERY_PARSE_ERROR"));
+    assert!(!stored.contains(dict_word));
 }
 //++agent TASK-225

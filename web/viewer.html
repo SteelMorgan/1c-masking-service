@@ -28,6 +28,9 @@
       <div class="col">
         <h3>Базы</h3>
         <div class="list" id="dbList"><p class="empty">Загрузка…</p></div>
+        <!--++agent TASK-225 [26.09.2026 03:00:00] экспорт действующей настройки (B3v)-->
+        <button class="btn sm mt8" id="vExportBtn" type="button" hidden>Экспорт настройки…</button>
+        <!--++agent TASK-225-->
         <h3 id="chatsHead" hidden>Чаты</h3>
         <div class="list" id="chatList"></div>
       </div>
@@ -58,6 +61,9 @@
           </div>
           <div class="rep-side">
             <span class="tag mut" id="reportStatus"></span>
+            <!--++agent TASK-225 [26.09.2026 03:00:00] «Почему скрыто» (B9)-->
+            <button class="btn sm tgl" id="whyBtn" type="button"><i class="ii">i</i> Почему скрыто</button>
+            <!--++agent TASK-225-->
             <div class="pill" id="maskToggle" role="group" aria-label="Какие значения показать" hidden>
               <button type="button" data-view="real">Реальные</button>
               <button type="button" data-view="masked">Маскированные</button>
@@ -71,10 +77,29 @@
         <div class="note warn" id="revealWarn" hidden></div>
         <div class="note err" id="revealErr" hidden></div>
         <div id="reportBody"></div>
+        <!--++agent TASK-225 [26.09.2026 03:00:00] панель причин маскирования-->
+        <aside class="whyp" id="whyPanel" hidden>
+          <h3>Почему скрыто</h3>
+          <p class="small muted" id="whyVersion"></p>
+          <div class="note warn small" id="whyNote" hidden></div>
+          <div id="whyList"></div>
+          <p class="small muted" id="whyHint" hidden>Выбрана причина — подсвечены её ячейки. Клик по ячейке — её причины.</p>
+        </aside>
+        <!--++agent TASK-225-->
       </div>
     </div>
   </div>
 
+  <!--++agent TASK-225 [26.09.2026 03:00:00] экспорт действующей версии (Viewer: только active)-->
+  <div class="overlay" id="dlgVExport"><div class="card dialog">
+    <h2>Экспорт настройки</h2>
+    <div class="note err" id="vExErr" hidden role="alert"></div>
+    <p id="vExText">Будет выгружена действующая версия настройки маскирования базы.</p>
+    <label class="rad"><input type="checkbox" id="vExTools"> Включить режимы инструментов</label>
+    <div class="hintline"><span class="ii">i</span>Файл не содержит значений из базы — только пути, правила и обоснования. Скачивание записывается в журнал настройки.</div>
+    <div class="row right"><button class="btn" id="vExCancel" type="button">Отмена</button><button class="btn primary" id="vExGo" type="button">Скачать</button></div>
+  </div></div>
+  <!--++agent TASK-225-->
   <div class="overlay" id="dlgPass"><div class="card dialog">
     <h2>Смена пароля</h2>
     <div class="note err" id="passErr" hidden role="alert"></div>

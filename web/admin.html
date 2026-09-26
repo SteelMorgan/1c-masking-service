@@ -54,12 +54,22 @@
           </div>
           <div class="note err" id="dbNameErr" hidden role="alert"></div>
         </div>
+        <!--**agent TASK-225 [26.09.2026 01:40:00] фаза 3: вкладки карточки базы по макету —
+             «Справочники»+«Правила» объединены в «Настройка маскирования», добавлен журнал.
         <div class="tabs" id="dbTabs">
           <button class="on" data-dt="main" type="button">Основное</button>
           <button data-dt="tools" type="button">Инструменты</button>
           <button data-dt="dict" type="button">Справочники</button>
           <button data-dt="pol" type="button">Правила</button>
         </div>
+        -->
+        <div class="tabs dbtabs" id="dbTabs">
+          <button class="on" data-dt="main" type="button">Основное</button>
+          <button data-dt="setup" type="button">Настройка маскирования</button>
+          <button data-dt="tools" type="button">Инструменты<span class="badge" id="toolsBadge" hidden></span></button>
+          <button data-dt="journal" type="button">Журнал настройки</button>
+        </div>
+        <!--**agent TASK-225-->
 
         <div id="dt-main">
           <div class="field"><label>Маскирование</label>
@@ -85,11 +95,18 @@
           <div class="hint" id="ttlEffHint"></div>
           <!----agent TASK-224-->
           <div class="field"><label>Метаданные базы</label>
-            <div class="row"><button class="btn" id="refreshBtn" type="button">Обновить метаданные</button><span id="refreshState" class="tag mut">—</span></div></div>
+            <div class="row"><button class="btn" id="refreshBtn" type="button">Обновить метаданные</button><span id="refreshState" class="tag mut">—</span></div>
+            <!--++agent TASK-225 [26.09.2026 01:40:00] §8: причина последнего сбоя обновления
+                 (текст сервера как есть) и состояние backoff.-->
+            <div class="note warn mt8" id="refreshProblem" hidden role="status"></div>
+            <!--++agent TASK-225-->
+          </div>
           <div class="note err" id="mainErr" hidden role="alert"></div>
           <button class="btn primary" id="mainSave" type="button">Сохранить</button>
         </div>
 
+        <!--**agent TASK-225 [26.09.2026 01:40:00] С4: легенда режимов, метка «новый»,
+             фильтр новых, выбор режима select'ом; bypass — через диалог подтверждения.
         <div id="dt-tools" hidden>
           <div class="field"><input class="input" id="toolFilter" placeholder="Найти инструмент"></div>
           <div class="tablewrap"><table><thead><tr><th>Инструмент</th><th>Режим</th></tr></thead><tbody id="toolsBody"></tbody></table></div>
@@ -97,7 +114,28 @@
           <div class="note err" id="toolsErr" hidden role="alert"></div>
           <button class="btn primary" id="toolsSave" type="button" disabled>Сохранить изменения</button>
         </div>
+        -->
+        <div id="dt-tools" hidden>
+          <div class="legend3">
+            <div class="lc"><span class="tag acc">Маскировать данные</span><p>Ответ инструмента проходит через маскирование. Для всех инструментов, возвращающих данные базы.</p></div>
+            <div class="lc"><span class="tag warn">Без маскирования (только метаданные)</span><p>Ответ передаётся агенту как есть. Только для инструментов, которые гарантированно не возвращают данные: структура метаданных, справка.</p></div>
+            <div class="lc"><span class="tag err">Запрещён до проверки</span><p>Вызов отклоняется. Так работает любой новый инструмент, пока администратор не выберет режим.</p></div>
+          </div>
+          <p class="hintline"><span class="ii">i</span><span>Инструменты, которых нет в списке, запрещены. Новый инструмент появляется здесь автоматически при первом вызове с меткой «новый» — выберите для него режим.</span></p>
+          <div class="row spread mb8">
+            <div class="pill" id="toolsPill"><button type="button" data-f="all" class="on">Все</button><button type="button" data-f="new">Только новые</button></div>
+            <div class="dg-searchbox"><input class="input dg-search" id="toolFilter" placeholder="Найти инструмент"></div>
+          </div>
+          <div class="card flush"><div class="tablewrap"><table>
+            <thead><tr><th>Инструмент</th><th>Режим</th><th class="hide-sm">С какого времени</th><th class="hide-sm">Отклонено вызовов</th><th class="hide-sm">Кто изменил</th></tr></thead>
+            <tbody id="toolsBody"></tbody></table></div></div>
+          <div class="note err mt10" id="toolsErr" hidden role="alert"></div>
+          <div class="row mt10"><button class="btn primary" id="toolsSave" type="button" disabled>Сохранить изменения</button><button class="btn" id="toolsReset" type="button" hidden>Отменить изменения</button></div>
+        </div>
+        <!--**agent TASK-225-->
 
+        <!--**agent TASK-225 [26.09.2026 01:45:00] вкладки «Справочники» и «Правила» заменены
+             вкладкой «Настройка маскирования» (черновик/версии/мастер импорта) и журналом.
         <div id="dt-dict" hidden>
           <div class="field"><label>Что маскировать</label>
             <div class="seg" id="dictMode"><button type="button" data-mode="all">Все справочники</button><button type="button" data-mode="part">Только выбранные</button></div>
@@ -141,6 +179,190 @@
           <div class="note err" id="polErr" hidden role="alert"></div>
           <button class="btn" id="polNew" type="button">Новая версия на основе действующей</button>
         </div>
+        -->
+        <div id="dt-setup" hidden>
+          <div class="row spread mb14" id="verBar">
+            <span class="small muted" id="verInfo"></span>
+            <span class="row">
+              <span class="tag warn" id="verDictLoad" hidden></span>
+              <button class="btn sm" id="setupExportBtn" type="button">Экспорт</button>
+              <button class="btn sm" id="setupImportBtn" type="button">Импорт…</button>
+              <button class="btn sm" id="setupDraftBtn" type="button">Новый черновик</button>
+            </span>
+          </div>
+          <div class="note err" id="setupErr" hidden role="alert"></div>
+          <div class="note ok" id="setupOk" hidden role="status"></div>
+
+          <div class="card empty-state" id="setupEmpty" hidden>
+            <div class="big-ico" id="setupEmptyIco"></div>
+            <h2>Маскирование этой базы не настроено</h2>
+            <p class="muted">Сейчас работают только встроенные правила: пароли, ключи и токены вырезаются по имени поля, ФИО скрываются. Реквизиты базы (ИНН, счета, идентификаторы биржи) агент видит как есть.</p>
+            <div class="row center-row"><button class="btn primary" id="emptyImport" type="button">Импортировать стартовую настройку</button><button class="btn" id="emptyManual" type="button">Настроить вручную</button></div>
+            <div class="note warn" id="emptyNoManifest" hidden><b>Метаданные базы ещё не получены.</b> Импорт возможен, но проверить пути по метаданным не получится. <button class="btn link" id="emptyRefresh" type="button">Обновить метаданные</button></div>
+            <details class="howto" open><summary><b>Как получить файл стартовой настройки</b></summary>
+              <ol class="steps">
+                <li>Попросите агента: <span class="code plain"><span id="emptyAsk"></span><button class="copy-link" id="emptyAskCopy" type="button">копировать</button></span><span class="small muted">Агент прочитает метаданные на DEV-копии и сформирует файл <span class="mono">masking-setup-&lt;база&gt;-&lt;дата&gt;.json</span> с отчётом.</span></li>
+                <li>Проверьте отчёт агента: что и почему он предлагает скрыть.</li>
+                <li>Нажмите «Импортировать стартовую настройку» и выберите файл. Ничего не применится без вашего подтверждения.</li>
+              </ol>
+            </details>
+          </div>
+
+          <div id="setupWizard" hidden>
+            <ol class="wiz" id="wiz">
+              <li data-w="1"><i>1</i>Файл</li><li data-w="2"><i>2</i>Сравнение</li><li data-w="3"><i>3</i>Сухой прогон</li><li data-w="4"><i>4</i>Активация</li>
+            </ol>
+            <div class="wz" id="wz1">
+              <label class="drop" id="dropZone">
+                <span class="big-ico" id="dropIco"></span>
+                <b>Перетащите файл настройки</b> или <span class="btn link">выберите</span>
+                <span class="small muted dblock">.json, до 1 МБ</span>
+                <input type="file" id="importFile" accept=".json,application/json" hidden>
+              </label>
+              <div class="note err mt10" id="importErr" hidden role="alert"></div>
+              <div class="card mt10" id="importCard" hidden>
+                <div class="row spread"><h3 class="m0 brk" id="impName"></h3><span class="tag ok">Файл разобран</span></div>
+                <dl class="kv" id="impKv"></dl>
+                <div class="note warn" id="impMismatch" hidden></div>
+              </div>
+              <div class="row mt10 right"><button class="btn" id="wizCancel" type="button">Закрыть мастер</button><button class="btn primary" id="wizTo2" type="button" disabled>Далее: сравнение</button></div>
+            </div>
+            <div class="wz" id="wz2">
+              <div class="row spread mb14"><p class="m0 muted" id="cmpTitle"></p>
+                <div class="pill" id="cmpPill"><button type="button" data-f="chg" class="on">Только изменённые</button><button type="button" data-f="all">Все</button></div></div>
+              <div id="cmpBody"></div>
+              <div class="row mt10 right"><span class="small muted" id="leftHint"></span><button class="btn" id="wiz2Back" type="button">Назад</button><button class="btn primary" id="wizTo3" type="button">Далее: сухой прогон</button></div>
+            </div>
+            <div class="wz" id="wz3">
+              <div class="card" id="dryCard">
+                <div class="row spread"><div><h3 class="m0" id="dryTitle">Сухой прогон</h3><span class="small muted">50 последних записей истории · только маскированный вид, значения не показываются</span></div><button class="btn sm primary" id="dryRun" type="button">Запустить</button></div>
+                <div id="dryBody" class="mt10"></div>
+              </div>
+              <div class="row mt10 right"><button class="btn" id="wiz3Back" type="button">Назад</button><button class="btn primary" id="wizTo4" type="button">Далее: активация</button></div>
+            </div>
+            <div class="wz" id="wz4">
+              <div class="card">
+                <h2 id="actTitle">Активировать</h2>
+                <p id="actText"></p>
+                <ul class="checks" id="actChecks"></ul>
+                <div class="field"><label for="actComment">Комментарий к версии</label><input class="input" id="actComment" maxlength="500" placeholder="например: стартовая настройка от агента"></div>
+                <button class="btn primary" id="actBtn" type="button" disabled>Активировать</button>
+                <div class="hint" id="actHint"></div>
+                <div class="note err mt10" id="actErr" hidden role="alert"></div>
+                <div class="note ok mt10" id="actOk" hidden role="status"></div>
+              </div>
+              <div class="row mt10 right"><button class="btn" id="wiz4Back" type="button">Назад</button></div>
+            </div>
+          </div>
+
+          <div id="setupEditor" hidden>
+            <div class="subtabs" id="setupSub"><button type="button" data-st="dict" class="on">Словарь</button><button type="button" data-st="rules">Правила</button><button type="button" data-st="versions">Версии</button></div>
+            <div class="note info row spread" id="draftNote">
+              <span id="draftNoteText"></span>
+              <span class="row" id="draftNoteActs">
+                <button class="btn sm" id="draftCompare" type="button">Сравнить с действующей</button>
+                <button class="btn sm primary" id="draftActivate" type="button">Активировать…</button>
+                <button class="btn sm danger" id="draftDiscard" type="button">Удалить черновик</button>
+                <button class="btn sm primary" id="draftStart" type="button">Изменить — создать черновик</button>
+              </span>
+            </div>
+            <div class="note warn" id="draftConflict" hidden role="alert"></div>
+
+            <div id="st-dict">
+              <div class="field"><label>Что маскировать <span class="ii" title="Значения отмеченных реквизитов загружаются из базы. Если такое значение встретится в любом ответе агенту — в таблице, тексте или JSON — оно будет скрыто.">i</span></label>
+                <div class="seg" id="dictMode"><button type="button" data-mode="all">Все справочники</button><button type="button" data-mode="part">Только выбранные</button></div>
+                <div class="hint" id="dictModeHint"></div></div>
+              <div id="dictPart">
+                <div class="note warn" id="dictNoManifest" hidden>
+                  Метаданные базы ещё не получены — дерево и проверка путей недоступны. Уже выбранные источники сохранены в панели справа.
+                  <div class="row mt8"><button class="btn sm" id="dictRefresh" type="button">Обновить метаданные</button>
+                    <span id="dictRefreshState" class="tag mut"></span></div>
+                </div>
+                <div class="dictgrid">
+                  <div>
+                    <div class="row mb8">
+                      <div class="dg-searchbox"><input class="input dg-search" id="dictSearch" placeholder="Найти объект или реквизит"></div>
+                      <div class="pill" id="treeF"><button type="button" data-f="all" class="on">Всё дерево</button><button type="button" data-f="sel" title="Показать только реквизиты, выбранные как источники словаря, и путь к ним.">Только отмеченные</button><button type="button" data-f="chg" title="Показать только то, чем черновик отличается от действующей версии.">Только изменённые</button></div>
+                    </div>
+                    <div class="hintline legend"><span><input type="checkbox" checked disabled> источник словаря</span><span><i class="dot"></i> изменено в черновике</span><span class="warnc">⚠ путь не найден</span><span><span class="lock">П</span> пароль — маскируется всегда</span></div>
+                    <div class="mtree" id="dictTree"></div>
+                  </div>
+                  <div class="card p14 dictside">
+                    <div id="srcEditor" hidden>
+                      <div class="row spread"><span class="small muted">Источник словаря</span><button class="btn sm ghost" id="srcClose" type="button">← к списку</button></div>
+                      <h3 class="mono brk" id="srcPath"></h3>
+                      <div class="field"><label for="srcCat">Категория</label><input class="input" id="srcCat" maxlength="32" list="catList"></div>
+                      <div class="field"><label>Условие отбора строк <span class="ii" title="Из базы загружаются значения только тех строк, которые подходят под условие. Без условия — все строки.">i</span></label>
+                        <div class="cb" id="condBuilder"></div>
+                        <div class="phrase" id="condPhrase"></div>
+                        <div class="note err" id="condErr" hidden></div>
+                        <details><summary class="small">Показать JSON (только просмотр)</summary><pre class="report" id="condJson"></pre></details>
+                      </div>
+                      <div class="field"><label for="srcReason">Обоснование</label><input class="input" id="srcReason" maxlength="500"></div>
+                      <div class="row"><button class="btn primary sm" id="srcApply" type="button">Применить</button><button class="btn sm danger" id="srcRemove" type="button">Убрать из словаря</button></div>
+                    </div>
+                    <div id="srcListPane">
+                      <h3 class="m0">Что маскируется</h3>
+                      <div class="hint" id="dictCount"></div>
+                      <div id="dictSelList"></div>
+                      <div class="field mt10"><label for="dictCatDefault">Категория для новых источников</label>
+                        <input class="input" id="dictCatDefault" maxlength="32" placeholder="например, FIO" list="catList"></div>
+                      <div class="field"><label for="dictReasonDefault">Обоснование для новых источников</label>
+                        <input class="input" id="dictReasonDefault" maxlength="500"></div>
+                    </div>
+                  </div>
+                </div>
+                <details class="small mt10"><summary class="muted">Дополнительно — источник вручную</summary>
+                  <div class="card mt10 p14">
+                    <div class="grid2">
+                      <div class="field"><label for="dictPath">Источник (путь)</label><input class="input mono" id="dictPath" placeholder="Справочник.Контрагенты.ИНН"></div>
+                      <div class="field"><label for="dictCat">Категория</label><input class="input" id="dictCat" placeholder="inn" maxlength="32" list="catList"></div>
+                    </div>
+                    <div class="row mt8"><button class="btn" id="dictAdd" type="button">Добавить источник</button><span class="hint">Условие отбора — в панели источника после добавления.</span></div>
+                  </div>
+                </details>
+              </div>
+              <datalist id="catList"></datalist>
+              <div class="note err mt10" id="dictErr" hidden role="alert"></div>
+              <div class="row mt10"><button class="btn primary" id="dictSave" type="button">Сохранить в черновик</button><span class="hint" id="dictSaveHint"></span></div>
+            </div>
+
+            <div id="st-rules" hidden>
+              <div class="row spread mb8">
+                <p class="hintline m0"><span class="ii">i</span><span>Правило срабатывает по полю ответа: пути реквизита, имени поля, типу или шаблону значения. Первым решает самый точный уровень: правило по пути реквизита, затем по имени поля, затем по типу — и его действие применяется к полю целиком, в том числе «Не маскировать». Внутри уровня действует самое строгое: Секрет &gt; Скрыть &gt; Не маскировать; приоритет решает только между правилами с одинаковым действием.</span></p>
+                <div class="row"><div class="pill" id="rulesPill"><button type="button" data-f="all" class="on">Все</button><button type="button" data-f="chg" title="Показать только то, чем черновик отличается от действующей версии.">Только изменённые</button></div><button class="btn sm primary" id="ruleAdd" type="button">+ Правило</button></div>
+              </div>
+              <div class="card flush"><div class="tablewrap"><table>
+                <thead><tr><th title="Включено">Вкл</th><th>Что ищем</th><th>Значение</th><th>Действие</th><th class="hide-sm">Категория</th><th class="hide-sm">Приор.</th><th>Обоснование</th><th></th></tr></thead>
+                <tbody id="rulesBody"></tbody></table></div></div>
+              <div class="note err mt10" id="rulesErr" hidden role="alert"></div>
+              <div class="row mt10"><button class="btn primary" id="rulesSave" type="button" disabled>Сохранить в черновик</button><span class="hint" id="rulesSaveHint"></span></div>
+            </div>
+
+            <div id="st-versions" hidden>
+              <div class="card flush"><div class="tablewrap"><table>
+                <!--**agent TASK-225 [26.09.2026 04:00:00] D2: автор/дата из setup/versions
+                <thead><tr><th>Версия</th><th>Состояние</th><th>Правил</th><th></th></tr></thead>-->
+                <thead><tr><th>Версия</th><th>Состояние</th><th>Происхождение · автор · дата</th><th></th></tr></thead>
+                <!--**agent TASK-225-->
+                <tbody id="versionsBody"></tbody></table></div></div>
+              <div class="note err mt10" id="versionsErr" hidden role="alert"></div>
+              <div class="card mt10" id="rbCard" hidden>
+                <h2 id="rbTitle"></h2>
+                <p id="rbText"></p>
+                <div class="row"><button class="btn primary" id="rbGo" type="button">Перейти к сравнению</button><button class="btn" id="rbCancel" type="button">Отмена</button></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="dt-journal" hidden>
+          <div class="note err" id="journalErr" hidden role="alert"></div>
+          <div class="card flush"><div class="tablewrap"><table>
+            <thead><tr><th>Когда</th><th>Кто</th><th>Действие</th></tr></thead>
+            <tbody id="journalBody"></tbody></table></div></div>
+        </div>
+        <!--**agent TASK-225-->
       </div>
     </div>
   </div></section>
@@ -182,6 +404,51 @@
     <div class="field" id="userDeleteRow"><label>Учётная запись</label><button class="btn sm danger" id="userDelete" type="button">Удалить пользователя</button><div class="hint">Возможно только для пользователя, который ни разу не входил. Логин освобождается.</div></div>
     <div class="row"><button class="btn primary" id="userSave" type="button" disabled>Сохранить</button><button class="btn" id="userClose" type="button">Закрыть</button></div>
   </div></div>
+
+  <!--++agent TASK-225 [26.09.2026 01:50:00] диалоги фазы 3: правило, экспорт, bypass.-->
+  <div class="overlay" id="dlgRule"><div class="card dialog">
+    <h2 id="ruleDlgTitle">Новое правило</h2>
+    <div class="note err" id="ruleDlgErr" hidden role="alert"></div>
+    <div class="field"><label for="ruleSel">Что ищем</label><select class="input" id="ruleSel">
+      <option value="source_path">Путь реквизита</option><option value="name">Имя поля</option><option value="type">Тип</option><option value="dictionary">Категория словаря</option><option value="regex">Шаблон значения (регулярное выражение)</option></select>
+      <div class="hint" id="ruleSelHint"></div></div>
+    <div class="field"><label for="ruleValue" id="ruleValueLabel">Значение</label><input class="input mono" id="ruleValue" maxlength="4096"></div>
+    <div class="field" id="ruleTestsField" hidden><label>Тест-примеры</label>
+      <div class="tst"><span class="tag plain" id="tstMatchTag">совпадает</span><input class="input sm mono" id="tstMatch" placeholder="пример, который должен совпасть"></div>
+      <div class="tst"><span class="tag plain" id="tstNoTag">не совпадает</span><input class="input sm mono" id="tstNo" placeholder="пример, который не должен совпасть"></div>
+      <div class="hint">Живая проверка — движком браузера; окончательно шаблон проверяет сервер при сохранении.</div></div>
+    <div class="field"><label>Действие</label><div class="seg" id="ruleActSeg"><button type="button" data-a="secret" title="Значение вырезается полностью и не сохраняется. Раскрыть нельзя.">Секрет</button><button type="button" data-a="mask" title="Значение заменяется токеном. Посмотреть исходное можно в «Просмотре истории».">Скрыть</button><button type="button" data-a="keep" title="Разрешает показать поле агенту как есть.">Не маскировать</button></div></div>
+    <div class="note warn" id="ruleWeakNote" hidden>Это ослабление: подходящие поля станут видны агенту как есть. Правило «Не маскировать» по пути реквизита отменяет для поля и правила «Скрыть» по имени и типу, и словарь, и шаблоны. После активации его нужно будет подтвердить отдельно.</div>
+    <div class="note warn" id="ruleSecretNote" hidden>Сервис пока не активирует версии с правилами «Секрет»: такая версия сохранится в черновике, но активация будет отклонена. Для скрытия используйте «Скрыть» — пароли, ключи и токены по имени поля уже вырезаются встроенными правилами.</div>
+    <div class="grid2">
+      <div class="field"><label for="ruleCat">Категория</label><input class="input" id="ruleCat" maxlength="64" list="catList"></div>
+      <div class="field"><label for="rulePrio">Приоритет</label><input class="input" id="rulePrio" type="number" value="0" min="-1000000" max="1000000"></div>
+    </div>
+    <div class="field"><label for="ruleReason">Обоснование</label><input class="input" id="ruleReason" maxlength="500" placeholder="зачем это правило"></div>
+    <label class="rad"><input type="checkbox" id="ruleEnabled" checked> Правило включено</label>
+    <div class="row right mt10"><button class="btn" id="ruleCancel" type="button">Отмена</button><button class="btn primary" id="ruleOk" type="button">Добавить в черновик</button></div>
+  </div></div>
+
+  <div class="overlay" id="dlgExport"><div class="card dialog">
+    <h2>Экспорт настройки</h2>
+    <div class="field"><label>Что выгрузить</label>
+      <label class="rad"><input type="radio" name="exWhat" value="active" id="exActive"> <span id="exActiveLabel">Действующую версию</span></label>
+      <label class="rad"><input type="radio" name="exWhat" value="draft" id="exDraft"> <span id="exDraftLabel">Черновик</span></label>
+      <label class="rad"><input type="radio" name="exWhat" value="other" id="exOther"> Другую версию <select class="input sm wauto" id="exOtherSel"></select></label></div>
+    <label class="rad"><input type="checkbox" id="exTools"> Включить режимы инструментов</label>
+    <div class="hint mb14">Без флажка файл не меняет режимы инструментов при импорте. С флажком перевод инструмента в «Без маскирования» при импорте считается ослаблением и потребует подтверждения.</div>
+    <div class="field"><label>Имя файла</label><div class="code"><span id="exName"></span></div></div>
+    <p class="hintline"><span class="ii">i</span><span>Файл не содержит значений из базы — только пути, правила и обоснования. Его можно передать агенту или импортировать в другую базу с той же структурой метаданных.</span></p>
+    <div class="row right"><button class="btn" id="exCancel" type="button">Отмена</button><button class="btn primary" id="exGo" type="button">Скачать</button></div>
+  </div></div>
+
+  <div class="overlay" id="dlgBypass"><div class="card dialog">
+    <h2 id="bypassTitle"></h2>
+    <p>Всё, что вернёт этот инструмент, агент увидит без маскирования, включая значения из словаря и секреты. Выбирайте этот режим только для инструментов, которые не читают данные базы.</p>
+    <div class="note warn" id="bypassHeur" hidden></div>
+    <div class="row right"><button class="btn" id="bypassNo" type="button">Отмена</button><button class="btn danger" id="bypassYes" type="button">Отключить маскирование</button></div>
+  </div></div>
+  <!--++agent TASK-225-->
 
   <div class="overlay" id="dlgConfirm"><div class="card dialog">
     <h2 id="confirmTitle">Подтвердите действие</h2>

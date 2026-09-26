@@ -10,6 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use chrono::Utc;
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -50,6 +52,52 @@ struct FeedPage {
     #[serde(default)]
     manifest_digest: Option<String>,
 }
+
+//++agent TASK-225 [25.09.2026]
+/// §8.1: параметры backoff серии transient-неудач pull. Читаются из env
+/// при старте сервиса; jitter (±0.2) подаётся caller'ом отдельно, чтобы
+/// тесты оставались детерминированными.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PullRetryPolicy {
+    pub base_seconds: u64,
+    pub cap_seconds: u64,
+    pub max_attempts: u64,
+    /// Размах случайного джиттера (±span, доля от задержки). Тесты
+    /// выставляют `MASKING_PULL_RETRY_JITTER_SPAN=0` — задержка
+    /// становится точной, ассёрты детерминированы (без sleep).
+    pub jitter_span: f64,
+}
+
+impl PullRetryPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            base_seconds: super::bounded_env_usize("MASKING_PULL_RETRY_BASE_SECONDS", 10, 1, 3_600)
+                as u64,
+            cap_seconds: super::bounded_env_usize("MASKING_PULL_RETRY_CAP_SECONDS", 900, 1, 86_400)
+                as u64,
+            max_attempts: super::bounded_env_usize("MASKING_PULL_MAX_ATTEMPTS", 8, 1, 1_000) as u64,
+            jitter_span: std::env::var("MASKING_PULL_RETRY_JITTER_SPAN")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .map(|value| value.clamp(0.0, 0.5))
+                .unwrap_or(0.2),
+        }
+    }
+
+    /// delay = min(base·2^(attempts-1), cap)·(1+jitter), jitter∈[-0.2,0.2].
+    /// `attempts` — номер зафиксированной неудачи (первая неудача → base).
+    pub(crate) fn retry_delay_seconds(&self, attempts: u64, jitter: f64) -> u64 {
+        let shift = attempts.saturating_sub(1).min(20);
+        let base = self
+            .base_seconds
+            .saturating_mul(1u64 << shift)
+            .min(self.cap_seconds);
+        let span = self.jitter_span;
+        let jittered = (base as f64) * (1.0 + jitter.clamp(-span, span));
+        jittered.round().max(1.0) as u64
+    }
+}
+//++agent TASK-225
 
 /// Классификация сбоя pull: определяет судьбу durable intent и audit code.
 /// `Transient` — повтор на следующем тике (менеджер/сессия недоступны или
@@ -169,17 +217,25 @@ fn all_allowed_source_paths(rules: &[PolicyRule]) -> HashSet<&str> {
         .collect()
 }
 
-/// Общий предикат eligible metadata source для All-expansion:
-/// класс `Catalog.*`/`Справочник.*` (trusted manifest от BSL `ПолноеИмя()`
-/// локализует имя класса) + тип String/Строка + `!password_mode` +
-/// `!metadata_is_secret` + вхождение в Mask allowlist.
-fn all_expandable_metadata(item: &FeedMetadataItem, allowed: &HashSet<&str>) -> bool {
+//++agent TASK-225 [26.09.2026] §3.4: базовый предикат F9 без allowlist —
+/// нужен и diff (эффективный набор `mode=all` считается по правилам
+/// версии), и pull (allowlist из живого снимка). Источники иначе
+/// разошлись бы между diff и фактической раскладкой feed.
+pub(crate) fn metadata_expandable_basics(item: &FeedMetadataItem) -> bool {
     let field_type = item.field_type.to_lowercase();
     (item.source_path.starts_with("Catalog.") || item.source_path.starts_with("Справочник."))
         && (field_type.contains("string") || field_type.contains("строка"))
         && !item.password_mode
         && !metadata_is_secret(item)
-        && allowed.contains(item.source_path.as_str())
+}
+//++agent TASK-225
+
+/// Общий предикат eligible metadata source для All-expansion:
+/// класс `Catalog.*`/`Справочник.*` (trusted manifest от BSL `ПолноеИмя()`
+/// локализует имя класса) + тип String/Строка + `!password_mode` +
+/// `!metadata_is_secret` + вхождение в Mask allowlist.
+fn all_expandable_metadata(item: &FeedMetadataItem, allowed: &HashSet<&str>) -> bool {
+    metadata_expandable_basics(item) && allowed.contains(item.source_path.as_str())
 }
 
 fn metadata_is_secret(item: &FeedMetadataItem) -> bool {
@@ -232,37 +288,49 @@ impl MaskingService {
                     let _ = self
                         .storage
                         .audit_feed_pull_failed(intent.database_id, error.code());
-                    let _ = self.storage.delete_refresh_intent(intent.database_id);
-                }
-                Err(error @ PullError::Transient(_)) => {
-                    // Intent остаётся — следующий тик повторит pull, старый
-                    // snapshot при этом не тронут.
+                    //++agent TASK-225 [25.09.2026]
+                    // §8.1: детерминированный сбой — intent снимается, код и
+                    // время сохраняются в databases (B2 → refresh.state
+                    // "failed" до следующего успешного pull).
                     let _ = self
                         .storage
-                        .audit_feed_pull_failed(intent.database_id, error.code());
+                        .record_refresh_terminal_failure(intent.database_id, error.code());
+                    //++agent TASK-225
+                }
+                Err(error @ PullError::Transient(_)) => {
                     //++agent TASK-225 [25.09.2026]
-                    // Transient-отказы повторяются каждый тик без внешних
-                    // симптомов — нужен журнальный след, иначе висячий pull
-                    // невиден до ручного запроса к audit_events. Пишем
-                    // один раз на instance intent-а (created_at) + код,
-                    // иначе застрявший pull спамит лог каждым тиком.
-                    {
-                        let key = (intent.created_at.clone(), error.code());
-                        let should_log = self
-                            .feed_pull_log_dedup
-                            .lock()
-                            .map(|mut dedup| {
-                                let changed = dedup.get(&intent.database_id) != Some(&key);
-                                if changed {
-                                    dedup.insert(intent.database_id, key);
-                                }
-                                changed
-                            })
-                            .unwrap_or(false);
-                        if should_log {
-                            tracing::warn!(
-                                event = "feed_pull_failed",
+                    // §8.1: backoff — повтор откладывается на
+                    // next_attempt_at; по достижении max_attempts intent
+                    // уходит в needs_attention (ждёт Admin). §8.2: аудируются
+                    // только первая неудача серии и переход в
+                    // needs_attention — промежуточные повторы в debug,
+                    // иначе зависший pull спамил audit каждым тиком
+                    // (живая проблема: 6105 строк).
+                    let span = self.pull_retry.jitter_span;
+                    let jitter: f64 = if span > 0.0 {
+                        rand::thread_rng().gen_range(-span..=span)
+                    } else {
+                        0.0
+                    };
+                    let attempts_after = (intent.attempts.max(0) as u64).saturating_add(1);
+                    let delay = self.pull_retry.retry_delay_seconds(attempts_after, jitter);
+                    let next_attempt_at =
+                        (Utc::now() + chrono::Duration::seconds(delay.max(1) as i64)).to_rfc3339();
+                    if let Ok((attempts, needs_attention)) = self.storage.record_refresh_failure(
+                        intent.database_id,
+                        error.code(),
+                        &next_attempt_at,
+                        self.pull_retry.max_attempts,
+                    ) {
+                        if attempts == 1 || needs_attention {
+                            let _ = self
+                                .storage
+                                .audit_feed_pull_failed(intent.database_id, error.code());
+                        } else {
+                            tracing::debug!(
+                                event = "feed_pull_retry",
                                 database_id = %intent.database_id,
+                                attempts,
                                 code = error.code(),
                             );
                         }
@@ -328,6 +396,12 @@ impl MaskingService {
         let mut dictionary_values: Vec<FeedDictionaryValue> = Vec::new();
         let mut dictionary_bytes = 0usize;
         let mut dictionary_sources: HashSet<String> = HashSet::new();
+        //++agent TASK-225 [25.09.2026]
+        // §5a.3: статистика источников pull (source_path → категория,
+        // число значений, суммарный размер) — пишется в
+        // cache_generations.source_stats_json для B2/diff (SOURCE_LARGE).
+        let mut source_stats: BTreeMap<String, (String, u64, u64)> = BTreeMap::new();
+        //++agent TASK-225
         for selector in &selectors {
             let expected_source = selector["source_path"].as_str().unwrap_or_default();
             let expected_category = selector["category"].as_str().unwrap_or_default();
@@ -355,6 +429,15 @@ impl MaskingService {
                 if dictionary_bytes > MAX_DICTIONARY_VALUE_BYTES {
                     return Err(PullError::Invalid("FEED_LIMIT_EXCEEDED"));
                 }
+                //++agent TASK-225 [25.09.2026]
+                {
+                    let stat = source_stats
+                        .entry(item.source_path.clone())
+                        .or_insert_with(|| (item.category.clone(), 0, 0));
+                    stat.1 += 1;
+                    stat.2 = stat.2.saturating_add(item.value.len() as u64);
+                }
+                //++agent TASK-225
                 dictionary_values.push(item);
                 if dictionary_values.len() > MAX_DICTIONARY_VALUES {
                     return Err(PullError::Invalid("FEED_LIMIT_EXCEEDED"));
@@ -368,14 +451,50 @@ impl MaskingService {
             return Err(PullError::Invalid("FEED_SECRET_SOURCE_FORBIDDEN"));
         }
 
+        //++agent TASK-225 [25.09.2026]
+        // §5a.2: автомат словаря собирается до admission в spawn_blocking —
+        // сборка ~1М значений занимает секунды CPU и не должна занимать
+        // per-DB слот или блокировать executor-потоки.
+        let (snapshot_dictionary, dictionary_index) = {
+            let map: std::collections::HashMap<String, String> = dictionary_values
+                .iter()
+                .map(|item| (item.value.clone(), item.category.clone()))
+                .collect();
+            let index_rules = rules.clone();
+            tokio::task::spawn_blocking(move || {
+                let index = crate::domain::DictionaryIndex::build(&map, &index_rules);
+                (map, index)
+            })
+            .await
+            .map_err(|_| PullError::Transient("STORAGE_UNAVAILABLE"))?
+        };
+        //++agent TASK-225 [26.09.2026] D8: категория → путь источника
+        // для причин `dictionary` (§6.3); первый источник категории по
+        // порядку feed — значения всех источников категории делят путь.
+        let dictionary_sources: std::collections::HashMap<String, String> = {
+            let mut map = std::collections::HashMap::new();
+            for item in &dictionary_values {
+                map.entry(item.category.clone())
+                    .or_insert_with(|| item.source_path.clone());
+            }
+            map
+        };
+        //++agent TASK-225
         let mut snapshot = PolicySnapshot {
             version,
             rules: rules.clone(),
-            dictionary: dictionary_values
-                .iter()
-                .map(|item| (item.value.clone(), item.category.clone()))
-                .collect(),
+            dictionary: snapshot_dictionary,
+            dictionary_sources,
+            dictionary_index,
             metadata_sources: metadata.clone(),
+            //++agent TASK-225 [26.09.2026] §6.1: связь истории с версией.
+            policy_id: settings
+                .active_policy_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
+            // 0 = «не посчитан» — set_policy_snapshot вычислит вне лока.
+            dictionary_fingerprint: 0,
+            //++agent TASK-225
             ready: true,
         };
         snapshot
@@ -386,6 +505,8 @@ impl MaskingService {
                 action: RuleAction::Secret,
                 category: "SECRET".to_owned(),
                 priority: i64::MAX,
+                //++agent TASK-225 [26.09.2026] встроенные — без rule_id (§6.1).
+                rule_id: None,
             }));
 
         let digest = pull_digest(&metadata, &dictionary_values);
@@ -399,6 +520,22 @@ impl MaskingService {
             "dictionary_count": dictionary_values.len(),
         }))
         .unwrap_or_else(|_| "{}".to_owned());
+        //++agent TASK-225 [25.09.2026]
+        let source_stats_json = serde_json::to_string(
+            &source_stats
+                .iter()
+                .map(|(source_path, (category, values, bytes))| {
+                    json!({
+                        "source_path": source_path,
+                        "category": category,
+                        "values": values,
+                        "bytes": bytes,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_owned());
+        //++agent TASK-225
 
         // Durable commit и RAM swap атомарно относительно обработки вызовов:
         // per-DB admission удерживается только на короткую секцию commit —
@@ -416,6 +553,7 @@ impl MaskingService {
                 metadata.len(),
                 dictionary_values.len(),
                 &selectors_json,
+                &source_stats_json,
             )
             .map_err(|_| PullError::Transient("STORAGE_UNAVAILABLE"))?;
         self.policy_cache
@@ -444,6 +582,15 @@ impl MaskingService {
         let _ = self
             .storage
             .delete_refresh_intent_if_unchanged(database_id, &intent.created_at);
+        //++agent TASK-225 [25.09.2026]
+        // §8.2: успех после серии transient-неудач — одна строка аудита
+        // `feed.pull.recovered` с числом попыток.
+        if intent.attempts > 0 {
+            let _ = self
+                .storage
+                .audit_feed_pull_recovered(database_id, intent.attempts.max(0) as u64);
+        }
+        //++agent TASK-225
         Ok(())
     }
 
@@ -539,28 +686,58 @@ impl MaskingService {
         metadata: &[FeedMetadataItem],
         rules: &[PolicyRule],
     ) -> Result<Vec<Value>, &'static str> {
-        let Some((mode, source_paths_json, filter_ast_json)) = self
+        //++agent TASK-225 [26.09.2026]
+        // §2.5: селекторы словаря берутся из dictionary_json АКТИВНОЙ
+        // версии; legacy dictionary_configs — только fallback для баз без
+        // активной версии (переходный контур миграции).
+        let versioned = self
             .storage
-            .dictionary_config_row(database_id)
-            .map_err(|_| "STORAGE_UNAVAILABLE")?
-        else {
-            return Ok(Vec::new());
+            .with_connection(|connection| {
+                crate::storage::setup::active_dictionary_json(connection, database_id)
+            })
+            .map_err(|_| "STORAGE_UNAVAILABLE")?;
+        let (mode, configured) = if let Some(dictionary_json) = versioned {
+            let value: Value =
+                serde_json::from_str(&dictionary_json).map_err(|_| "DICTIONARY_CONFIG_INVALID")?;
+            let mode = value["mode"].as_str().unwrap_or_default().to_string();
+            let sources = value["sources"].clone();
+            (mode, sources)
+        } else {
+            let Some((mode, source_paths_json, filter_ast_json)) = self
+                .storage
+                .dictionary_config_row(database_id)
+                .map_err(|_| "STORAGE_UNAVAILABLE")?
+            else {
+                return Ok(Vec::new());
+            };
+            if filter_ast_json.is_some() {
+                // filter_ast живёт только внутри per-selector записей.
+                return Err("DICTIONARY_CONFIG_INVALID");
+            }
+            (
+                mode,
+                serde_json::from_str(&source_paths_json)
+                    .map_err(|_| "DICTIONARY_CONFIG_INVALID")?,
+            )
         };
-        if filter_ast_json.is_some() {
-            // filter_ast живёт только внутри per-selector записей.
-            return Err("DICTIONARY_CONFIG_INVALID");
-        }
         let configured: Vec<Value> =
-            serde_json::from_str(&source_paths_json).map_err(|_| "DICTIONARY_CONFIG_INVALID")?;
+            serde_json::from_value(configured).map_err(|_| "DICTIONARY_CONFIG_INVALID")?;
+        //++agent TASK-225
         if configured.len() > MAX_SELECTOR_COUNT {
             return Err("DICTIONARY_CONFIG_INVALID");
         }
         let normalize = |value: &Value| -> Result<Value, &'static str> {
             let object = value.as_object().ok_or("DICTIONARY_CONFIG_INVALID")?;
-            if !object
-                .keys()
-                .all(|key| matches!(key.as_str(), "source_path" | "category" | "filter_ast"))
-            {
+            //++agent TASK-225 [26.09.2026]
+            // Снимок версии несёт reason/estimated_values — служебные для
+            // селекторов ключи, пропускаем их (не часть провода).
+            //++agent TASK-225
+            if !object.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "source_path" | "category" | "filter_ast" | "reason" | "estimated_values"
+                )
+            }) {
                 return Err("DICTIONARY_CONFIG_INVALID");
             }
             let source = object

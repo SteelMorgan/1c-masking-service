@@ -209,5 +209,11 @@ pub struct RefreshIntent {
     pub reason: Option<String>,
     pub actor_id: Option<Uuid>,
     pub created_at: String,
+    //++agent TASK-225 [25.09.2026]
+    /// §8.1: число transient-неудач текущей серии и состояние очереди
+    /// (`pending` — worker берёт, `needs_attention` — ждёт Admin).
+    //++agent TASK-225
+    pub attempts: i64,
+    pub state: String,
 }
 //++agent TASK-222

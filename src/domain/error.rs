@@ -26,6 +26,12 @@ pub enum ErrorCode {
     MappingUnavailable,
     TerminalAlreadyRecorded,
     CallConflict,
+    //++agent TASK-225 [26.09.2026]
+    /// ОВ-2/Б12: у базы нет активной версии настройки (404).
+    NoActiveVersion,
+    /// §5.7: повторный сухой прогон базы, пока идёт текущий (409).
+    DryRunBusy,
+    //--agent TASK-225
 }
 
 impl ErrorCode {
@@ -44,6 +50,10 @@ impl ErrorCode {
             Self::MappingUnavailable => "MAPPING_UNAVAILABLE",
             Self::TerminalAlreadyRecorded => "TERMINAL_ALREADY_RECORDED",
             Self::CallConflict => "CALL_CONFLICT",
+            //++agent TASK-225
+            Self::NoActiveVersion => "NO_ACTIVE_VERSION",
+            Self::DryRunBusy => "DRY_RUN_BUSY",
+            //--agent TASK-225
         }
     }
 }
@@ -65,6 +75,10 @@ impl ServiceError {
             | ErrorCode::CallConflict
             | ErrorCode::TerminalAlreadyRecorded => (StatusCode::CONFLICT, false),
             ErrorCode::DatabaseIdentityUnverified => (StatusCode::BAD_REQUEST, false),
+            //++agent TASK-225
+            ErrorCode::NoActiveVersion => (StatusCode::NOT_FOUND, false),
+            ErrorCode::DryRunBusy => (StatusCode::CONFLICT, false),
+            //--agent TASK-225
             ErrorCode::PolicyInvalid => (StatusCode::UNPROCESSABLE_ENTITY, false),
             ErrorCode::ResultLimitExceeded => (StatusCode::PAYLOAD_TOO_LARGE, false),
             ErrorCode::MaskingTimeout | ErrorCode::ServiceNotReady => {
@@ -99,6 +113,9 @@ impl ServiceError {
             ErrorCode::DatabaseIdentityUnverified => "Идентичность базы не подтверждена",
             ErrorCode::ResultLimitExceeded => "Размер результата превышает допустимый предел",
             ErrorCode::TerminalAlreadyRecorded => "Завершение вызова уже зафиксировано",
+            //++agent TASK-225
+            ErrorCode::NoActiveVersion => "Активная версия настройки не найдена",
+            //--agent TASK-225
             _ => "Операция временно недоступна",
         }
     }

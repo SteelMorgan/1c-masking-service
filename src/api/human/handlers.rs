@@ -72,6 +72,9 @@ pub struct HistoryQuery {
 pub struct MetadataQuery {
     pub path: Option<String>,
     pub q: Option<String>,
+    //++agent TASK-225 [26.09.2026] B13: плоский список полей объекта.
+    pub fields_of: Option<String>,
+    //++agent TASK-225
 }
 
 #[derive(Serialize)]
@@ -694,6 +697,15 @@ pub async fn database_metadata(
         .q
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
+    //++agent TASK-225 [26.09.2026] B13: fields_of=<Класс.Объект> —
+    // плоский список полей для редактора фильтров (≤512 символов).
+    if let Some(object) = query.fields_of {
+        if object.len() > 512 {
+            return ApiError::bad_request("fields_of длиннее 512 символов").into_response();
+        }
+        return Json(super::setup::fields_of_view(&state.setup, id, &object)).into_response();
+    }
+    //++agent TASK-225
     if path.len() > 512 || q.as_deref().is_some_and(|v| v.len() > 128) {
         return ApiError::bad_request("Слишком длинный path или q").into_response();
     }
@@ -761,13 +773,19 @@ pub async fn put_dictionary_config(
         Err(e) => return e.into_response(),
     };
     config.id = config_id;
+    //++agent TASK-225 [26.09.2026] M-4: правка идёт в черновик —
+    // ответ прежний по коду, плюс номер версии черновика (spec §4).
     match state
         .data
         .put_dictionary_config(&actor, id, config, Uuid::new_v4())
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(draft_version) => Json(serde_json::json!({
+            "draft_version": draft_version,
+        }))
+        .into_response(),
         Err(e) => data_error(e).into_response(),
     }
+    //++agent TASK-225
 }
 
 pub async fn policies(
@@ -822,14 +840,17 @@ pub async fn activate_policy(
     }
 }
 
-fn admin_mutation(state: &HumanState, headers: &HeaderMap) -> Result<Principal, ApiError> {
+pub(crate) fn admin_mutation(
+    state: &HumanState,
+    headers: &HeaderMap,
+) -> Result<Principal, ApiError> {
     if !same_origin(headers, &state.expected_origin) {
         return Err(ApiError::forbidden());
     }
     authorize(state, headers, Some(Role::Admin), true)
 }
 
-fn authorize(
+pub(crate) fn authorize(
     state: &HumanState,
     headers: &HeaderMap,
     required_role: Option<Role>,
@@ -868,7 +889,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
         })
 }
 
-fn same_origin(headers: &HeaderMap, expected_origin: &str) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap, expected_origin: &str) -> bool {
     headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -894,7 +915,7 @@ fn valid_database_patch(patch: &AdminDatabasePatch) -> bool {
         })
 }
 
-fn data_error(error: HumanDataError) -> ApiError {
+pub(crate) fn data_error(error: HumanDataError) -> ApiError {
     match error {
         HumanDataError::NotFound => ApiError::not_found(),
         HumanDataError::MappingUnavailable => {
@@ -907,6 +928,27 @@ fn data_error(error: HumanDataError) -> ApiError {
             "Secret-правила недоступны до включения предменеджерной защиты",
         ),
         //--agent TASK-221
+        //++agent TASK-225 [26.09.2026]
+        HumanDataError::DraftExists => ApiError::conflict_code(
+            "DRAFT_EXISTS",
+            "Черновик настройки уже существует — правьте его или удалите",
+        ),
+        //++agent TASK-225 [26.09.2026] §4 legacy-activate: 409 + ids.
+        HumanDataError::WeakeningNotConfirmed(missing) => ApiError::coded(
+            StatusCode::CONFLICT,
+            "WEAKENING_NOT_CONFIRMED",
+            "ослабления требуют явного подтверждения",
+            Some(serde_json::json!({"missing": missing})),
+        ),
+        //++agent TASK-225
+        HumanDataError::BypassNotConfirmed => ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "BYPASS_NOT_CONFIRMED",
+            message:
+                "Режим «метаданные без маскирования» требует явного подтверждения (confirm_bypass)",
+            details: None,
+        },
+        //++agent TASK-225
         HumanDataError::Unavailable => ApiError::unavailable(),
     }
 }
@@ -921,83 +963,123 @@ struct ErrorBody<'a> {
     code: &'a str,
     message: &'a str,
     correlation_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    details: Option<serde_json::Value>,
 }
 
 impl ApiError {
-    fn unauthorized() -> Self {
+    //++agent TASK-225 [26.09.2026]
+    /// Произвольный код/статус и details — ошибки setup API (§4)
+    /// несут структурные payloads (`missing`, `unknown`, `errors` …).
+    pub(crate) fn coded(
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+        details: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message,
+            details,
+        }
+    }
+
+    pub(crate) fn not_found_code(code: &'static str, message: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+            message,
+            details: None,
+        }
+    }
+    //++agent TASK-225
+
+    pub(crate) fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "AUTHENTICATION_FAILED",
             message: GENERIC_LOGIN_MESSAGE,
+            details: None,
         }
     }
-    fn forbidden() -> Self {
+    pub(crate) fn forbidden() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "FORBIDDEN",
             message: "Операция запрещена",
+            details: None,
         }
     }
-    fn rate_limited() -> Self {
+    pub(crate) fn rate_limited() -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: "AUTHENTICATION_FAILED",
             message: GENERIC_LOGIN_MESSAGE,
+            details: None,
         }
     }
-    fn invalid_activation() -> Self {
+    pub(crate) fn invalid_activation() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "ACTIVATION_FAILED",
             message: "Активация недоступна",
+            details: None,
         }
     }
-    fn password_policy() -> Self {
+    pub(crate) fn password_policy() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "PASSWORD_POLICY",
             message: "Новый пароль должен содержать от 12 до 1024 символов",
+            details: None,
         }
     }
-    fn bad_request(message: &'static str) -> Self {
+    pub(crate) fn bad_request(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST",
             message,
+            details: None,
         }
     }
-    fn not_found() -> Self {
+    pub(crate) fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "NOT_FOUND",
             message: "Запись не найдена",
+            details: None,
         }
     }
-    fn conflict() -> Self {
+    pub(crate) fn conflict() -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code: "CONFLICT",
             message: "Операция недоступна в текущем состоянии",
+            details: None,
         }
     }
-    fn conflict_code(code: &'static str, message: &'static str) -> Self {
+    pub(crate) fn conflict_code(code: &'static str, message: &'static str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code,
             message,
+            details: None,
         }
     }
-    fn unavailable() -> Self {
+    pub(crate) fn unavailable() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "SERVICE_NOT_READY",
             message: "Операция временно недоступна",
+            details: None,
         }
     }
 }
@@ -1011,6 +1093,7 @@ impl IntoResponse for ApiError {
                     code: self.code,
                     message: self.message,
                     correlation_id: Uuid::new_v4(),
+                    details: self.details,
                 },
             }),
         )
