@@ -118,7 +118,7 @@
         <div id="dt-tools" hidden>
           <div class="legend3">
             <div class="lc"><span class="tag acc">Маскировать данные</span><p>Ответ инструмента проходит через маскирование. Для всех инструментов, возвращающих данные базы.</p></div>
-            <div class="lc"><span class="tag warn">Без маскирования (только метаданные)</span><p>Ответ передаётся агенту как есть. Только для инструментов, которые гарантированно не возвращают данные: структура метаданных, справка.</p></div>
+            <div class="lc"><span class="tag warn">Без маскирования</span><p>Ответ передаётся агенту как есть. Только для инструментов, которые не возвращают данных базы: метаданные, проверка синтаксиса, управление окнами и служебные операции.</p></div>
             <div class="lc"><span class="tag err">Запрещён до проверки</span><p>Вызов отклоняется. Так работает любой новый инструмент, пока администратор не выберет режим.</p></div>
           </div>
           <p class="hintline"><span class="ii">i</span><span>Инструменты, которых нет в списке, запрещены. Новый инструмент появляется здесь автоматически при первом вызове с меткой «новый» — выберите для него режим.</span></p>
@@ -127,7 +127,8 @@
             <div class="dg-searchbox"><input class="input dg-search" id="toolFilter" placeholder="Найти инструмент"></div>
           </div>
           <div class="card flush"><div class="tablewrap"><table>
-            <thead><tr><th>Инструмент</th><th>Режим</th><th class="hide-sm">С какого времени</th><th class="hide-sm">Отклонено вызовов</th><th class="hide-sm">Кто изменил</th></tr></thead>
+            <!--++agent TASK-225 [26.09.2026] + колонка «Удалить» (снятие записи классификации).-->
+            <thead><tr><th>Инструмент</th><th>Режим</th><th class="hide-sm">С какого времени</th><th class="hide-sm">Отклонено вызовов</th><th class="hide-sm">Кто изменил</th><th></th></tr></thead>
             <tbody id="toolsBody"></tbody></table></div></div>
           <div class="note err mt10" id="toolsErr" hidden role="alert"></div>
           <div class="row mt10"><button class="btn primary" id="toolsSave" type="button" disabled>Сохранить изменения</button><button class="btn" id="toolsReset" type="button" hidden>Отменить изменения</button></div>
@@ -329,7 +330,7 @@
 
             <div id="st-rules" hidden>
               <div class="row spread mb8">
-                <p class="hintline m0"><span class="ii">i</span><span>Правило срабатывает по полю ответа: пути реквизита, имени поля, типу или шаблону значения. Первым решает самый точный уровень: правило по пути реквизита, затем по имени поля, затем по типу — и его действие применяется к полю целиком, в том числе «Не маскировать». Внутри уровня действует самое строгое: Секрет &gt; Скрыть &gt; Не маскировать; приоритет решает только между правилами с одинаковым действием.</span></p>
+                <p class="hintline m0"><span class="ii">i</span><span>Правило срабатывает по полю ответа: пути реквизита, имени поля, типу или шаблону значения. Первым решает самый точный уровень: правило по пути реквизита, затем по имени поля, затем по типу — «Скрыть» и «Секрет» применяются к полю целиком, а «Не маскировать» снимает только эту структурную маску: словарь и шаблоны внутри значения продолжают действовать. Внутри уровня действует самое строгое: Секрет &gt; Скрыть &gt; Не маскировать; приоритет решает только между правилами с одинаковым действием.</span></p>
                 <div class="row"><div class="pill" id="rulesPill"><button type="button" data-f="all" class="on">Все</button><button type="button" data-f="chg" title="Показать только то, чем черновик отличается от действующей версии.">Только изменённые</button></div><button class="btn sm primary" id="ruleAdd" type="button">+ Правило</button></div>
               </div>
               <div class="card flush"><div class="tablewrap"><table>
@@ -417,8 +418,8 @@
       <div class="tst"><span class="tag plain" id="tstMatchTag">совпадает</span><input class="input sm mono" id="tstMatch" placeholder="пример, который должен совпасть"></div>
       <div class="tst"><span class="tag plain" id="tstNoTag">не совпадает</span><input class="input sm mono" id="tstNo" placeholder="пример, который не должен совпасть"></div>
       <div class="hint">Живая проверка — движком браузера; окончательно шаблон проверяет сервер при сохранении.</div></div>
-    <div class="field"><label>Действие</label><div class="seg" id="ruleActSeg"><button type="button" data-a="secret" title="Значение вырезается полностью и не сохраняется. Раскрыть нельзя.">Секрет</button><button type="button" data-a="mask" title="Значение заменяется токеном. Посмотреть исходное можно в «Просмотре истории».">Скрыть</button><button type="button" data-a="keep" title="Разрешает показать поле агенту как есть.">Не маскировать</button></div></div>
-    <div class="note warn" id="ruleWeakNote" hidden>Это ослабление: подходящие поля станут видны агенту как есть. Правило «Не маскировать» по пути реквизита отменяет для поля и правила «Скрыть» по имени и типу, и словарь, и шаблоны. После активации его нужно будет подтвердить отдельно.</div>
+    <div class="field"><label>Действие</label><div class="seg" id="ruleActSeg"><button type="button" data-a="secret" title="Значение вырезается полностью и не сохраняется. Раскрыть нельзя.">Секрет</button><button type="button" data-a="mask" title="Значение заменяется токеном. Посмотреть исходное можно в «Просмотре истории».">Скрыть</button><button type="button" data-a="keep" title="Снимает структурную маску поля (по пути/имени/типу); словарь и шаблоны внутри значения продолжают действовать.">Не маскировать</button></div></div>
+    <div class="note warn" id="ruleWeakNote" hidden>Это ослабление: поле лишается структурной маски. Правило «Не маскировать» по пути реквизита отменяет для поля структурные правила «Скрыть» по имени и типу, но словарь и шаблоны продолжают маскировать значения внутри поля. После активации его нужно будет подтвердить отдельно.</div>
     <div class="note warn" id="ruleSecretNote" hidden>Сервис пока не активирует версии с правилами «Секрет»: такая версия сохранится в черновике, но активация будет отклонена. Для скрытия используйте «Скрыть» — пароли, ключи и токены по имени поля уже вырезаются встроенными правилами.</div>
     <div class="grid2">
       <div class="field"><label for="ruleCat">Категория</label><input class="input" id="ruleCat" maxlength="64" list="catList"></div>

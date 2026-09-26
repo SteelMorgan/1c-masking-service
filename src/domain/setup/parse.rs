@@ -952,13 +952,13 @@ fn parse_tools(issues: &mut Issues, value: Option<&Value>) -> Option<Vec<ToolSpe
             "mode",
         );
         let mode = match mode.as_deref() {
-            Some("data-mask") | Some("metadata-bypass") | Some("deny-pending-review") => mode,
+            Some("data-mask") | Some("no-mask") | Some("deny-pending-review") => mode,
             _ => {
                 if mode.is_some() {
                     issues.push(
                         "SETUP_FIELD_INVALID",
                         format!("{at}.mode"),
-                        "mode ∈ data-mask|metadata-bypass|deny-pending-review".to_string(),
+                        "mode ∈ data-mask|no-mask|deny-pending-review".to_string(),
                         None,
                     );
                 }
@@ -1443,5 +1443,27 @@ mod tests {
         assert!(outcome.truncated);
         assert_eq!(outcome.errors.len(), SETUP_MAX_ERRORS);
     }
+
+    //++agent TASK-225 [26.09.2026] L R4-8: переименованный класс
+    // (миграция 0015) в файле отвергается — обратной совместимости со
+    // старым именем нет.
+    #[test]
+    fn tool_mode_metadata_bypass_rejected() {
+        let mut body = base_body();
+        mutate(
+            &mut body,
+            "/tools",
+            serde_json::json!([{
+                "tool": "execute_query",
+                "mode": "metadata-bypass",
+                "reason": "старое имя"
+            }]),
+        );
+        let outcome = parse_setup_body(&serde_json::to_vec(&body).unwrap());
+        assert!(outcome.parsed.is_none());
+        let found = find_issue(&outcome, "SETUP_FIELD_INVALID").expect("code");
+        assert_eq!(found.at, "$.tools[0].mode");
+    }
+    //++agent TASK-225
 }
 //++agent TASK-225

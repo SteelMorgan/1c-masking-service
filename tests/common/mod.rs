@@ -131,13 +131,21 @@ async fn serve(
         .lock()
         .unwrap()
         .push((name.clone(), arguments.clone()));
-    let payload = match responder(&name, &arguments) {
-        Ok(result) => json!({"success": true, "result": result}),
-        Err(code) => json!({"success": false, "error": {"code": code, "message": code}}),
+    //++agent TASK-225 [26.09.2026]
+    // Реальный менеджер отказы уровня вызова отдаёт не-2xx статусом
+    // (`503 no_target` и т.п.) — фейк повторяет, иначе не покрыть разбор
+    // конверта ошибки на не-2xx ответе.
+    let (status, payload) = match responder(&name, &arguments) {
+        Ok(result) => ("200 OK", json!({"success": true, "result": result})),
+        Err(code) => (
+            "503 Service Unavailable",
+            json!({"success": false, "error": {"code": code, "message": code}}),
+        ),
     };
+    //++agent TASK-225
     let payload = serde_json::to_vec(&payload).unwrap();
     let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         payload.len()
     );
     writer.write_all(response.as_bytes()).await?;
@@ -296,3 +304,41 @@ pub async fn pull_empty_cache(state: &AppState, database_id: Uuid) -> FakeManage
     fake
 }
 //++agent TASK-222
+
+//++agent TASK-225 [26.09.2026] N
+/// Кластерный сервер тестовых баз (Srvr из строки соединения).
+pub const TEST_CLUSTER_SERVER: &str = "test-srv";
+
+/// `Ref` тестовой базы — уникален для `database_id`, чтобы строки
+/// разных баз не схлопывались по координатам.
+pub fn test_infobase_name(database_id: Uuid) -> String {
+    format!("test-ib-{database_id}")
+}
+
+/// Второй GUID пары — детерминирован от `database_id` (instance_id
+/// "<cluster>|<infobase>" уникален per база).
+pub fn test_infobase_guid(database_id: Uuid) -> Uuid {
+    Uuid::from_u128(database_id.as_u128() ^ 0x5a5a_5a5a_5a5a_5a5a_5a5a_5a5a_5a5a_5a5a)
+}
+
+/// Identity с ras-ключом `ras:<id>:<derived>` — та же, что кладёт
+/// `seed_database`, — запросы резолвятся в посаженную запись по точному
+/// совпадению `instance_id`.
+pub fn test_identity(database_id: Uuid) -> onec_masking_service::domain::DatabaseIdentity {
+    onec_masking_service::domain::DatabaseIdentity {
+        instance_id: format!("ras:{}:{}", database_id, test_infobase_guid(database_id)),
+        cluster_server: TEST_CLUSTER_SERVER.to_owned(),
+        infobase_name: test_infobase_name(database_id),
+    }
+}
+
+/// Посадка записи с заданным id и `test_identity` координатами.
+pub fn seed_database(
+    storage: &SqliteStorage,
+    database_id: Uuid,
+) -> onec_masking_service::domain::DatabaseSettings {
+    storage
+        .insert_database(database_id, &test_identity(database_id))
+        .unwrap()
+}
+//++agent TASK-225

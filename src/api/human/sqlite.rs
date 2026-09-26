@@ -8,8 +8,8 @@ use crate::{
     api::human::model::{refresh_error_text, RefreshStatus},
     auth::Principal,
     domain::{
-        DatabaseMode, ErrorCode, MaskingService, PolicyRule, PolicySnapshot, RuleAction,
-        RuleSelector, ToolClass,
+        DatabaseIdentity, DatabaseMode, ErrorCode, MaskingService, PolicyRule, PolicySnapshot,
+        RuleAction, RuleSelector, ToolClass,
     },
     storage::{valid_filter_ast, SqliteStorage},
 };
@@ -65,7 +65,8 @@ impl HumanDataStore for SqliteHumanDataStore {
                         i.state,i.attempts,i.next_attempt_at,i.last_error_code,i.first_failed_at,
                         d.last_refresh_error_code,d.last_refresh_error_at,d.last_refresh_ok_at,
                         (SELECT p.version FROM policies p WHERE p.database_id=d.id AND p.status='active'),
-                        (SELECT p.version FROM policies p WHERE p.database_id=d.id AND p.status='draft')
+                        (SELECT p.version FROM policies p WHERE p.database_id=d.id AND p.status='draft'),
+                        d.cluster_server,d.infobase_name,d.instance_id
                  FROM databases d
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
                  LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
@@ -128,6 +129,14 @@ impl HumanDataStore for SqliteHumanDataStore {
                     setup_state: setup_state(active_version, draft_version),
                     active_version,
                     draft_version,
+                    //++agent TASK-225 [26.09.2026] O2: координаты
+                    // отображаемые; источник выводится из префикса
+                    // ключа (`ras:`/`gen:`; иное — legacy-ключ, NULL).
+                    cluster_server: row.get(19)?,
+                    infobase_name: row.get(20)?,
+                    guid_source: DatabaseIdentity::guid_source(&row.get::<_, String>(21)?)
+                        .map(str::to_owned),
+                    //++agent TASK-225
                 })
             })?.collect();
             //++agent TASK-222
@@ -349,17 +358,14 @@ impl HumanDataStore for SqliteHumanDataStore {
         patch: ToolClassificationPatch,
         correlation_id: Uuid,
     ) -> Result<(), HumanDataError> {
-        if tool_name.is_empty()
-            || tool_name.len() > 128
-            || ToolClass::try_from(patch.class.as_str()).is_err()
-        {
+        if tool_name.is_empty() || ToolClass::try_from(patch.class.as_str()).is_err() {
             return Err(HumanDataError::Conflict);
         }
         //++agent TASK-225 [26.09.2026]
-        // B10: серверный барьер к диалогу С4 — metadata-bypass исключает
+        // B10: серверный барьер к диалогу С4 — no-mask исключает
         // инструмент из маскирования, подтверждение обязательно.
         //++agent TASK-225
-        if patch.class == "metadata-bypass" && !patch.confirm_bypass {
+        if patch.class == "no-mask" && !patch.confirm_bypass {
             return Err(HumanDataError::BypassNotConfirmed);
         }
         //++agent TASK-222 [05.10.2026]
@@ -371,6 +377,35 @@ impl HumanDataStore for SqliteHumanDataStore {
         //++agent TASK-225
         self.storage.with_connection(|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let now=Utc::now().to_rfc3339(); tx.execute("INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at,auto_added) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(database_id,tool_name) DO UPDATE SET class=excluded.class,reviewer=excluded.reviewer,updated_at=excluded.updated_at,auto_added=0",params![database_id.to_string(),tool_name,patch.class,actor.user_id.to_string(),now])?; audit(&tx,actor,"tool.update",database_id,correlation_id,&now)?; tx.commit() }).map_err(sql_error)
         //++agent TASK-222
+    }
+
+    //++agent TASK-225 [26.09.2026]
+    // DELETE: та же транзакция и аудит, что у PUT; удаление строки —
+    // единственная семантика (классификация — живое состояние, не
+    // версионируемая настройка, поэтому в setup-версии не пишется).
+    //++agent TASK-225
+    fn delete_tool_classification(
+        &self,
+        actor: &Principal,
+        database_id: Uuid,
+        tool_name: &str,
+        correlation_id: Uuid,
+    ) -> Result<(), HumanDataError> {
+        if tool_name.is_empty() {
+            return Err(HumanDataError::Conflict);
+        }
+        self.storage
+            .with_connection(|c| {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now = Utc::now().to_rfc3339();
+                let affected =
+                    delete_tool_row(&tx, actor, database_id, tool_name, correlation_id, &now)?;
+                if affected == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                tx.commit()
+            })
+            .map_err(sql_error)
     }
 
     fn list_dictionary_configs(
@@ -729,6 +764,7 @@ impl HumanDataStore for SqliteHumanDataStore {
                             database_id,
                         )?,
                         database_mismatch: false,
+                        to_is_import: target.is_import(),
                     };
                     //++agent TASK-225
                     //++agent TASK-225 [26.09.2026] B-1: отсутствие активной
@@ -997,6 +1033,46 @@ pub(crate) fn audit(
     tx.execute("INSERT INTO audit_events(actor_kind,actor_id,action,database_id,outcome,correlation_id,created_at) VALUES ('human',?1,?2,?3,'success',?4,?5)",params![a.user_id.to_string(),action,db.to_string(),corr.to_string(),now])?;
     Ok(())
 }
+
+//++agent TASK-225 [26.09.2026] R4-9
+/// Аудит с машиночитаемой деталью в `code` — имя инструмента для
+/// tool.delete (иначе по журналу не восстановить, что удалили).
+pub(crate) fn audit_tool(
+    tx: &rusqlite::Transaction<'_>,
+    a: &Principal,
+    action: &str,
+    db: Uuid,
+    tool_name: &str,
+    corr: Uuid,
+    now: &str,
+) -> rusqlite::Result<()> {
+    tx.execute("INSERT INTO audit_events(actor_kind,actor_id,action,database_id,code,outcome,correlation_id,created_at) VALUES ('human',?1,?2,?3,?4,'success',?5,?6)",params![a.user_id.to_string(),action,db.to_string(),tool_name,corr.to_string(),now])?;
+    Ok(())
+}
+
+/// Единственный путь удаления классификации инструмента: строка
+/// tool_classifications + аудит `tool.delete` с именем — в вызвавшей
+/// транзакции. Возвращает число затронутых строк (0 → вызывающий
+/// решает: DELETE-endpoint отвечает 404, активация — просто идёт
+/// дальше, инструмента уже нет).
+pub(crate) fn delete_tool_row(
+    tx: &rusqlite::Transaction<'_>,
+    a: &Principal,
+    db: Uuid,
+    tool_name: &str,
+    corr: Uuid,
+    now: &str,
+) -> rusqlite::Result<usize> {
+    let affected = tx.execute(
+        "DELETE FROM tool_classifications WHERE database_id=?1 AND tool_name=?2",
+        params![db.to_string(), tool_name],
+    )?;
+    if affected > 0 {
+        audit_tool(tx, a, "tool.delete", db, tool_name, corr, now)?;
+    }
+    Ok(affected)
+}
+//++agent TASK-225
 
 //++agent TASK-222 [05.10.2026]
 /// Tx-scoped durable refresh intent: phase всегда 'full' — pull refresh

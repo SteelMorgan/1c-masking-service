@@ -31,13 +31,24 @@ fn get_request(uri: &str) -> Request<Body> {
 
 /// База + активная версия (version=5) со словарём, правилом и классификацией.
 fn seed_active_setup(storage: &SqliteStorage, database_id: Uuid) {
+    //++agent TASK-225 [26.09.2026] N: запись сажается с координатами —
+    // экспорт адресуется identity, а не внутренним id.
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
+    assert!(storage
+        .set_database_mode(
+            database_id,
+            onec_masking_service::domain::DatabaseMode::Enabled
+        )
+        .unwrap());
     storage
         .with_connection(|connection| {
             connection.execute(
-                "INSERT INTO databases(id,instance_id,mode,display_label,created_at,updated_at)
-                 VALUES (?1,?2,'enabled','Demo DB','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-                rusqlite::params![database_id.to_string(), format!("inst-{database_id}")],
+                "UPDATE databases SET display_label='Demo DB' WHERE id=?1",
+                [database_id.to_string()],
             )?;
+            //++agent TASK-225
             connection.execute(
                 "INSERT INTO policies(id,database_id,version,status,dictionary_json,origin,created_at)
                  VALUES (?1,?2,5,'active',?3,'migration','2026-01-01T00:00:00Z')",
@@ -71,7 +82,8 @@ fn seed_active_setup(storage: &SqliteStorage, database_id: Uuid) {
             )?;
             connection.execute(
                 "INSERT INTO tool_classifications(database_id,tool_name,class,reviewer,updated_at)
-                 VALUES (?1,'execute_query','data-mask','admin','2026-01-01T00:00:00Z')",
+                 VALUES (?1,'execute_query','data-mask','admin','2026-01-01T00:00:00Z')
+                 ON CONFLICT(database_id,tool_name) DO UPDATE SET class='data-mask'",
                 [database_id.to_string()],
             )?;
             Ok(())
@@ -89,7 +101,8 @@ async fn setup_export_returns_active_version_and_audits_agent() {
 
     let response = app
         .oneshot(get_request(&format!(
-            "/internal/v1/setup/export?database_id={database_id}&include_tools=1"
+            "/internal/v1/setup/export?database_id={}&include_tools=1",
+            database_id
         )))
         .await
         .unwrap();
@@ -112,7 +125,10 @@ async fn setup_export_returns_active_version_and_audits_agent() {
     let rule = &body["rules"][0];
     assert_eq!(rule["selector"], "regex");
     assert_eq!(rule["enabled"], false);
-    assert_eq!(rule["reason"], "не указано (создано до TASK-225)");
+    assert_eq!(
+        rule["reason"],
+        "не указано (создано до версионирования настройки)"
+    );
     assert!(rule.get("rule_id").is_none() && rule.get("id").is_none());
     assert_eq!(rule["tests"]["match"][0], "abc");
     // tools_json у версии нет → текущие tool_classifications.
@@ -150,7 +166,8 @@ async fn setup_export_omits_tools_without_flag() {
 
     let response = app
         .oneshot(get_request(&format!(
-            "/internal/v1/setup/export?database_id={database_id}"
+            "/internal/v1/setup/export?database_id={}",
+            database_id
         )))
         .await
         .unwrap();
@@ -169,22 +186,24 @@ async fn setup_export_is_404_without_active_version() {
 
     // База существует, но версий нет вовсе.
     let database_id = Uuid::new_v4();
+    //++agent TASK-225 [26.09.2026] N
     storage
-        .with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO databases(id,instance_id,mode,created_at,updated_at)
-                 VALUES (?1,?2,'enabled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-                rusqlite::params![database_id.to_string(), format!("inst-{database_id}")],
-            )?;
-            Ok(())
-        })
+        .insert_database(database_id, &common::test_identity(database_id))
         .unwrap();
+    assert!(storage
+        .set_database_mode(
+            database_id,
+            onec_masking_service::domain::DatabaseMode::Enabled
+        )
+        .unwrap());
+    //++agent TASK-225
 
     for id in [database_id, Uuid::new_v4()] {
         let response = app
             .clone()
             .oneshot(get_request(&format!(
-                "/internal/v1/setup/export?database_id={id}"
+                "/internal/v1/setup/export?database_id={}",
+                id
             )))
             .await
             .unwrap();

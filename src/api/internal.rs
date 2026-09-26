@@ -93,7 +93,8 @@ async fn preflight(
     tracing::info!(
         event = "call_preflight",
         %correlation_id,
-        database_id = %request.database_id,
+        cluster_server = %request.identity.cluster_server,
+        infobase_name = %request.identity.infobase_name,
         tool = %request.tool_name,
     );
     //++agent TASK-225
@@ -130,7 +131,8 @@ async fn finalize(
     tracing::info!(
         event = "call_finalize",
         %correlation_id,
-        database_id = %request.database_id,
+        cluster_server = %request.identity.cluster_server,
+        infobase_name = %request.identity.infobase_name,
         tool = %request.tool_name,
         outcome = outcome_kind,
     );

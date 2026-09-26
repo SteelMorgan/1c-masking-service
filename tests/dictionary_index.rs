@@ -498,7 +498,8 @@ fn wildcard_name_match_is_unicode_case_insensitive() {
     assert_eq!(neutral, "8-905-111-22-33", "{masked}");
 }
 
-// T10-08: бюджет сборки и запроса на 1М значениях (§5a.4).
+// T10-08: время прогрева (сборки автомата) и запроса на 1М значениях (§5a.4).
+// Эта же оценка — основа `retry_after_s` у SERVICE_WARMING_UP.
 // Игнорируется в обычном прогоне — запуск `cargo test -- --ignored`.
 #[test]
 #[ignore]
@@ -522,7 +523,7 @@ fn bench_dictionary_automaton_1m() {
     let started = Instant::now();
     let index = DictionaryIndex::build(&dictionary, &[]).expect("index");
     let build_elapsed = started.elapsed();
-    println!("build 1M: {build_elapsed:?} (budget 10s)");
+    println!("build 1M: {build_elapsed:?} (время прогрева, лимит 10s)");
     assert!(build_elapsed.as_secs() <= 10, "build {build_elapsed:?}");
 
     let snapshot = PolicySnapshot {
@@ -640,7 +641,7 @@ fn bench_dictionary_keep_automaton_1m() {
     let started = Instant::now();
     let index = DictionaryIndex::build(&dictionary, &rules).expect("index");
     let build_elapsed = started.elapsed();
-    println!("build 1M keep: {build_elapsed:?} (budget 10s)");
+    println!("build 1M keep: {build_elapsed:?} (время прогрева, лимит 10s)");
     assert!(build_elapsed.as_secs() <= 10, "build {build_elapsed:?}");
 
     let snapshot = PolicySnapshot {

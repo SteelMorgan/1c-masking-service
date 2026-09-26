@@ -124,7 +124,16 @@ impl PullError {
 impl From<ManagerClientError> for PullError {
     fn from(error: ManagerClientError) -> Self {
         match error {
-            ManagerClientError::Rejected { .. } => Self::Transient("INTERNAL_TOOL_FAILED"),
+            //++agent TASK-225 [26.09.2026]
+            // K/N: менеджер жив и отвечает, но не может передать запрос
+            // базе — это не «менеджер недоступен». `no_target` — сессия
+            // этой ИБ сейчас неактивна: повторяем, сессия может
+            // подключиться сама.
+            ManagerClientError::Rejected { code } => match code.as_str() {
+                "no_target" => Self::Transient("DATABASE_NOT_CONNECTED"),
+                _ => Self::Transient("INTERNAL_TOOL_FAILED"),
+            },
+            //++agent TASK-225
             ManagerClientError::Transport
             | ManagerClientError::Timeout
             | ManagerClientError::InvalidResponse => Self::Transient("MANAGER_UNAVAILABLE"),
@@ -359,6 +368,11 @@ impl MaskingService {
         if settings.mode != DatabaseMode::Enabled {
             return Err(PullError::Skipped);
         }
+        //++agent TASK-225 [26.09.2026] O2: маршрут feed-вызова — точный
+        // ключ instance_id записи; менеджер сопоставляет сессию только
+        // по нему.
+        let identity = settings.call_identity();
+        //++agent TASK-225
         let (version, rules) = if let Some(policy_id) = settings.active_policy_id.as_deref() {
             self.storage
                 .active_policy(database_id, policy_id)
@@ -374,7 +388,13 @@ impl MaskingService {
         }
 
         let metadata_pages = self
-            .pull_pages(client, database_id, METADATA_TOOL, &metadata_selector())
+            .pull_pages(
+                client,
+                &identity,
+                database_id,
+                METADATA_TOOL,
+                &metadata_selector(),
+            )
             .await?;
         if !metadata_pages.dictionary_values.is_empty() {
             return Err(PullError::Invalid("RESULT_INVALID"));
@@ -406,7 +426,7 @@ impl MaskingService {
             let expected_source = selector["source_path"].as_str().unwrap_or_default();
             let expected_category = selector["category"].as_str().unwrap_or_default();
             let pages = self
-                .pull_pages(client, database_id, DICTIONARY_TOOL, selector)
+                .pull_pages(client, &identity, database_id, DICTIONARY_TOOL, selector)
                 .await?;
             if !pages.metadata.is_empty() {
                 return Err(PullError::Invalid("RESULT_INVALID"));
@@ -455,19 +475,41 @@ impl MaskingService {
         // §5a.2: автомат словаря собирается до admission в spawn_blocking —
         // сборка ~1М значений занимает секунды CPU и не должна занимать
         // per-DB слот или блокировать executor-потоки.
-        let (snapshot_dictionary, dictionary_index) = {
-            let map: std::collections::HashMap<String, String> = dictionary_values
-                .iter()
-                .map(|item| (item.value.clone(), item.category.clone()))
-                .collect();
-            let index_rules = rules.clone();
+        //++agent TASK-225 [26.09.2026] фаза-2 C
+        // Пропуск пересборки по отпечатку: словарь не изменился → индекс
+        // переиспользуется через дешёвый `with_actions` (автомат значений
+        // внутри него сохраняется; сборка ~10с/1М значений не нужна).
+        // Отпечаток считается в spawn_blocking (O(n) вне executor-
+        // потоков), отпечаток и Arc индекса текущего снимка читаются
+        // под read-локом до него.
+        let map: std::collections::HashMap<String, String> = dictionary_values
+            .iter()
+            .map(|item| (item.value.clone(), item.category.clone()))
+            .collect();
+        // Автомат строится по правилам файла без встроенных
+        // секретных путей — как было до фазы-2.
+        let index_rules = rules.clone();
+        let (existing_fingerprint, existing_index) = self
+            .policy_cache
+            .read()
+            .await
+            .get(&database_id)
+            .map(|s| (s.dictionary_fingerprint, s.dictionary_index.clone()))
+            .unwrap_or_default();
+        let (snapshot_dictionary, new_fingerprint, dictionary_index) =
             tokio::task::spawn_blocking(move || {
-                let index = crate::domain::DictionaryIndex::build(&map, &index_rules);
-                (map, index)
+                let fingerprint = crate::domain::dictionary_fingerprint(&map);
+                let index = match existing_index
+                    .filter(|_| fingerprint != 0 && fingerprint == existing_fingerprint)
+                {
+                    Some(index) => Some(index.with_actions(&index_rules)),
+                    None => crate::domain::DictionaryIndex::build(&map, &index_rules),
+                };
+                (map, fingerprint, index)
             })
             .await
-            .map_err(|_| PullError::Transient("STORAGE_UNAVAILABLE"))?
-        };
+            .map_err(|_| PullError::Transient("STORAGE_UNAVAILABLE"))?;
+        //++agent TASK-225
         //++agent TASK-225 [26.09.2026] D8: категория → путь источника
         // для причин `dictionary` (§6.3); первый источник категории по
         // порядку feed — значения всех источников категории делят путь.
@@ -480,9 +522,18 @@ impl MaskingService {
             map
         };
         //++agent TASK-225
-        let mut snapshot = PolicySnapshot {
+        let mut snapshot_rules = rules;
+        snapshot_rules.extend(password_paths.iter().map(|path| PolicyRule {
+            selector: RuleSelector::SourcePath,
+            pattern: (*path).to_owned(),
+            action: RuleAction::Secret,
+            category: "SECRET".to_owned(),
+            priority: i64::MAX,
+            rule_id: None,
+        }));
+        let snapshot = PolicySnapshot {
             version,
-            rules: rules.clone(),
+            rules: snapshot_rules,
             dictionary: snapshot_dictionary,
             dictionary_sources,
             dictionary_index,
@@ -492,23 +543,14 @@ impl MaskingService {
                 .active_policy_id
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok()),
-            // 0 = «не посчитан» — set_policy_snapshot вычислит вне лока.
-            dictionary_fingerprint: 0,
+            //++agent TASK-225 [26.09.2026] фаза-2 C: отпечаток посчитан
+            // при pull — следующий pull с тем же словарём пропустит
+            // пересборку автомата (см. выше), а set_policy_snapshot
+            // получит корректный MINOR-9-ключ сравнения.
+            dictionary_fingerprint: new_fingerprint,
             //++agent TASK-225
             ready: true,
         };
-        snapshot
-            .rules
-            .extend(password_paths.into_iter().map(|path| PolicyRule {
-                selector: RuleSelector::SourcePath,
-                pattern: path.to_owned(),
-                action: RuleAction::Secret,
-                category: "SECRET".to_owned(),
-                priority: i64::MAX,
-                //++agent TASK-225 [26.09.2026] встроенные — без rule_id (§6.1).
-                rule_id: None,
-            }));
-
         let digest = pull_digest(&metadata, &dictionary_values);
         let target_version = self
             .storage
@@ -600,6 +642,7 @@ impl MaskingService {
     async fn pull_pages(
         &self,
         client: &ManagerClient,
+        identity: &crate::domain::DatabaseIdentity,
         database_id: Uuid,
         tool: &str,
         selector: &Value,
@@ -616,7 +659,7 @@ impl MaskingService {
                 "cursor": cursor.clone().map_or(Value::Null, Value::String),
             });
             let result = client
-                .call_tool(database_id, tool, &arguments)
+                .call_tool(identity, tool, &arguments)
                 .await
                 .map_err(PullError::from)?;
             let page: FeedPage = serde_json::from_value(tool_result_value(&result)?)

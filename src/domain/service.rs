@@ -18,10 +18,10 @@ pub(crate) use dictionary_feed::metadata_expandable_basics;
 use crate::storage::{HistoryWrite, SqliteStorage, TerminalWrite};
 
 use super::{
-    DatabaseMode, ErrorCode, FeedMetadataItem, FinalizeOutcome, FinalizeRequest, FinalizeResponse,
-    MappingLimits, MappingStore, MaskEngine, PolicySnapshot, PreflightRequest, PreflightResponse,
-    ServiceError, TerminalEventRequest, TerminalEventResponse, TerminalScopeKind, ToolClass,
-    SCHEMA_VERSION,
+    DatabaseIdentity, DatabaseMode, ErrorCode, FeedMetadataItem, FinalizeOutcome, FinalizeRequest,
+    FinalizeResponse, MappingLimits, MappingStore, MaskEngine, PolicySnapshot, PreflightRequest,
+    PreflightResponse, ServiceError, TerminalEventRequest, TerminalEventResponse,
+    TerminalScopeKind, ToolClass, SCHEMA_VERSION,
 };
 
 type CallKey = (Uuid, String, Uuid);
@@ -31,6 +31,11 @@ const VERIFIED_TERMINAL_CODES: &[&str] = &[
     "TOOL_PENDING_REVIEW",
     "MASK_TOKEN_INVALID",
     "SERVICE_NOT_READY",
+    //++agent TASK-225 [26.09.2026] фаза-2 L: менеджер пишет терминал на
+    // каждый отказ preflight — включая SERVICE_WARMING_UP (фаза-2 C).
+    // Без кода в этом списке outbox менеджера ретраил запись бесконечно.
+    "SERVICE_WARMING_UP",
+    //++agent TASK-225
     "POLICY_INVALID",
     "RESULT_LIMIT_EXCEEDED",
     "MASKING_TIMEOUT",
@@ -112,7 +117,7 @@ impl MaskingService {
         // нельзя раскрыть. Нераскрываемая история — чистый риск хранения,
         // поэтому старт сервиса удаляет history и контексты вызовов целиком.
         let _ = storage.purge_ephemeral_history();
-        //--agent TASK-224
+        //++agent TASK-224
         Self {
             storage,
             mappings: RwLock::new(MappingStore::new(MappingLimits::default())),
@@ -198,7 +203,7 @@ impl MaskingService {
             })
             .unwrap_or(false)
     }
-    //--agent TASK-224
+    //++agent TASK-224
     //++agent TASK-222
 
     pub(crate) fn admission_for(
@@ -375,20 +380,23 @@ impl MaskingService {
         &self,
         request: PreflightRequest,
     ) -> Result<PreflightResponse, ServiceError> {
-        let _admission = self
-            .admission_for(request.database_id, request.correlation_id)?
-            .lock_owned()
-            .await;
         validate_common(
             request.schema_version,
             &request.chat_id,
             &request.tool_name,
             request.correlation_id,
         )?;
-        let (settings, created) = self
+        //++agent TASK-225 [26.09.2026] N: база резолвится по координатам
+        // (Srvr, Ref) + RAS/GUID-паре; id записи возвращает ensure.
+        let (database_id, settings, created) = self
             .storage
-            .ensure_database(request.database_id)
+            .ensure_database(&request.identity)
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
+        //++agent TASK-225
+        let _admission = self
+            .admission_for(database_id, request.correlation_id)?
+            .lock_owned()
+            .await;
         //++agent TASK-224 [08.10.2026] итерация 4; ревью R1 [25.09.2026]
         // Заголовок — durable-производная `request.arguments`: записывается
         // только после зачистки engine-ом (ключи-секреты и литералы
@@ -404,24 +412,27 @@ impl MaskingService {
             .and_then(|arguments| describe_call(&request.tool_name, &arguments));
         let _ = self.storage.write_call_context(
             request.call_id,
-            request.database_id,
+            database_id,
             &request.chat_id,
             &request.tool_name,
             call_title.as_deref(),
             effective_history_ttl(&settings),
         );
-        //--agent TASK-224
+        //++agent TASK-224
         if created || settings.mode == DatabaseMode::Unconfigured {
-            return self.persist_preflight_denial(&request, &settings, ErrorCode::ActionRequired);
+            return self.persist_preflight_denial(
+                &request,
+                database_id,
+                &settings,
+                ErrorCode::ActionRequired,
+            );
         }
-        let class = match self
-            .storage
-            .tool_class(request.database_id, &request.tool_name)
-        {
+        let class = match self.storage.tool_class(database_id, &request.tool_name) {
             Ok(class) => class,
             Err(_) => {
                 return self.persist_preflight_denial(
                     &request,
+                    database_id,
                     &settings,
                     ErrorCode::ServiceNotReady,
                 )
@@ -433,21 +444,37 @@ impl MaskingService {
         // (auto_added/first_seen_at/denied_count) в одной транзакции.
         //++agent TASK-225
         if class == ToolClass::DenyPendingReview {
-            return self.persist_pending_review_denial(&request, &settings);
+            return self.persist_pending_review_denial(&request, database_id, &settings);
         }
         if class == ToolClass::DataMask && settings.mode == DatabaseMode::Enabled {
             let policy = match self
-                .policy_for(request.database_id, &settings, request.correlation_id)
+                .policy_for(database_id, &settings, request.correlation_id)
                 .await
             {
                 Ok(policy) => policy,
                 Err(error) => {
-                    return self.persist_preflight_denial(&request, &settings, error.code)
+                    return self.persist_preflight_denial(
+                        &request,
+                        database_id,
+                        &settings,
+                        error.code,
+                    )
                 }
             };
             if !policy.ready {
+                //++agent TASK-225 [26.09.2026] фаза-2 C
+                // Холодный старт/первый прогрев: !ready при ожидающем
+                // pull — это прогрев, а не «сервис сломан». persist-запись
+                // здесь не нужна: терминальный отказ агента фиксирует
+                // менеджерский гейт через calls/terminal, повтор идёт с
+                // новым call_id, как у всех отказов preflight.
+                if let Some(error) = self.warming_error(database_id, request.correlation_id) {
+                    return Err(error);
+                }
+                //++agent TASK-225
                 return self.persist_preflight_denial(
                     &request,
+                    database_id,
                     &settings,
                     ErrorCode::ServiceNotReady,
                 );
@@ -456,7 +483,7 @@ impl MaskingService {
         //++agent TASK-225 [25.09.2026]
         // Обратная расшифровка токенов в аргументах — только для
         // data-mask при Enabled: подстановка реальных значений в вызов,
-        // чей ответ будет замаскирован. Для metadata-bypass и data-mask
+        // чей ответ будет замаскирован. Для no-mask и data-mask
         // вне Enabled само наличие [MASK:v1:...] — попытка оракула
         // (резолв вернул бы сырьё в незамаскированный ответ или просто
         // протечку идентификатора) — отказ MASK_TOKEN_INVALID до 1С.
@@ -466,7 +493,7 @@ impl MaskingService {
             let mut mappings = self.mappings.write().await;
             match self.engine.resolve_tokens(
                 &request.arguments,
-                request.database_id,
+                database_id,
                 &request.chat_id,
                 &mut mappings,
             ) {
@@ -487,6 +514,7 @@ impl MaskingService {
                         drop(mappings);
                         return self.persist_preflight_denial(
                             &request,
+                            database_id,
                             &settings,
                             ErrorCode::ServiceNotReady,
                         );
@@ -498,6 +526,7 @@ impl MaskingService {
                     drop(mappings);
                     return self.persist_preflight_denial(
                         &request,
+                        database_id,
                         &settings,
                         ErrorCode::MaskTokenInvalid,
                     );
@@ -509,6 +538,7 @@ impl MaskingService {
                 _ => {
                     return self.persist_preflight_denial(
                         &request,
+                        database_id,
                         &settings,
                         ErrorCode::MaskTokenInvalid,
                     );
@@ -535,14 +565,23 @@ impl MaskingService {
         }
         let write = match request.scope.kind {
             TerminalScopeKind::Verified => {
-                let (Some(database_id), Some(chat_id)) =
-                    (request.scope.database_id, request.scope.chat_id.as_deref())
-                else {
+                //++agent TASK-225 [26.09.2026] O2: verified-scope несёт
+                // точный ключ instance_id (+Srvr/Ref для отображения).
+                let (Some(instance_id), Some(chat_id)) = (
+                    request.scope.instance_id.as_deref(),
+                    request.scope.chat_id.as_deref(),
+                ) else {
                     return Err(ServiceError::new(
                         ErrorCode::PolicyInvalid,
                         request.correlation_id,
                     ));
                 };
+                let identity = DatabaseIdentity {
+                    instance_id: instance_id.to_owned(),
+                    cluster_server: request.scope.cluster_server.clone().unwrap_or_default(),
+                    infobase_name: request.scope.infobase_name.clone().unwrap_or_default(),
+                };
+                //++agent TASK-225
                 if chat_id.is_empty()
                     || chat_id.len() > 512
                     || !VERIFIED_TERMINAL_CODES.contains(&request.error_code.as_str())
@@ -552,9 +591,10 @@ impl MaskingService {
                         request.correlation_id,
                     ));
                 }
-                let (settings, _) = self.storage.ensure_database(database_id).map_err(|_| {
-                    ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
-                })?;
+                let (database_id, settings, _) =
+                    self.storage.ensure_database(&identity).map_err(|_| {
+                        ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
+                    })?;
                 let public_result =
                     safe_terminal_error(&request.error_code, request.correlation_id);
                 //++agent TASK-224 [08.10.2026] итерация 4: заголовок берём из
@@ -583,9 +623,12 @@ impl MaskingService {
                     effective_history_ttl(&settings),
                     request.correlation_id,
                 )
+                //++agent TASK-224
             }
             TerminalScopeKind::Unverified => {
-                if request.scope.database_id.is_some()
+                if request.scope.instance_id.is_some()
+                    || request.scope.cluster_server.is_some()
+                    || request.scope.infobase_name.is_some()
                     || request.scope.chat_id.is_some()
                     || !UNVERIFIED_TERMINAL_CODES.contains(&request.error_code.as_str())
                 {
@@ -620,21 +663,23 @@ impl MaskingService {
         &self,
         request: FinalizeRequest,
     ) -> Result<FinalizeResponse, ServiceError> {
-        let _admission = self
-            .admission_for(request.database_id, request.correlation_id)?
-            .lock_owned()
-            .await;
         validate_common(
             request.schema_version,
             &request.chat_id,
             &request.tool_name,
             request.correlation_id,
         )?;
-        let key = (
-            request.database_id,
-            request.chat_id.clone(),
-            request.call_id,
-        );
+        //++agent TASK-225 [26.09.2026] N: см. preflight.
+        let (database_id, settings, created) = self
+            .storage
+            .ensure_database(&request.identity)
+            .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
+        //++agent TASK-225
+        let _admission = self
+            .admission_for(database_id, request.correlation_id)?
+            .lock_owned()
+            .await;
+        let key = (database_id, request.chat_id.clone(), request.call_id);
         let cached = self.completed_responses.lock().ok().and_then(|mut cache| {
             if cache
                 .get(&key)
@@ -652,7 +697,7 @@ impl MaskingService {
         }
         if let Some(history) = self
             .storage
-            .load_history(request.database_id, &request.chat_id, request.call_id)
+            .load_history(database_id, &request.chat_id, request.call_id)
             .map_err(|_| ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id))?
         {
             return Ok(FinalizeResponse {
@@ -673,17 +718,13 @@ impl MaskingService {
                 ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id)
             })?;
             workers
-                .entry(request.database_id)
+                .entry(database_id)
                 .or_insert_with(|| Arc::new(Semaphore::new(self.per_database_workers)))
                 .clone()
         };
         let _database_worker = database_worker
             .acquire_owned()
             .await
-            .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
-        let (settings, created) = self
-            .storage
-            .ensure_database(request.database_id)
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
         if created || settings.mode == DatabaseMode::Unconfigured {
             return Err(ServiceError::new(
@@ -693,7 +734,7 @@ impl MaskingService {
         }
         let class = self
             .storage
-            .tool_class(request.database_id, &request.tool_name)
+            .tool_class(database_id, &request.tool_name)
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
         if class == ToolClass::DenyPendingReview {
             return Err(ServiceError::new(
@@ -740,13 +781,18 @@ impl MaskingService {
         };
         //++agent TASK-225
         let policy = self
-            .policy_for(request.database_id, &settings, request.correlation_id)
+            .policy_for(database_id, &settings, request.correlation_id)
             .await?;
         if settings.mode == DatabaseMode::Enabled && class == ToolClass::DataMask && !policy.ready {
-            return Err(ServiceError::new(
-                ErrorCode::ServiceNotReady,
-                request.correlation_id,
-            ));
+            //++agent TASK-225 [26.09.2026] фаза-2 C: !ready при
+            // ожидающем pull — прогрев: агент получает SERVICE_WARMING_UP
+            // с retry_after_s вместо безликого отказа.
+            return Err(self
+                .warming_error(database_id, request.correlation_id)
+                .unwrap_or_else(|| {
+                    ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id)
+                }));
+            //++agent TASK-225
         }
         //++agent TASK-224 [08.10.2026] итерация 4: заголовок отчёта —
         // текст запроса из контекста, записанного preflight-фазой
@@ -756,10 +802,11 @@ impl MaskingService {
             .call_context_text(request.call_id)
             .ok()
             .flatten();
-        //--agent TASK-224
+        //++agent TASK-224
         if let Some(reason) = sanitized_reason {
             return self.persist_sanitized_failure(
                 &request,
+                database_id,
                 &settings,
                 policy.version,
                 outcome_name,
@@ -785,6 +832,7 @@ impl MaskingService {
         {
             return self.persist_sanitized_failure(
                 &request,
+                database_id,
                 &settings,
                 policy.version,
                 "sanitized_error",
@@ -800,6 +848,7 @@ impl MaskingService {
             Err(_) => {
                 return self.persist_sanitized_failure(
                     &request,
+                    database_id,
                     &settings,
                     policy.version,
                     "sanitized_error",
@@ -812,7 +861,7 @@ impl MaskingService {
         let mut mappings = self.mappings.write().await;
         let masked = match self.engine.mask(
             &cut_result,
-            request.database_id,
+            database_id,
             &request.chat_id,
             batch_id,
             settings.mapping_ttl_seconds,
@@ -825,6 +874,7 @@ impl MaskingService {
                 drop(mappings);
                 return self.persist_sanitized_failure(
                     &request,
+                    database_id,
                     &settings,
                     policy.version,
                     "sanitized_error",
@@ -837,6 +887,7 @@ impl MaskingService {
             drop(mappings);
             return self.persist_sanitized_failure(
                 &request,
+                database_id,
                 &settings,
                 policy.version,
                 "sanitized_error",
@@ -883,7 +934,7 @@ impl MaskingService {
                 schema: Some(&request.field_sources.schema),
             },
         );
-        //--agent TASK-224
+        //++agent TASK-224
         //++agent TASK-225 [26.09.2026]
         // §6.1/§6.2: детальная запись — причины по ячейкам отчёта
         // (координаты из той же раскладки блоков, что neutral_report),
@@ -905,7 +956,7 @@ impl MaskingService {
         let write = self
             .storage
             .write_history(
-                request.database_id,
+                database_id,
                 &request.chat_id,
                 request.call_id,
                 &request.tool_name,
@@ -1406,6 +1457,35 @@ impl MaskingService {
         })
     }
 
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    /// `!ready` при ожидающем pull — прогрев, а не отказ:
+    /// SERVICE_WARMING_UP с `retry_after_s` по объёму прошлого pull
+    /// (~100 тыс. значений/с сборки автомата, минимум 5с). Intent
+    /// отсутствует (`needs_attention`, снят терминальной ошибкой или ещё
+    /// не поставлен) — прогрева нет: None, caller отдаёт SERVICE_NOT_READY.
+    /// Ошибка чтения — тоже None: не обещаем повтор, которого нет.
+    fn warming_error(&self, database_id: Uuid, correlation_id: Uuid) -> Option<ServiceError> {
+        if !matches!(self.storage.refresh_intent_pending(database_id), Ok(true)) {
+            return None;
+        }
+        let values = self
+            .storage
+            .with_connection(|connection| {
+                crate::storage::setup::last_source_stats(connection, database_id)
+            })
+            .ok()
+            .flatten()
+            .map(|stats| {
+                stats
+                    .values()
+                    .map(|stat| stat.values.max(0) as u64)
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+        Some(ServiceError::warming_up(correlation_id, values / 100_000))
+    }
+    //++agent TASK-225
+
     fn cache_response(&self, key: CallKey, response: Value, ttl_seconds: u64) {
         if let Ok(mut cache) = self.completed_responses.lock() {
             if cache.len() >= 10_000 {
@@ -1424,16 +1504,18 @@ impl MaskingService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_sanitized_failure(
         &self,
         request: &FinalizeRequest,
+        database_id: Uuid,
         settings: &super::DatabaseSettings,
         policy_version: i64,
         outcome: &str,
         reason: &str,
         //++agent TASK-224 [08.10.2026] итерация 4: заголовок из контекста
         // вызова — sanitized-запись тоже должна показывать текст запроса.
-        //--agent TASK-224
+        //++agent TASK-224
         title: Option<&str>,
     ) -> Result<FinalizeResponse, ServiceError> {
         let public_result = safe_processing_error(request.correlation_id);
@@ -1448,7 +1530,7 @@ impl MaskingService {
         let write = self
             .storage
             .write_history(
-                request.database_id,
+                database_id,
                 &request.chat_id,
                 request.call_id,
                 &request.tool_name,
@@ -1478,11 +1560,7 @@ impl MaskingService {
             }
         };
         self.cache_response(
-            (
-                request.database_id,
-                request.chat_id.clone(),
-                request.call_id,
-            ),
+            (database_id, request.chat_id.clone(), request.call_id),
             public_result.clone(),
             effective_history_ttl(settings),
         );
@@ -1495,6 +1573,7 @@ impl MaskingService {
     fn persist_preflight_denial(
         &self,
         request: &PreflightRequest,
+        database_id: Uuid,
         settings: &super::DatabaseSettings,
         code: ErrorCode,
     ) -> Result<PreflightResponse, ServiceError> {
@@ -1519,7 +1598,7 @@ impl MaskingService {
         let write = self
             .storage
             .write_scoped_terminal(
-                request.database_id,
+                database_id,
                 &request.chat_id,
                 request.call_id,
                 &request.tool_name,
@@ -1532,6 +1611,7 @@ impl MaskingService {
             .map_err(|_| {
                 ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id)
             })?;
+        //++agent TASK-224
         if write == TerminalWrite::Conflict {
             return Err(ServiceError::new(
                 ErrorCode::TerminalAlreadyRecorded,
@@ -1548,6 +1628,7 @@ impl MaskingService {
     fn persist_pending_review_denial(
         &self,
         request: &PreflightRequest,
+        database_id: Uuid,
         settings: &super::DatabaseSettings,
     ) -> Result<PreflightResponse, ServiceError> {
         let public_result = safe_terminal_error(
@@ -1571,7 +1652,7 @@ impl MaskingService {
         let write = self
             .storage
             .write_tool_pending_review(
-                request.database_id,
+                database_id,
                 &request.chat_id,
                 request.call_id,
                 &request.tool_name,
@@ -1961,6 +2042,10 @@ fn safe_terminal_error(code: &str, correlation_id: Uuid) -> Value {
         "MASK_TOKEN_INVALID" => "Значение недоступно",
         "CHAT_IDENTITY_REQUIRED" => "Требуется подтверждённый контекст диалога",
         "DATABASE_IDENTITY_UNVERIFIED" => "Идентичность базы не подтверждена",
+        //++agent TASK-225 [26.09.2026] фаза-2 C: терминальная запись
+        // прогрева — без N (оценка живёт в ответе вызова, не в истории).
+        "SERVICE_WARMING_UP" => "Сервис маскирования прогревает словарь",
+        //++agent TASK-225
         _ => "Операция временно недоступна",
     };
     json!({
@@ -2024,7 +2109,7 @@ fn strip_parse_error_text(result: Value) -> Value {
 //++agent TASK-225
 //++agent TASK-225 [25.09.2026]
 // Бизнес-result бывает JSON-строкой (validate_query и другие
-// metadata-bypass инструменты возвращают сериализованный JSON из BSL).
+// no-mask инструменты возвращают сериализованный JSON из BSL).
 // Её нельзя сериализовать повторно — to_string дал бы экранированный
 // литерал `"{\"valid\":...}"`; в text уходит само строковое значение.
 // Opaque-результат (ToolCallResult без конверта границы) уже находится в
@@ -2106,7 +2191,7 @@ fn effective_history_ttl(settings: &super::DatabaseSettings) -> u64 {
         .history_ttl_seconds
         .min(settings.mapping_ttl_seconds)
 }
-//--agent TASK-224
+//++agent TASK-224
 
 //++agent TASK-225 [26.09.2026]
 /// §6.1: отображение JSON-pointer маскированного результата в координату
@@ -2388,7 +2473,7 @@ fn neutral_report(result: &Value, meta: &ReportMeta) -> Value {
     //++agent TASK-224 [08.10.2026] итерация 4: title — текст запроса
     // (при его отсутствии null — форма отчёта стабильна).
     json!({"version":1, "title":meta.title, "blocks":blocks})
-    //--agent TASK-224
+    //++agent TASK-224
 }
 
 fn neutral_block(value: &Value, schema: Option<&Value>) -> Value {
@@ -2480,7 +2565,7 @@ fn neutral_block(value: &Value, schema: Option<&Value>) -> Value {
         })
         .collect();
     json!({"kind":"table","columns":column_descriptors,"rows":scalar_rows})
-    //--agent TASK-224
+    //++agent TASK-224
 }
 
 //++agent TASK-224 [08.10.2026] итерация 4
@@ -2522,7 +2607,7 @@ fn report_cell(value: &Value) -> Value {
 fn masked_cell(text: &str) -> bool {
     text.contains("[MASK:v1:") || text.contains("[SECRET_REMOVED]")
 }
-//--agent TASK-224
+//++agent TASK-224
 
 fn is_report_scalar(value: &Value) -> bool {
     matches!(

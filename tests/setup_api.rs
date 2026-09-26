@@ -71,7 +71,9 @@ async fn fixture() -> (
         masking.clone(),
     );
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     (storage, auth, sessions, masking, app, session, database_id)
 }
 
@@ -1045,20 +1047,20 @@ async fn m5_legacy_activate_accepts_only_draft() {
 }
 
 // ------------------------------------------------------------------
-// B-4/T8-02: PUT tools metadata-bypass без confirm_bypass → 400.
+// B-4/T8-02: PUT tools no-mask без confirm_bypass → 400.
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn t8_tool_classification_bypass_requires_confirm() {
     let (_, _, _, _, app, admin, database_id) = fixture().await;
     let uri = format!("/api/v1/admin/databases/{database_id}/tools/execute_query");
-    // metadata-bypass без подтверждения → 400 BYPASS_NOT_CONFIRMED.
+    // no-mask без подтверждения → 400 BYPASS_NOT_CONFIRMED.
     let response = app
         .clone()
         .oneshot(put(
             &uri,
             &admin,
             "*",
-            &json!({"class":"metadata-bypass","confirm_bypass":false}).to_string(),
+            &json!({"class":"no-mask","confirm_bypass":false}).to_string(),
         ))
         .await
         .unwrap();
@@ -1777,7 +1779,7 @@ async fn t6_dry_run_bounded_keep_secret_and_no_writes() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2173,7 +2175,7 @@ async fn d8_dictionary_reason_carries_source_path() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2230,3 +2232,739 @@ async fn d8_dictionary_reason_carries_source_path() {
     let link = dict["link"]["admin_path"].as_str().unwrap();
     assert!(link.contains("source="), "{link}");
 }
+
+// ------------------------------------------------------------------
+// H (phase-decisions-2): DELETE tools/{tool} — снятие записи
+// классификации. Admin-only + CSRF + аудит + 404.
+// ------------------------------------------------------------------
+fn delete_request(uri: &str, session: &IssuedSession) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("origin", ORIGIN)
+        .header("cookie", cookie(&session.token))
+        .header("x-csrf-token", &session.csrf_token)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_tool_classification_removes_row_and_audits() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    let uri = format!("/api/v1/admin/databases/{database_id}/tools/execute_query");
+    app.clone()
+        .oneshot(put(
+            &uri,
+            &admin,
+            "*",
+            &json!({"class":"data-mask"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &admin))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Запись удалена из живого состояния.
+    assert_eq!(tool_count(&storage, database_id, "execute_query"), 0);
+    // Аудит-событие как у PUT — action=tool.delete; имя удалённого — в
+    // code (R4-9).
+    let audited: i64 = storage
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action='tool.delete' AND database_id=?1 AND code='execute_query'",
+                [database_id.to_string()],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(audited, 1);
+    // Повторное удаление — 404.
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &admin))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_tool_classification_requires_admin_csrf_and_origin() {
+    let (_, auth, sessions, _, app, admin, database_id) = fixture().await;
+    let uri = format!("/api/v1/admin/databases/{database_id}/tools/execute_query");
+    app.clone()
+        .oneshot(put(
+            &uri,
+            &admin,
+            "*",
+            &json!({"class":"data-mask"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // Viewer — 403.
+    let admin_principal = auth
+        .authenticate("setup-api-h", "admin", ADMIN_PASSWORD)
+        .unwrap();
+    let (_, activation) = auth
+        .create_user(&admin_principal, "viewer-h", Role::Viewer, Uuid::new_v4())
+        .unwrap();
+    auth.activate("viewer-h", &activation, "viewer passphrase h")
+        .unwrap();
+    let viewer = auth
+        .authenticate("viewer-h-login", "viewer-h", "viewer passphrase h")
+        .unwrap();
+    let viewer_session = sessions.issue(viewer, Utc::now()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &viewer_session))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Без CSRF — 403; чужой origin — 403.
+    let no_csrf = Request::builder()
+        .method("DELETE")
+        .uri(&uri)
+        .header("origin", ORIGIN)
+        .header("cookie", cookie(&admin.token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(no_csrf).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let foreign_origin = Request::builder()
+        .method("DELETE")
+        .uri(&uri)
+        .header("origin", "https://evil.test")
+        .header("cookie", cookie(&admin.token))
+        .header("x-csrf-token", &admin.csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(foreign_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Запись на месте — ни одна из попыток не прошла.
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &admin))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+// ------------------------------------------------------------------
+// H.6: удаление инструментов через импорт — отказываемый TOOL_REMOVED.
+// ------------------------------------------------------------------
+fn seed_tool(storage: &SqliteStorage, database_id: Uuid, tool: &str, class: &str) {
+    storage
+        .with_connection(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO tool_classifications(database_id,tool_name,class,updated_at,auto_added)
+                 VALUES (?1,?2,?3,'2026-09-26T00:00:00Z',0)",
+                rusqlite::params![database_id.to_string(), tool, class],
+            )
+        })
+        .unwrap();
+}
+
+fn tool_count(storage: &SqliteStorage, database_id: Uuid, tool: &str) -> i64 {
+    storage
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM tool_classifications WHERE database_id=?1 AND tool_name=?2",
+                rusqlite::params![database_id.to_string(), tool],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+}
+
+fn diff_tool_removed_ids(diff: &Value) -> Vec<String> {
+    diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "TOOL_REMOVED")
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn h6_file_with_tools_marks_missing_as_removable_tool_removed() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[],
+        json!({"mode":"part","sources":[]}),
+    );
+    seed_tool(&storage, database_id, "execute_query", "data-mask");
+    seed_tool(&storage, database_id, "retired_tool", "no-mask");
+
+    // Файл с секцией tools (execute_query остаётся, retired_tool нет).
+    let mut file = setup_file(database_id, json!({"mode":"part","sources":[]}), json!([]));
+    file["tools"] = json!([{"tool":"execute_query","mode":"data-mask","reason":"нужен"}]);
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports"),
+            &admin,
+            &serde_json::to_string(&file).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let diff = body_json(response).await;
+    let removed = diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "TOOL_REMOVED")
+        .collect::<Vec<_>>();
+    // В файле только execute_query → удаляются 5 встроенных + retired_tool.
+    assert_eq!(removed.len(), 6, "{diff}");
+    let retired = removed
+        .iter()
+        .find(|c| c["subject"]["tool"] == "retired_tool")
+        .unwrap();
+    // Нейтральная категория — не ослабление и не усиление.
+    assert_eq!(retired["class"], "neutral");
+    assert_eq!(retired["before"]["mode"], "no-mask");
+    assert!(removed.iter().all(|c| c["class"] == "neutral"));
+    assert!(!removed
+        .iter()
+        .any(|c| c["subject"]["tool"] == "execute_query"));
+}
+
+#[tokio::test]
+async fn h6_file_without_tools_removes_nothing() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[],
+        json!({"mode":"part","sources":[]}),
+    );
+    seed_tool(&storage, database_id, "execute_query", "data-mask");
+
+    // Файл БЕЗ секции tools — удалений нет вообще.
+    let file = setup_file(database_id, json!({"mode":"part","sources":[]}), json!([]));
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports"),
+            &admin,
+            &serde_json::to_string(&file).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let diff = body_json(response).await;
+    assert!(diff_tool_removed_ids(&diff).is_empty(), "{diff}");
+
+    // "tools": null ≡ ключа нет — тоже без удалений (уточнение H.6).
+    let mut file = file;
+    file["tools"] = Value::Null;
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports?replace_draft=1"),
+            &admin,
+            &serde_json::to_string(&file).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let diff = body_json(response).await;
+    assert!(diff_tool_removed_ids(&diff).is_empty(), "{diff}");
+}
+
+#[tokio::test]
+async fn h6_activate_applies_accepted_removals_and_audits() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[],
+        json!({"mode":"part","sources":[]}),
+    );
+    seed_tool(&storage, database_id, "keep_me", "data-mask");
+    seed_tool(&storage, database_id, "gone_a", "data-mask");
+    seed_tool(&storage, database_id, "gone_b", "no-mask");
+
+    // "tools": [] в файле = удаление ВСЕХ (keep_me не в файле тоже —
+    // значит и он TOOL_REMOVED; оставим его через declined).
+    let mut file = setup_file(database_id, json!({"mode":"part","sources":[]}), json!([]));
+    file["tools"] = json!([]);
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports"),
+            &admin,
+            &serde_json::to_string(&file).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    let (version, hash) = (
+        body["draft_version"].as_i64().unwrap(),
+        body["draft_hash"].as_str().unwrap().to_string(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let diff = body_json(response).await;
+    let removals = diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "TOOL_REMOVED")
+        .collect::<Vec<_>>();
+    // "tools": [] = удалить все: 6 встроенных + 3 посеянных.
+    assert_eq!(removals.len(), 9, "{diff}");
+    let declined: Vec<String> = removals
+        .iter()
+        .filter(|c| c["subject"]["tool"] == "keep_me")
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(declined.len(), 1);
+
+    // Сначала — stale: неизвестный id отказа → STALE_CONFIRMATION.
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/activate"),
+            &admin,
+            &json!({
+                "version": version, "draft_hash": hash,
+                "declined_tool_removals": ["not-a-change"],
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(response).await["error"]["details"]["code"],
+        "STALE_CONFIRMATION"
+    );
+
+    // Активация: gone_a/gone_b удалены + аудит, keep_me остался.
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/activate"),
+            &admin,
+            &json!({
+                "version": version, "draft_hash": hash,
+                "declined_tool_removals": declined,
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let removed: Vec<&str> = body["tool_removals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(removed.len(), 8, "{body}");
+    assert!(removed.contains(&"gone_a") && removed.contains(&"gone_b"));
+
+    assert_eq!(tool_count(&storage, database_id, "keep_me"), 1);
+    assert_eq!(tool_count(&storage, database_id, "gone_a"), 0);
+    assert_eq!(tool_count(&storage, database_id, "gone_b"), 0);
+    assert_eq!(tool_count(&storage, database_id, "execute_query"), 0);
+    let audited: i64 = storage
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action='tool.delete' AND database_id=?1 AND code IS NOT NULL",
+                [database_id.to_string()],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(audited, 8);
+    // R4-9: имя удалённого инструмента — в audit_events.code.
+    let named: i64 = storage
+        .with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action='tool.delete' AND database_id=?1 AND code='gone_a'",
+                [database_id.to_string()],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(named, 1);
+}
+
+// ------------------------------------------------------------------
+// TASK-225 I: round-trip — пустой reason экспортируется плейсхолдером;
+// импорт неизменённого файла → diff 0 изменений (нет шума
+// REASON_CHANGED).
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn i_roundtrip_empty_reason_placeholder_is_silent() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[json!({
+            "selector": "name",
+            "value": "*ФИО*",
+            "action": "mask",
+            "category": "pii",
+            "priority": 10,
+            "enabled": true,
+            "reason": ""
+        })],
+        json!({"mode":"part","sources":[
+            {"source_path":"Справочник.Контрагенты","category":"pii","reason":""}
+        ]}),
+    );
+
+    // Экспорт: пустые reason подставлены плейсхолдером.
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/export"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let file = body_json(response).await;
+    let placeholder = "не указано (создано до версионирования настройки)";
+    assert_eq!(file["dictionary"]["sources"][0]["reason"], placeholder);
+    assert_eq!(file["rules"][0]["reason"], placeholder);
+
+    // Импорт файла без правок → черновик.
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports"),
+            &admin,
+            &file.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Diff активной vs черновика — ноль изменений.
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let diff = body_json(response).await;
+    assert_eq!(
+        diff["changes"].as_array().unwrap().len(),
+        0,
+        "round-trip должен молчать: {diff}"
+    );
+}
+
+// ------------------------------------------------------------------
+// J: первая версия базы — diff с пустой настройкой и активация.
+// Регресс: раньше from=active без активной версии отдавал NO_DRAFT,
+// мастер сообщал «у базы нет черновика» и активация была недоступна.
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn j_first_version_diffs_against_empty_and_activates() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+
+    // Без черновика — по-прежнему 409 NO_DRAFT.
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"]["code"], "NO_DRAFT");
+
+    // Промах по from=draft — 404 VERSION_NOT_FOUND (NO_DRAFT — только
+    // про отсутствие целевого черновика).
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=draft&to=active"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        "VERSION_NOT_FOUND"
+    );
+
+    // Импорт → черновик v1.
+    let file = setup_file(
+        database_id,
+        json!({"mode":"part","sources":[sample_source("Справочник.Контрагенты","контрагенты")]}),
+        json!([sample_rule("Иванов")]),
+    );
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/imports?replace_draft=0"),
+            &admin,
+            &file.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let draft = body_json(response).await;
+    assert_eq!(draft["draft_version"], 1);
+
+    // from=active при отсутствии активной версии: 200, from_version=null,
+    // все элементы — добавления/усиления.
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=active&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let diff = body_json(response).await;
+    assert_eq!(diff["from_version"], Value::Null);
+    assert_eq!(diff["to_version"], 1);
+    let changes = diff["changes"].as_array().unwrap();
+    assert!(!changes.is_empty(), "первая версия должна давать изменения");
+    assert!(
+        changes
+            .iter()
+            .all(|change| change["class"] == "strengthening" || change["class"] == "neutral"),
+        "против пустой настройки не может быть ослаблений: {diff}"
+    );
+    assert_eq!(diff["counts"]["weakening"], 0);
+
+    // Несуществующий номер from по-прежнему — VERSION_NOT_FOUND.
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff?from=99&to=draft"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        "VERSION_NOT_FOUND"
+    );
+
+    // Активация без активной версии: все усиления приняты — 200.
+    let accepted: Vec<Value> = changes
+        .iter()
+        .filter(|change| change["class"] == "strengthening")
+        .map(|change| change["id"].clone())
+        .collect();
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/activate"),
+            &admin,
+            &json!({
+                "version": 1,
+                "draft_hash": draft["draft_hash"],
+                "accepted_strengthenings": accepted,
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["active_version"], 1);
+    let statuses: Vec<String> = storage
+        .with_connection(|c| {
+            let mut s =
+                c.prepare("SELECT status FROM policies WHERE database_id=?1 ORDER BY version")?;
+            let rows = s
+                .query_map([database_id.to_string()], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(
+        statuses,
+        ["active"],
+        "черновик стал активной v1: {statuses:?}"
+    );
+}
+
+// ------------------------------------------------------------------
+// TASK-225 L R4-2: TOOL_REMOVED эмитится только для версий, пришедших
+// из импорта файла (origin=import). Черновик «из действующей»,
+// legacy-черновик и откат наследуют ЧАСТИЧНЫЙ снимок tools — удалений
+// по ним быть не должно.
+// ------------------------------------------------------------------
+fn seed_active_tools_json(storage: &SqliteStorage, database_id: Uuid, tools: Value) {
+    storage
+        .with_connection(|c| {
+            c.execute(
+                "UPDATE policies SET tools_json=?2 WHERE database_id=?1 AND status='active'",
+                rusqlite::params![database_id.to_string(), tools.to_string()],
+            )
+        })
+        .unwrap();
+}
+
+async fn fetch_diff(app: &axum::Router, admin: &IssuedSession, database_id: Uuid) -> Value {
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/admin/databases/{database_id}/setup/diff"),
+            admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+// Ручной черновик (origin=manual — им покрыты и «из действующей», и
+// legacy PUT): переходы режимов работают, удалений по отсутствующим в
+// списке инструментам нет.
+#[tokio::test]
+async fn r4_manual_draft_put_tools_keeps_transitions_no_removals() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[],
+        json!({"mode":"part","sources":[]}),
+    );
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/draft"),
+            &admin,
+            r#"{"from":"empty"}"#,
+        ))
+        .await
+        .unwrap();
+    let hash = body_json(response).await["draft_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // execute_query: data-mask → no-mask (ослабление должно остаться в
+    // diff), остальные 5 встроенных вне списка — не удаляются.
+    let response = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/admin/databases/{database_id}/setup/draft/tools"),
+            &admin,
+            &hash,
+            &json!({"tools":[{"tool":"execute_query","mode":"no-mask","reason":"L"}]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let diff = fetch_diff(&app, &admin, database_id).await;
+    assert!(
+        diff_tool_removed_ids(&diff).is_empty(),
+        "ручной черновик не должен удалять классификации: {diff}"
+    );
+    let transition = diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "TOOL_NO_MASK")
+        .expect("переход execute_query data-mask→no-mask обязан быть в diff");
+    assert_eq!(transition["class"], "weakening");
+}
+
+// Откат версии — origin=rollback: снимок tools копируется, удалений нет.
+#[tokio::test]
+async fn r4_rollback_draft_emits_no_tool_removals() {
+    let (storage, _, _, _, app, admin, database_id) = fixture().await;
+    seed_active(
+        &storage,
+        database_id,
+        &[],
+        json!({"mode":"part","sources":[]}),
+    );
+    seed_active_tools_json(
+        &storage,
+        database_id,
+        json!([{"tool":"execute_query","mode":"data-mask","reason":"snap"}]),
+    );
+    // Черновик v2 со снимком tools → откат на него даёт v3 origin=rollback.
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/draft"),
+            &admin,
+            r#"{"from":"active"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/admin/databases/{database_id}/setup/rollback"),
+            &admin,
+            &json!({"version": 2, "replace_draft": true}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let diff = fetch_diff(&app, &admin, database_id).await;
+    assert!(
+        diff_tool_removed_ids(&diff).is_empty(),
+        "откат не должен удалять классификации: {diff}"
+    );
+}
+
+// Импорт-сторона (origin=import → удаления есть) покрыта тестами
+// H.6 выше (`h6_file_with_tools_marks_missing_as_removable_tool_removed`).

@@ -1021,7 +1021,10 @@ async function viewerPage() {
 
 const TOOL_CLASSES = [
   ['data-mask', 'Маскировать'],
-  ['metadata-bypass', 'Только метаданные'],
+  //**agent TASK-225 [26.09.2026 05:00:00] единая подпись режима
+  // ['no-mask', 'Только метаданные'],
+  ['no-mask', 'Без маскирования'],
+  //**agent TASK-225
   ['deny-pending-review', 'Запрещено до проверки'],
 ];
 const POLICY_STATUS = { draft: ['warn', 'Черновик'], active: ['ok', 'Действующая'], retired: ['mut', 'Архив'] };
@@ -1434,7 +1437,14 @@ async function adminPage() {
     //   tag.className = 'tag warn';
     //   tag.textContent = `Выполняется: ${db.refresh_stage}`;
     //   scheduleRefreshPoll();
-    if (db.refresh_stage && db.refresh_stage !== 'active') {
+    //++agent TASK-225 [26.09.2026] K: intent в needs_attention — повторы
+    // остановлены, «Обновляются…» вводит в заблуждение (см. refreshProblem).
+    if (db.refresh && db.refresh.state === 'needs_attention') {
+      tag.className = 'tag err';
+      tag.textContent = 'Нужна настройка';
+      tag.title = 'Автоматические попытки остановлены — см. причину ниже';
+    } else if (db.refresh_stage && db.refresh_stage !== 'active') {
+    //++agent TASK-225
       tag.className = 'tag warn';
       tag.textContent = 'Обновляются…';
       tag.title = `Этап: ${db.refresh_stage}`;
@@ -2261,8 +2271,8 @@ async function adminPage() {
   const TOOL_MODES = [
     ['data-mask', 'Маскировать данные', 'acc',
       'Ответ инструмента проходит через маскирование. Для всех инструментов, возвращающих данные базы.'],
-    ['metadata-bypass', 'Без маскирования (только метаданные)', 'warn',
-      'Ответ передаётся агенту как есть. Только для инструментов, которые гарантированно не возвращают данные: структура метаданных, справка.'],
+    ['no-mask', 'Без маскирования', 'warn',
+      'Ответ передаётся агенту как есть. Только для инструментов, которые не возвращают данных базы: метаданные, проверка синтаксиса, управление окнами и служебные операции.'],
     ['deny-pending-review', 'Запрещён до проверки', 'err',
       'Вызов отклоняется. Так работает любой новый инструмент, пока администратор не выберет режим.'],
   ];
@@ -2430,7 +2440,11 @@ async function adminPage() {
     } else {
       $('#verInfo').textContent = draft ? `Действующей версии нет · черновик ${draft.version}` : 'Действующей версии нет';
     }
-    const loading = db.refresh_stage && db.refresh_stage !== 'active';
+    //++agent TASK-225 [26.09.2026] K: при needs_attention загрузка
+    // остановлена — «Словарь загружается…» не показываем.
+    const loading = db.refresh_stage && db.refresh_stage !== 'active'
+      && !(db.refresh && db.refresh.state === 'needs_attention');
+    //++agent TASK-225
     $('#verDictLoad').hidden = !loading;
     $('#verDictLoad').textContent = 'Словарь загружается…';
     $('#setupExportBtn').disabled = !active && !draft;
@@ -3517,6 +3531,9 @@ async function adminPage() {
     wiz.confirmed = new Set();
     wiz.accepted = null; // null = «ещё не видели diff» → принять все по умолчанию
     wiz.excluded = new Set();
+    //++agent TASK-225 [26.09.2026] H.6: отказанные удаления инструментов
+    wiz.declined = new Set();
+    //++agent TASK-225
     wiz.draftVersion = mode === 'import' ? null : (setup.draft ? setup.draft.version : null);
     if (mode === 'import') {
       wiz.imported = null;
@@ -3698,6 +3715,11 @@ async function adminPage() {
       wiz.confirmed = new Set([...wiz.confirmed].filter(id => wIds.has(id)));
       const xIds = new Set(diff.warnings.filter(w => w.excludable).map(w => w.id));
       wiz.excluded = new Set([...wiz.excluded].filter(id => xIds.has(id)));
+      //++agent TASK-225 [26.09.2026] H.6: declined держим только по
+      // живым TOOL_REMOVED текущего diff.
+      const rIds = new Set(toolRemovals().map(c => c.id));
+      wiz.declined = new Set([...wiz.declined].filter(id => rIds.has(id)));
+      //++agent TASK-225
       renderDiff();
     } catch (error) {
       body.replaceChildren();
@@ -3726,7 +3748,7 @@ async function adminPage() {
     SECRET_TO_KEEP: 'Секрет → не маскировать', PATTERN_NARROWED: 'Шаблон сужен', REGEX_REMOVED: 'Шаблон удалён',
     SOURCE_REMOVED: 'Источник словаря удалён', FILTER_NARROWED: 'Условие источника сужено',
     FILTER_CHANGED: 'Условие источника изменено — проверьте', DICTIONARY_CATEGORY_WEAKER: 'Категория словаря ослаблена',
-    DICTIONARY_MODE_UNVERIFIABLE: 'Режим словаря не проверить', TOOL_BYPASS: 'Инструмент без маскирования',
+    DICTIONARY_MODE_UNVERIFIABLE: 'Режим словаря не проверить', TOOL_NO_MASK: 'Инструмент без маскирования',
     SOURCE_ADDED: 'Новый источник словаря', FILTER_WIDENED: 'Условие источника расширено', MASK_ADDED: 'Новое правило',
     SECRET_ADDED: 'Новое правило', RULE_ADDED: 'Новое правило', MASK_TO_SECRET: 'Скрытие → секрет', KEEP_REMOVED: '«Не маскировать» снято',
     KEEP_TO_MASK: '«Не маскировать» → скрытие', KEEP_TO_SECRET: '«Не маскировать» → секрет', PATTERN_WIDENED: 'Шаблон расширен',
@@ -3746,7 +3768,7 @@ async function adminPage() {
     }
     const reason = (ch.after && ch.after.reason) || (ch.before && ch.before.reason);
     if (reason) content.append(el('div', 'why', `Обоснование: «${reason}»`));
-    if (ch.kind === 'TOOL_BYPASS' && ch.after && ch.after.name_looks_like_data) {
+    if (ch.kind === 'TOOL_NO_MASK' && ch.after && ch.after.name_looks_like_data) {
       content.append(el('div', 'why warnc', 'Имя инструмента похоже на чтение данных.'));
     }
     if (ch.class === 'weakening') {
@@ -3779,11 +3801,33 @@ async function adminPage() {
       lbl.append(cb);
       row.classList.toggle('off-c', !cb.checked);
       row.append(lbl, content);
+    } else if (ch.kind === 'TOOL_REMOVED') {
+      //++agent TASK-225 [26.09.2026] H.6: удаление инструмента —
+      // отказываемо; галочка по умолчанию включена (удалить).
+      const lbl = el('label', 'cf');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !wiz.declined.has(ch.id);
+      cb.disabled = readOnly;
+      cb.title = 'Снимите флаг, чтобы оставить инструмент с текущим режимом';
+      cb.addEventListener('change', () => {
+        if (cb.checked) wiz.declined.delete(ch.id); else wiz.declined.add(ch.id);
+        row.classList.toggle('off-c', !cb.checked);
+        updateDiffCounters();
+      });
+      lbl.append(cb, document.createTextNode(' Удалить'));
+      row.classList.toggle('off-c', !cb.checked);
+      row.append(lbl, content);
+      //++agent TASK-225
     } else {
       row.append(content);
     }
     return row;
   };
+  //++agent TASK-225 [26.09.2026] H.6/Q: удаления инструментов —
+  // один фильтр на всех потребителей.
+  const toolRemovals = () => wiz.diff.changes.filter(c => c.kind === 'TOOL_REMOVED');
+  //++agent TASK-225
   const block = (cls, shield, shieldCls, title, tip) => {
     const b = el('div', `blk${cls ? ` ${cls}` : ''}`);
     const h = el('div', 'blk-h');
@@ -3801,7 +3845,11 @@ async function adminPage() {
     $('#cmpTitle').textContent = active ? `${toLabel} против действующей версии ${diff.from_version}` : `${toLabel} — действующей версии нет, сравнение с пустой настройкой`;
     const weak = diff.changes.filter(c => c.class === 'weakening');
     const strong = diff.changes.filter(c => c.class === 'strengthening');
-    const neutral = diff.changes.filter(c => c.class === 'neutral');
+    //++agent TASK-225 [26.09.2026] H.6: удаления — свой блок,
+    // в «нейтральных» не прячем.
+    const removals = toolRemovals();
+    const neutral = diff.changes.filter(c => c.class === 'neutral' && c.kind !== 'TOOL_REMOVED');
+    //++agent TASK-225
     if (!diff.changes.length && !diff.warnings.length) {
       body.append(el('div', 'note ok', 'Отличий нет — версия совпадает с действующей настройкой.'));
     }
@@ -3831,6 +3879,27 @@ async function adminPage() {
     strong.forEach(ch => bs.append(changeRow(ch, 'flat')));
     if (strong.length && wiz.mode !== 'compare') bs.append(el('p', 'small muted p14 m0', 'Снимите флаг, чтобы не переносить отдельное усиление в действующую версию: оно вернётся к состоянию действующей. «Принимаю все» ставит или снимает все флаги.'));
     body.append(bs);
+    //++agent TASK-225 [26.09.2026] H.6: удаления инструментов —
+    // отказываемые (галочка = удалить, по умолчанию включена).
+    if (removals.length) {
+      const [br, hr] = block('warnb', '×', 'w', 'Удаления инструментов',
+        'Инструменты, которых нет в файле настройки. После активации их записи удаляются; при повторном вызове инструмент появится с меткой «новый» и будет запрещён до выбора режима. Удаления предлагаются только для черновика, созданного импортом файла — ручной черновик или откат не удаляют классификации.');
+      const noneLbl = el('label', 'cf right-auto');
+      const none = document.createElement('input');
+      none.type = 'checkbox';
+      none.id = 'remNone';
+      none.disabled = wiz.mode === 'compare';
+      none.checked = removals.every(ch => wiz.declined.has(ch.id));
+      none.addEventListener('change', () => {
+        removals.forEach(ch => { if (none.checked) wiz.declined.add(ch.id); else wiz.declined.delete(ch.id); });
+        renderDiff();
+      });
+      noneLbl.append(none, document.createTextNode(' Отказаться от всех удалений'));
+      hr.append(noneLbl);
+      removals.forEach(ch => br.append(changeRow(ch, 'flat')));
+      body.append(br);
+    }
+    //++agent TASK-225
     // C. Предупреждения — исключаемы построчно.
     const [bx, hx] = block('warnb', '!', 'w', 'Предупреждения');
     hx.append(el('span', 'tag warn', String(diff.warnings.length)));
@@ -4131,6 +4200,9 @@ async function adminPage() {
           confirmed_weakenings: [...wiz.confirmed],
           accepted_strengthenings: [...wiz.accepted],
           excluded_warnings: [...wiz.excluded],
+          //++agent TASK-225 [26.09.2026] H.6: отказы от удалений.
+          declined_tool_removals: [...wiz.declined],
+          //++agent TASK-225
           comment: $('#actComment').value.trim() || undefined,
         }),
       });
@@ -4280,7 +4352,7 @@ async function adminPage() {
           $('#toolsSave').textContent = tools.dirty.size ? `Сохранить изменения (${tools.dirty.size})` : 'Сохранить изменения';
           sel.title = (TOOL_MODE[next] || [])[3] || '';
         };
-        if (next === 'metadata-bypass' && tool.class !== 'metadata-bypass') {
+        if (next === 'no-mask' && tool.class !== 'no-mask') {
           askBypass(tool.tool_name, apply, () => { sel.value = current; });
         } else {
           apply();
@@ -4292,6 +4364,27 @@ async function adminPage() {
       tr.append(el('td', 'hide-sm small', tool.auto_added ? `впервые ${fmtTime(tool.first_seen_at)}` : fmtTime(tool.updated_at)));
       tr.append(el('td', 'hide-sm', String(tool.denied_count || 0)));
       tr.append(el('td', `hide-sm${tool.reviewer ? '' : ' muted'}`, loginOf(tool.reviewer)));
+      //++agent TASK-225 [26.09.2026] удаление записи классификации —
+      // снятые из 1С инструменты не должны вечно висеть в списке.
+      const delTd = el('td');
+      const delBtn = el('button', 'btn sm', 'Удалить');
+      delBtn.type = 'button';
+      delBtn.title = 'Убрать инструмент из списка. Если его снова вызовут, он появится с меткой «новый» и будет запрещён до выбора режима.';
+      delBtn.addEventListener('click', () => {
+        askConfirm('Удалить инструмент из списка?', `Запись о режиме «${tool.tool_name}» будет удалена. Если инструмент вызовут снова, он появится с меткой «новый», и его вызовы будут отклоняться до выбора режима.`, async () => {
+          try {
+            await api(dbPath(`/tools/${encodeURIComponent(tool.tool_name)}`), { method: 'DELETE' });
+            tools.dirty.delete(tool.tool_name);
+            await loadTools(dbs.current);
+          } catch (error) {
+            showError($('#toolsErr'), error);
+            renderTools();
+          }
+        });
+      });
+      delTd.append(delBtn);
+      tr.append(delTd);
+      //++agent TASK-225
     }
     $('#toolsSave').disabled = tools.dirty.size === 0;
     $('#toolsReset').hidden = tools.dirty.size === 0;
@@ -4324,7 +4417,7 @@ async function adminPage() {
       for (const [toolName, cls] of tools.dirty) {
         await api(`/api/v1/admin/databases/${encodeURIComponent(dbs.current.id)}/tools/${encodeURIComponent(toolName)}`, {
           method: 'PUT',
-          body: JSON.stringify(cls === 'metadata-bypass' ? { class: cls, confirm_bypass: true } : { class: cls }),
+          body: JSON.stringify(cls === 'no-mask' ? { class: cls, confirm_bypass: true } : { class: cls }),
         });
         tools.dirty.delete(toolName);
       }

@@ -1,8 +1,7 @@
+mod common;
 //++agent TASK-225 [26.09.2026]
 // T2-*: миграция 0010 (перенос данных §2.3, частичные уникальные индексы,
 // content_hash §2.4) и §2.5 — селекторы словаря из активной версии.
-
-mod common;
 
 use std::sync::Arc;
 
@@ -232,7 +231,9 @@ fn migration_retires_extra_drafts_keeping_latest() {
 fn unique_partial_indexes_hold_for_draft_and_active() {
     let storage = SqliteStorage::in_memory().unwrap();
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let next = std::sync::atomic::AtomicI64::new(1);
     let insert = |status: &str| {
         let version = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -252,7 +253,9 @@ fn unique_partial_indexes_hold_for_draft_and_active() {
     assert!(insert("retired").is_ok());
     // другая база — свой draft
     let other = Uuid::new_v4();
-    storage.ensure_database(other).unwrap();
+    storage
+        .insert_database(other, &common::test_identity(other))
+        .unwrap();
     assert!(
         storage
             .with_connection(|c| c.execute(
@@ -268,7 +271,9 @@ fn unique_partial_indexes_hold_for_draft_and_active() {
 fn content_hash_is_deterministic_and_tracks_content() {
     let storage = SqliteStorage::in_memory().unwrap();
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let rules = [PolicyRule {
         selector: RuleSelector::Name,
         pattern: "*Инн*".to_owned(),
@@ -300,7 +305,9 @@ fn content_hash_is_deterministic_and_tracks_content() {
 async fn pull_uses_dictionary_of_active_version() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(
             database_id,
@@ -393,5 +400,140 @@ async fn pull_uses_dictionary_of_active_version() {
     assert_eq!(selectors.len(), 1);
     assert_eq!(selectors[0]["source_path"], "Catalog.Versioned.Name");
     assert_eq!(selectors[0]["category"], "VER");
+}
+
+//++agent TASK-225 [26.09.2026] L R4-8
+/// База "до 0015": DDL 0001..0014 + schema_migrations(1..14).
+/// `tool_classifications.class` несёт дореименованный CHECK —
+/// 'metadata-bypass' был допустимым классом.
+fn legacy_database_14() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("setup.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    for file in [
+        "0001_core.sql",
+        "0002_terminal_history.sql",
+        "0003_v2_call_receipts.sql",
+        "0004_v2_active_snapshots.sql",
+        "0005_v2_feed_leases.sql",
+        "0006_v2_feed_completion_proof.sql",
+        "0007_v2_refresh_intents.sql",
+        "0008_drop_v2_feed.sql",
+        "0009_call_contexts.sql",
+        "0010_setup_versions.sql",
+        "0011_tool_auto_classification.sql",
+        "0012_strict_mode.sql",
+        "0013_refresh_backoff.sql",
+        "0014_mask_token_flag.sql",
+    ] {
+        let sql = std::fs::read_to_string(format!("migrations/{file}")).unwrap();
+        // 0011+ повторяют ADD COLUMN'ы 0010 — настоящий runner
+        // применяет их поколоночно с пропуском существующих; в фикстуре
+        // то же самое — постатейно, дубли колонок игнорируем.
+        if file.starts_with("0011")
+            || file.starts_with("0012")
+            || file.starts_with("0013")
+            || file.starts_with("0014")
+        {
+            for statement in sql.split(';') {
+                let statement = statement.trim();
+                if statement.is_empty() {
+                    continue;
+                }
+                match connection.execute_batch(statement) {
+                    Ok(()) => {}
+                    Err(error) if error.to_string().contains("duplicate column name") => {
+                        // колонка уже есть — как у apply_add_column_migration
+                    }
+                    Err(error) => panic!("{file}: {error}"),
+                }
+            }
+        } else {
+            connection.execute_batch(&sql).unwrap();
+        }
+    }
+    for version in 1..=14i64 {
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 'x')",
+                [version],
+            )
+            .unwrap();
+    }
+    (dir, path)
+}
+
+/// Миграция 0015: 'metadata-bypass' в tool_classifications и снимках
+/// policies.tools_json переводится в 'no-mask'; новый CHECK отвергает
+/// старое имя.
+#[test]
+fn migration_0015_renames_metadata_bypass_to_no_mask() {
+    let (_dir, path) = legacy_database_14();
+    let database_id = Uuid::new_v4();
+    let policy_id = Uuid::new_v4().to_string();
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        ensure_db_row(&connection, database_id);
+        connection
+            .execute(
+                "INSERT INTO tool_classifications(database_id,tool_name,class,updated_at)
+                 VALUES (?1,'legacy_tool','metadata-bypass','t'),
+                        (?1,'kept_tool','data-mask','t')",
+                [database_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO policies(id,database_id,version,status,created_at,updated_at,origin,tools_json)
+                 VALUES (?1,?2,1,'active','t','t','import',?3)",
+                rusqlite::params![
+                    policy_id,
+                    database_id.to_string(),
+                    json!([
+                        {"tool":"legacy_tool","mode":"metadata-bypass","reason":"r"},
+                        {"tool":"kept_tool","mode":"data-mask","reason":"r"}
+                    ])
+                    .to_string()
+                ],
+            )
+            .unwrap();
+    }
+    let storage = SqliteStorage::open(&path).unwrap();
+    assert_eq!(
+        query_one::<String>(
+            &storage,
+            "SELECT class FROM tool_classifications WHERE database_id=?1 AND tool_name='legacy_tool'",
+            [database_id.to_string()],
+        ),
+        "no-mask"
+    );
+    assert_eq!(
+        query_one::<String>(
+            &storage,
+            "SELECT class FROM tool_classifications WHERE database_id=?1 AND tool_name='kept_tool'",
+            [database_id.to_string()],
+        ),
+        "data-mask"
+    );
+    let tools_json = query_one::<String>(
+        &storage,
+        "SELECT tools_json FROM policies WHERE id=?1",
+        [policy_id],
+    );
+    assert!(!tools_json.contains("metadata-bypass"), "{tools_json}");
+    assert!(tools_json.contains("\"mode\":\"no-mask\""), "{tools_json}");
+    // Новый CHECK: старое имя отвергается.
+    let rejected = storage.with_connection(|c| {
+        c.execute(
+            "INSERT INTO tool_classifications(database_id,tool_name,class,updated_at)
+             VALUES (?1,'old_name_tool','metadata-bypass','t')",
+            [database_id.to_string()],
+        )
+        .map(|_| ())
+    });
+    assert!(rejected.is_err(), "CHECK обязан отвергать metadata-bypass");
 }
 //++agent TASK-225

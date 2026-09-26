@@ -41,6 +41,15 @@ pub(crate) struct StoredVersion {
     pub rules: Vec<StoredVersionRule>,
 }
 
+impl StoredVersion {
+    /// Черновик создан импортом файла — единственный источник
+    /// TOOL_REMOVED в diff (R4-2): у ручного/legacy/rollback-черновика
+    /// секция tools — частичный снимок, удалений по нему не предлагаем.
+    pub(crate) fn is_import(&self) -> bool {
+        self.origin == "import"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StoredVersionRule {
     pub id: Uuid,

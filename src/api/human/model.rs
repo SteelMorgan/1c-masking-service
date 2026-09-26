@@ -44,6 +44,15 @@ pub struct DatabaseSummary {
     pub setup_state: String,
     pub active_version: Option<i64>,
     pub draft_version: Option<i64>,
+    //++agent TASK-225 [26.09.2026] N
+    /// Координаты базы из session.register (`Srvr`/`Ref`) и источник
+    /// идентификаторов: `ras` — реальные GUID-ы кластера/ИБ, `generated` —
+    /// сгенерированная пара при недоступном RAS, `null` — запись до
+    /// первой регистрации по координатам.
+    pub cluster_server: Option<String>,
+    pub infobase_name: Option<String>,
+    pub guid_source: Option<String>,
+    //++agent TASK-225
 }
 
 //++agent TASK-225 [25.09.2026]
@@ -72,7 +81,12 @@ pub(crate) fn refresh_error_text(
     first_failed_at: Option<&str>,
 ) -> String {
     let base = match code {
-        "MANAGER_UNAVAILABLE" => "Менеджер MCP недоступен: сервис не может получить метаданные и словарь базы. Проверьте, что менеджер запущен и база подключена в нём.".to_owned(),
+        //++agent TASK-225 [26.09.2026] N: различаем «менеджер не отвечает»
+        // (транспорт/таймаут) и «менеджер работает, но активной сессии этой
+        // ИБ сейчас нет» (`no_target` → DATABASE_NOT_CONNECTED).
+        "MANAGER_UNAVAILABLE" => "Менеджер MCP недоступен: сервис не может получить метаданные и словарь базы. Проверьте, что менеджер запущен.".to_owned(),
+        "DATABASE_NOT_CONNECTED" => "Менеджер MCP работает, но активной сессии этой информационной базы сейчас нет: подключите базу и нажмите «Обновить метаданные».".to_owned(),
+        //++agent TASK-225
         "INTERNAL_TOOL_FAILED" => "База отклонила запрос метаданных/словаря (инструмент выгрузки вернул ошибку). Проверьте журнал регистрации базы.".to_owned(),
         "STORAGE_UNAVAILABLE" => "Внутреннее хранилище сервиса занято или недоступно. Повтор будет автоматически.".to_owned(),
         "POLICY_INVALID" => "Действующая настройка содержит правила, которые сервис пока не может применить (например, «Секрет»). Исправьте настройку.".to_owned(),
@@ -227,7 +241,7 @@ pub struct ToolClassification {
 pub struct ToolClassificationPatch {
     pub class: String,
     //++agent TASK-225 [26.09.2026]
-    /// B10: `metadata-bypass` — исключение инструмента из маскирования,
+    /// B10: `no-mask` — исключение инструмента из маскирования,
     /// сервер требует явного подтверждения диалога С4.
     //++agent TASK-225
     #[serde(default)]
@@ -351,9 +365,9 @@ pub enum HumanDataError {
     // максимум один draft на базу (§2.2 частичный индекс).
     #[error("draft already exists")]
     DraftExists,
-    /// B10: metadata-bypass без confirm_bypass:true — серверный барьер
+    /// B10: no-mask без confirm_bypass:true — серверный барьер
     /// к подтверждающему диалогу С4 в UI.
-    #[error("metadata-bypass requires confirm_bypass")]
+    #[error("no-mask requires confirm_bypass")]
     BypassNotConfirmed,
     /// §4 legacy-activate: diff(active, черновик) содержит ослабления —
     /// без подтверждений B7 они неактивируемы (барьер не обходится
@@ -406,6 +420,17 @@ pub trait HumanDataStore: Send + Sync {
         database_id: Uuid,
         tool_name: &str,
         patch: ToolClassificationPatch,
+        correlation_id: Uuid,
+    ) -> Result<(), HumanDataError>;
+    //++agent TASK-225 [26.09.2026]
+    /// Удаление записи классификации (снятый из 1С инструмент не должен
+    /// вечно висеть в админке). `NotFound`, если записи нет.
+    //++agent TASK-225
+    fn delete_tool_classification(
+        &self,
+        actor: &Principal,
+        database_id: Uuid,
+        tool_name: &str,
         correlation_id: Uuid,
     ) -> Result<(), HumanDataError>;
     fn list_dictionary_configs(

@@ -50,6 +50,10 @@ impl SetupService {
         connection: &rusqlite::Connection,
         database_id: Uuid,
         database_mismatch: bool,
+        //++agent TASK-225 [26.09.2026] R4-2: полный снимок tools
+        // (TOOL_REMOVED) — только у версии из импорта файла.
+        to_is_import: bool,
+        //++agent TASK-225
     ) -> rusqlite::Result<DiffContext> {
         //++agent TASK-225 [26.09.2026] M-2/M-3: expandable-пути F9 и
         // текущие режимы инструментов — контекст §3.4/§3.5.
@@ -92,6 +96,7 @@ impl SetupService {
             tool_modes,
             source_stats,
             database_mismatch,
+            to_is_import,
         })
     }
 }
@@ -108,7 +113,11 @@ pub(crate) fn export_file_json(
     include_tools: Option<Vec<setup::ToolSpec>>,
     now: &str,
 ) -> Value {
-    let missing_reason = "не указано (создано до TASK-225)";
+    //++agent TASK-225 [26.09.2026]
+    // Плейсхолдер — общая константа: diff признаёт его эквивалентом
+    // пустого reason (`reason_key`), round-trip не шумит REASON_CHANGED.
+    let missing_reason = setup::REASON_PLACEHOLDER;
+    //++agent TASK-225
     let sources: Vec<Value> = content
         .dictionary
         .sources
@@ -123,7 +132,7 @@ pub(crate) fn export_file_json(
             map.insert(
                 "reason".into(),
                 (if source.reason.is_empty() {
-                    missing_reason.to_string()
+                    missing_reason.to_owned()
                 } else {
                     source.reason.clone()
                 })
@@ -149,7 +158,7 @@ pub(crate) fn export_file_json(
             map.insert(
                 "reason".into(),
                 (if rule.reason.is_empty() {
-                    missing_reason.to_string()
+                    missing_reason.to_owned()
                 } else {
                     rule.reason.clone()
                 })
@@ -245,6 +254,13 @@ pub(crate) struct ActivateRequest {
     pub accepted_strengthenings: Vec<String>,
     #[serde(default)]
     pub excluded_warnings: Vec<String>,
+    //++agent TASK-225 [26.09.2026]
+    /// H.6: отказы от удалений инструментов (id изменений TOOL_REMOVED).
+    /// По умолчанию удаление принято — отказ возвращает записи в
+    /// tool_classifications нетронутыми.
+    //++agent TASK-225
+    #[serde(default)]
+    pub declined_tool_removals: Vec<String>,
     #[serde(default)]
     pub comment: Option<String>,
 }
@@ -607,31 +623,52 @@ pub(crate) async fn setup_journal(
 // B5: diff версий (§3)
 // ------------------------------------------------------------------
 
+/// Готовый прогон diff: `from=None` — сравнение с пустой настройкой.
+struct DiffRun {
+    from: Option<store::StoredVersion>,
+    to: store::StoredVersion,
+    diff: setup::SetupDiff,
+}
+
+/// Какая сторона diff не найдена: промахи разводятся, потому что
+/// `to=draft` без черновика — 409 NO_DRAFT, а промах по `from` — 404.
+enum DiffMiss {
+    To,
+    From,
+}
+
 /// Общий прогон diff: загружает версии из ссылки, считает §3-функцию.
-/// `Ok(None)` — версия не найдена (ответ формирует вызывающий).
+/// `Err(DiffMiss::To)` — цель не найдена; `Err(DiffMiss::From)` — версия
+/// `from` не найдена (`from=active` без активной версии — не промах:
+/// J, сравнение с пустой настройкой, иначе первую версию базы
+/// невозможно сравнить и активировать из мастера).
 fn run_diff(
     state: &SetupService,
     database_id: Uuid,
     from_ref: &VersionRef,
     to_ref: &VersionRef,
     database_mismatch: bool,
-) -> Result<Option<(store::StoredVersion, store::StoredVersion, setup::SetupDiff)>, rusqlite::Error>
-{
+) -> Result<Result<DiffRun, DiffMiss>, rusqlite::Error> {
     state.storage.with_connection(|connection| {
         let from = store::load_version(connection, database_id, from_ref)?;
         let to = store::load_version(connection, database_id, to_ref)?;
-        let (Some(from), Some(to)) = (from, to) else {
-            return Ok(None);
+        let Some(to) = to else {
+            return Ok(Err(DiffMiss::To));
         };
-        let context = state.diff_context(connection, database_id, database_mismatch)?;
-        let from_content = store::stored_version_content(&from);
+        let from_content = match from.as_ref() {
+            Some(version) => store::stored_version_content(version),
+            None if *from_ref == VersionRef::Active => store::empty_content(),
+            None => return Ok(Err(DiffMiss::From)),
+        };
+        let context =
+            state.diff_context(connection, database_id, database_mismatch, to.is_import())?;
         let diff = compute_diff(
             &from_content,
             //++agent TASK-225: NULL-словарь цели наследуется (review MAJOR-5)
             &store::stored_version_content_for_to(&to, &from_content),
             &context,
         );
-        Ok(Some((from, to, diff)))
+        Ok(Ok(DiffRun { from, to, diff }))
     })
 }
 
@@ -682,19 +719,23 @@ pub(crate) async fn diff_setup(
         return ApiError::bad_request("from/to: active|draft|номер").into_response();
     };
     match run_diff(&state.setup, id, &from_ref, &to_ref, false) {
-        Ok(Some((from, to, diff))) => {
-            let mut body = diff_response(&diff);
-            body["from_version"] = from.version.into();
-            body["to_version"] = to.version.into();
-            body["to_hash"] = to.content_hash.unwrap_or_default().into();
+        Ok(Ok(run)) => {
+            let mut body = diff_response(&run.diff);
+            //++agent TASK-225 [26.09.2026] J: первая версия —
+            // `from_version: null` (сравнение с пустой настройкой).
+            body["from_version"] = run.from.map(|version| version.version).into();
+            //++agent TASK-225
+            body["to_version"] = run.to.version.into();
+            body["to_hash"] = run.to.content_hash.unwrap_or_default().into();
             Json(body).into_response()
         }
         //++agent TASK-225: NO_DRAFT только когда отсутствует именно
-        // черновик (review MINOR-7) — иначе маскируем отсутствие from.
-        Ok(None) if to_ref == VersionRef::Draft => {
+        // целевой черновик (review MINOR-7) — промах по from остаётся
+        // 404, как до J.
+        Ok(Err(DiffMiss::To)) if to_ref == VersionRef::Draft => {
             ApiError::conflict_code("NO_DRAFT", "у базы нет черновика").into_response()
         }
-        Ok(None) => {
+        Ok(Err(_)) => {
             ApiError::not_found_code("VERSION_NOT_FOUND", "версия не найдена").into_response()
         }
         Err(error) => setup_storage_error("diff_setup", &error),
@@ -835,9 +876,12 @@ pub(crate) async fn import_setup(
         // Предупреждения импорта — по diff(active, draft) с флагом
         // database_mismatch (§3.6 DATABASE_MISMATCH).
         let active = store::load_version(&transaction, id, &VersionRef::Active)?;
+        //++agent TASK-225 [26.09.2026] R4-2: parsed.content — сам файл
+        // импорта, его секция tools авторитетна для TOOL_REMOVED.
         let diff_context = state
             .setup
-            .diff_context(&transaction, id, database_mismatch)?;
+            .diff_context(&transaction, id, database_mismatch, true)?;
+        //++agent TASK-225
         let warnings = active
             .map(|active| {
                 compute_diff(
@@ -1071,7 +1115,7 @@ fn draft_view(
 ) -> rusqlite::Result<Value> {
     let content = store::stored_version_content(version);
     let manifest_paths = state
-        .diff_context(connection, database_id, false)?
+        .diff_context(connection, database_id, false, false)?
         .manifest_paths;
     let sources: Vec<Value> = content
         .dictionary
@@ -1353,7 +1397,12 @@ pub(crate) async fn draft_revert(
             .map(store::stored_version_content)
             .unwrap_or_else(store::empty_content);
         let mut content = store::stored_version_content(&draft);
-        let context = state.setup.diff_context(&transaction, id, false)?;
+        //++agent TASK-225 [26.09.2026] R4-2: revert воспроизводит те же
+        // id изменений — флаг импорта обязан совпадать с diff-вью.
+        let context = state
+            .setup
+            .diff_context(&transaction, id, false, draft.is_import())?;
+        //++agent TASK-225
         let diff = compute_diff(&from, &content, &context);
         if let Err(unknown) =
             store::apply_change_reverts(&mut content, &diff.changes, &request.change_ids)
@@ -1539,7 +1588,12 @@ pub(crate) async fn activate_setup(
             .map(store::stored_version_content)
             .unwrap_or_else(store::empty_content);
         // Шаг 3: пересчёт diff и предупреждений сервером.
-        let context = state.setup.diff_context(&transaction, id, false)?;
+        //++agent TASK-225 [26.09.2026] R4-2: TOOL_REMOVED — только для
+        // черновика, пришедшего из импорта файла.
+        let context = state
+            .setup
+            .diff_context(&transaction, id, false, draft.is_import())?;
+        //++agent TASK-225
         //++agent TASK-225 [26.09.2026] review MAJOR-5: legacy-черновик без
         // dictionary_json («не задано») наследует словарь активной — иначе
         // барьер видел бы фантомные SOURCE_REMOVED. Унаследованное
@@ -1579,6 +1633,21 @@ pub(crate) async fn activate_setup(
             .iter()
             .map(String::as_str)
             .collect();
+        //++agent TASK-225 [26.09.2026]
+        // H.6: удаления инструментов — отказываемые (declined), остальные
+        // приняты по умолчанию.
+        //++agent TASK-225
+        let removal_ids: HashSet<String> = diff
+            .changes
+            .iter()
+            .filter(|change| change.kind == "TOOL_REMOVED")
+            .map(|change| change.id.clone())
+            .collect();
+        let declined: HashSet<&str> = request
+            .declined_tool_removals
+            .iter()
+            .map(String::as_str)
+            .collect();
         // Шаг 4: confirmed ⊇ W; id вне текущего diff — STALE_CONFIRMATION.
         let stale: Vec<String> = confirmed
             .iter()
@@ -1589,6 +1658,7 @@ pub(crate) async fn activate_setup(
                     .filter(|id| !strengthening_ids.contains(**id)),
             )
             .chain(excluded.iter().filter(|id| !warning_ids.contains(**id)))
+            .chain(declined.iter().filter(|id| !removal_ids.contains(**id)))
             .map(|id| id.to_string())
             .collect();
         if !stale.is_empty() {
@@ -1654,6 +1724,23 @@ pub(crate) async fn activate_setup(
             transaction.commit()?;
             return Ok(Err(json!({"code":"SECRET_POLICY_UNSUPPORTED"})));
         }
+        //++agent TASK-225 [26.09.2026]
+        // H.6: принятые TOOL_REMOVED — имена инструментов из subject
+        // изменений, не отмеченных в declined. Удаление и аудит — в той
+        // же транзакции активации (путь H.1 DELETE).
+        //++agent TASK-225
+        let applied_removals: Vec<String> = diff
+            .changes
+            .iter()
+            .filter(|change| {
+                change.kind == "TOOL_REMOVED" && !declined.contains(change.id.as_str())
+            })
+            .filter_map(|change| {
+                change.subject.as_ref()?["tool"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
         // Шаги 8+10: итог в черновик, переключение статусов/зеркала/intent.
         store::write_version_content(&transaction, draft.id, &content, &now)?;
         let version = store::activate_draft_tx(
@@ -1664,6 +1751,12 @@ pub(crate) async fn activate_setup(
             request.comment.as_deref(),
             &now,
         )?;
+        for tool in &applied_removals {
+            //++agent TASK-225 [26.09.2026] R4-9/Q: единый путь
+            // удаления — тот же delete_tool_row, что у DELETE-endpoint.
+            super::sqlite::delete_tool_row(&transaction, &actor, id, tool, Uuid::new_v4(), &now)?;
+            //++agent TASK-225
+        }
         store::journal_insert(
             &transaction,
             id,
@@ -1678,6 +1771,8 @@ pub(crate) async fn activate_setup(
                 "accepted_strengthenings": request.accepted_strengthenings,
                 "reverted_strengthenings": reverted,
                 "excluded_warnings": request.excluded_warnings,
+                //++agent TASK-225 [26.09.2026] H.6.
+                "tool_removals": applied_removals,
                 "comment": request.comment,
             })),
             &now,
@@ -1698,10 +1793,11 @@ pub(crate) async fn activate_setup(
             final_counts,
             reverted,
             excluded_items,
+            applied_removals,
         )))
     });
     match outcome {
-        Ok(Ok((version, policy_id, counts, reverted, excluded))) => {
+        Ok(Ok((version, policy_id, counts, reverted, excluded, applied_removals))) => {
             //++agent TASK-225 [26.09.2026] MINOR-5/§2.5: снимок правил в
             // RAM применяем сразу после commit — активированная версия
             // действует до успешного pull (менеджер может быть в
@@ -1733,6 +1829,9 @@ pub(crate) async fn activate_setup(
                 "applied": counts,
                 "reverted_strengthenings": reverted,
                 "excluded_items": excluded,
+                //++agent TASK-225 [26.09.2026] H.6: фактически удалённые
+                // записи классификации (принятые TOOL_REMOVED).
+                "tool_removals": applied_removals,
                 "refresh": {"state": "pending"},
             }))
             .into_response()

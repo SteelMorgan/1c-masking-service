@@ -30,6 +30,22 @@ pub(crate) const SETUP_MAX_ERRORS: usize = 200;
 /// Причина, которой миграция §2.3 заполняет перенесённые источники/правила
 /// без reason (старый формат её не имел).
 pub(crate) const MIGRATION_REASON: &str = "перенос из миграции 0010";
+///++agent TASK-225 [26.09.2026]
+/// Плейсхолдер reason: файл обязан нести обоснование (§1), поэтому
+/// экспорт подставляет его в пустой reason. При обратном импорте
+/// diff не должен шуметь REASON_CHANGED — `reason_key` ниже.
+pub(crate) const REASON_PLACEHOLDER: &str = "не указано (создано до версионирования настройки)";
+
+/// Ключ сравнения reason в diff: пустой и плейсхолдер эквивалентны —
+/// round-trip export→import неизменённой настройки даёт 0 изменений.
+pub(crate) fn reason_key(reason: &str) -> &str {
+    if reason.trim().is_empty() || reason == REASON_PLACEHOLDER {
+        ""
+    } else {
+        reason
+    }
+}
+//++agent TASK-225
 
 /// §1.2 generated_by — кто сформировал файл.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +160,7 @@ pub(crate) struct SetupChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<serde_json::Value>,
     //++agent TASK-225 [26.09.2026] §3.5: дополнение изменения
-    // (name_looks_like_data у TOOL_BYPASS).
+    // (name_looks_like_data у TOOL_NO_MASK).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
     //++agent TASK-225

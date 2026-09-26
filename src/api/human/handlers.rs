@@ -748,6 +748,29 @@ pub async fn update_tool_classification(
     }
 }
 
+//++agent TASK-225 [26.09.2026]
+// DELETE — снятие записи классификации (инструмент, снятый из 1С,
+// не должен вечно висеть в админке). Только Admin + CSRF, аудит
+// tool.delete в той же транзакции, что и DELETE.
+//++agent TASK-225
+pub async fn delete_tool_classification(
+    State(state): State<Arc<HumanState>>,
+    Path((id, tool)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match admin_mutation(&state, &headers) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    match state
+        .data
+        .delete_tool_classification(&actor, id, &tool, Uuid::new_v4())
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => data_error(e).into_response(),
+    }
+}
+
 pub async fn dictionary_configs(
     State(state): State<Arc<HumanState>>,
     Path(id): Path<Uuid>,
@@ -945,7 +968,7 @@ pub(crate) fn data_error(error: HumanDataError) -> ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "BYPASS_NOT_CONFIRMED",
             message:
-                "Режим «метаданные без маскирования» требует явного подтверждения (confirm_bypass)",
+                "Режим «без маскирования» (no-mask) требует явного подтверждения (confirm_bypass)",
             details: None,
         },
         //++agent TASK-225

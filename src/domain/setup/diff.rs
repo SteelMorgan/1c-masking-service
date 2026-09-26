@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde_json::Value;
 
 use super::{
-    canonical_value_bytes, change_id, rule_key, sha256_bytes_hex, source_key, ChangeClass,
-    SetupChange, SetupWarning, ToolSpec, VersionContent,
+    canonical_value_bytes, change_id, reason_key, rule_key, sha256_bytes_hex, source_key,
+    ChangeClass, SetupChange, SetupWarning, ToolSpec, VersionContent,
 };
 
 /// Контекст diff — всё внешнее, что нужно для предупреждений §3.6.
@@ -41,6 +41,16 @@ pub(crate) struct DiffContext {
     pub source_stats: Option<HashMap<String, super::SourceStat>>,
     /// Импорт: database_hint.id задан и не совпал с целевой базой.
     pub database_mismatch: bool,
+    //++agent TASK-225 [26.09.2026] фаза-2 L R4-2
+    /// `to`-версия пришла из импорта файла (origin=import) — только её
+    /// секция tools авторитетна как ПОЛНЫЙ снимок набора режимов, а
+    /// значит только для неё отсутствие инструмента в файле =
+    /// отказываемое TOOL_REMOVED. Черновик «из действующей», legacy-
+    /// черновик и откат наследуют tools_json как частичный снимок —
+    /// удалений по ним не эмитим (иначе каждый ручной черновик
+    /// «удалял» бы классификации, не попавшие в старый снимок).
+    pub to_is_import: bool,
+    //++agent TASK-225
 }
 
 /// Результат diff.
@@ -154,6 +164,16 @@ fn rule_json(rule: &super::RuleSpec) -> Value {
     Value::Object(map)
 }
 
+//++agent TASK-225 [26.09.2026]
+/// Сравнение правил «по сути»: reason нормализуется — пустой и
+/// экспортный плейсхолдер эквивалентны (иначе round-trip шумит
+/// REASON_CHANGED). Для before/after в ответе — сырой `rule_json`.
+fn rule_cmp_json(rule: &super::RuleSpec) -> Value {
+    let mut value = rule_json(rule);
+    value["reason"] = reason_key(&rule.reason).into();
+    value
+}
+
 fn source_json(source: &super::DictionarySourceSpec) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("source_path".into(), source.source_path.clone().into());
@@ -171,6 +191,7 @@ fn source_json(source: &super::DictionarySourceSpec) -> Value {
 fn tool_json(tool: &ToolSpec) -> Value {
     serde_json::json!({"tool": tool.tool, "mode": tool.mode, "reason": tool.reason})
 }
+//--agent TASK-225
 
 /// §3: diff контента. Порядок обхода детерминирован (BTreeMap, сортировки)
 /// — id изменений и порядок в ответе воспроизводимы.
@@ -308,7 +329,7 @@ fn diff_rules(
                 .unwrap_or("none");
             let raw_changed = raw_from
                 .zip(raw_to)
-                .is_some_and(|(x, y)| rule_json(x) != rule_json(y));
+                .is_some_and(|(x, y)| rule_cmp_json(x) != rule_cmp_json(y));
             if b == "keep" || a == "keep" {
                 if b != a || raw_changed {
                     let mut item = change(
@@ -410,7 +431,7 @@ fn diff_rules(
                     // То же эффективное действие — нейтральные правки.
                     let raw_changed = raw_from
                         .zip(raw_to)
-                        .is_some_and(|(x, y)| rule_json(x) != rule_json(y));
+                        .is_some_and(|(x, y)| rule_cmp_json(x) != rule_cmp_json(y));
                     if before.category != after.category && selector != "dictionary" {
                         changes.push(change(
                             "rule",
@@ -465,7 +486,7 @@ fn diff_rules(
             (None, None) => {
                 if raw_from
                     .zip(raw_to)
-                    .is_some_and(|(x, y)| rule_json(x) != rule_json(y))
+                    .is_some_and(|(x, y)| rule_cmp_json(x) != rule_cmp_json(y))
                 {
                     changes.push(change(
                         "rule",
@@ -939,7 +960,7 @@ fn diff_dictionary(
                                 source_json(after),
                             ));
                         }
-                        if before.reason != after.reason
+                        if reason_key(&before.reason) != reason_key(&after.reason)
                             || before.estimated_values != after.estimated_values
                         {
                             changes.push(change(
@@ -1179,7 +1200,7 @@ fn human_count_label(count: i64) -> String {
 
 /// §3.5: инструменты. Снимок `tools` версии сравнивается с `from`;
 /// отсутствующий ранее инструмент трактуется как deny-pending-review
-/// (дефолт автоклассификации) — добавление metadata-bypass/data-mask
+/// (дефолт автоклассификации) — добавление no-mask/data-mask
 /// тогда честно классифицируется ослаблением.
 //++agent TASK-225 [26.09.2026] M-2: §3.5 — `before` это текущая строка
 /// tool_classifications (отсутствие → deny-pending-review), а не снимок
@@ -1211,8 +1232,8 @@ fn diff_tools(
             continue;
         }
         let (kind, class, detail) = match (before.as_str(), after.mode.as_str()) {
-            (_, "metadata-bypass") => (
-                "TOOL_BYPASS",
+            (_, "no-mask") => (
+                "TOOL_NO_MASK",
                 ChangeClass::Weakening,
                 Some(serde_json::json!({
                     "name_looks_like_data": name_looks_like_data(&after.tool),
@@ -1220,13 +1241,13 @@ fn diff_tools(
             ),
             ("deny-pending-review", "data-mask") => ("TOOL_ENABLED", ChangeClass::Neutral, None),
             ("data-mask", "deny-pending-review")
-            | ("metadata-bypass", "data-mask")
-            | ("metadata-bypass", "deny-pending-review") => {
+            | ("no-mask", "data-mask")
+            | ("no-mask", "deny-pending-review") => {
                 ("TOOL_RESTRICTED", ChangeClass::Strengthening, None)
             }
             // Остальные переходы консервативно считаются ослаблением.
             _ => (
-                "TOOL_BYPASS",
+                "TOOL_NO_MASK",
                 ChangeClass::Weakening,
                 Some(serde_json::json!({
                     "name_looks_like_data": name_looks_like_data(&after.tool),
@@ -1245,6 +1266,37 @@ fn diff_tools(
         item.detail = detail;
         changes.push(item);
     }
+    //++agent TASK-225 [26.09.2026]
+    // H.6: секция tools есть — классифицированный инструмент, которого
+    // в файле нет, удаляется записью. Изменение отказываемое на
+    // активации; класс — neutral: вызов упадёт в deny-pending-review,
+    // маскирование не ослабляется (в счётчики ослаблений/усилений не
+    // входит). Секции нет (to.tools=None выше) — удалений не будет.
+    // R4-2: удаления — только когда `to` пришёл из импорта файла
+    // (полный снимок); ручной/legacy/rollback-черновик — частичный
+    // снимок, удалений не эмитим.
+    if context.to_is_import {
+        if let Some(modes) = &context.tool_modes {
+            let in_file: HashSet<&str> = tools.iter().map(|tool| tool.tool.as_str()).collect();
+            let mut removed: Vec<(&String, &String)> = modes
+                .iter()
+                .filter(|(name, _)| !in_file.contains(name.as_str()))
+                .collect();
+            removed.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, mode) in removed {
+                changes.push(change(
+                    "tool",
+                    "TOOL_REMOVED",
+                    ChangeClass::Neutral,
+                    format!("Инструмент {name}: запись о режиме будет удалена (был «{mode}»)"),
+                    serde_json::json!({"area":"tool","tool":name}),
+                    serde_json::json!({"mode": mode}),
+                    Value::Null,
+                ));
+            }
+        }
+    }
+    //++agent TASK-225
 }
 
 /// Эвристика §3.5/UI С4: имя инструмента похоже на работу с данными.
@@ -1392,7 +1444,9 @@ fn collect_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::setup::{DictionarySourceSpec, SourceStat, VersionDictionary};
+    use crate::domain::setup::{
+        DictionarySourceSpec, RuleSpec, SourceStat, VersionDictionary, REASON_PLACEHOLDER,
+    };
 
     fn source(path: &str, estimated_values: Option<i64>) -> DictionarySourceSpec {
         DictionarySourceSpec {
@@ -1423,6 +1477,7 @@ mod tests {
             tool_modes: Some(HashMap::new()),
             source_stats: stats,
             database_mismatch: false,
+            to_is_import: false,
         }
     }
 
@@ -1682,5 +1737,77 @@ mod tests {
             .expect("ожидалось FILTER_CHANGED");
         assert_eq!(change.change_class, ChangeClass::Weakening);
     }
+
+    //++agent TASK-225 [26.09.2026] I: пустой reason ≡ экспортный
+    // плейсхолдер — export→import неизменённой настройки не шумит
+    // REASON_CHANGED; явное обоснование по-прежнему отличается.
+    fn rule_spec(selector: &str, value: &str, reason: &str) -> RuleSpec {
+        RuleSpec {
+            rule_id: None,
+            selector: selector.to_string(),
+            value: value.to_string(),
+            action: "mask".to_string(),
+            category: "pii".to_string(),
+            priority: 10,
+            enabled: true,
+            reason: reason.to_string(),
+            tests: None,
+        }
+    }
+
+    fn content_full(sources: Vec<DictionarySourceSpec>, rules: Vec<RuleSpec>) -> VersionContent {
+        VersionContent {
+            dictionary: VersionDictionary {
+                mode: "part".to_string(),
+                sources,
+            },
+            rules,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn empty_reason_matches_export_placeholder() {
+        // Источник и правило: "" внутри ↔ плейсхолдер в файле, обе стороны.
+        for (from_reason, to_reason) in [("", REASON_PLACEHOLDER), (REASON_PLACEHOLDER, "")] {
+            let before = content_full(
+                vec![filtered_source("Spr.Kontr", None, from_reason)],
+                vec![rule_spec("name", "*фио*", from_reason)],
+            );
+            let after = content_full(
+                vec![filtered_source("Spr.Kontr", None, to_reason)],
+                vec![rule_spec("name", "*фио*", to_reason)],
+            );
+            let diff = compute_diff(&before, &after, &context(None));
+            assert!(
+                diff.changes.is_empty(),
+                "round-trip {from_reason:?}→{to_reason:?} должен молчать: {:?}",
+                diff.changes.iter().map(|c| &c.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn real_reason_still_differs_from_placeholder() {
+        let before = content_full(
+            vec![filtered_source("Spr.Kontr", None, "")],
+            vec![rule_spec("name", "*фио*", "")],
+        );
+        let after = content_full(
+            vec![filtered_source("Spr.Kontr", None, "ручное обоснование")],
+            vec![rule_spec("name", "*фио*", "ручное обоснование")],
+        );
+        let diff = compute_diff(&before, &after, &context(None));
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| change.kind == "REASON_CHANGED")
+                .count(),
+            2,
+            "{:?}",
+            diff.changes.iter().map(|c| &c.kind).collect::<Vec<_>>()
+        );
+    }
+    //++agent TASK-225
 }
 //--agent TASK-225

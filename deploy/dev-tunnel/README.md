@@ -1,55 +1,61 @@
-# DEV reverse tunnel для 1С server channel
+# Пример: reverse-туннель к v8-session-manager (тестовый стенд)
 
-Артефакт поднимает только loopback reverse forwarding:
+Пример для тестового стенда, а не часть поставки сервиса. Контейнер поднимает
+только loopback reverse forwarding с сервера 1С к менеджеру, работающему в
+контейнере агента:
 
 ```text
-onec-infra 127.0.0.1:4000 -> SSH -> 1c-ai-sandbox 127.0.0.1:4000
+сервер 1С 127.0.0.1:4000 -> SSH -> контейнер менеджера 127.0.0.1:4000
 ```
 
+Имена контейнеров, volume, образ, учётная запись, адрес сервера 1С и порты
+задаются через ENV — образец в [.env.example](.env.example); скопируйте его в
+`.env` рядом с `compose.yml`. Дефолты в `compose.yml` — заглушки
+(`onec-host`, `tunnel-user`, `manager-container`), без замены туннель не
+поднимется. Проверка подстановки: `docker compose -f deploy/dev-tunnel/compose.yml config`.
+
 Туннель не публикует порт во внешнюю сеть и не содержит ключей в Git или image.
-Контейнер использует отдельный read-only volume
-`onec-v8sm-dev-tunnel-secrets` с файлами `id_ed25519` (`0600`) и
-`known_hosts` (`0644`), принадлежащими UID/GID `1000:1000`.
+Контейнер использует отдельный внешний read-only volume с файлами
+`id_ed25519` (`0600`) и `known_hosts` (`0644`), принадлежащими UID/GID
+контейнера.
 
 ## Защитный контракт
 
-- DEV account: `onec-v8sm-dev-tunnel`, system account без sudo и с shell
+- Отдельная системная учётная запись на сервере 1С без sudo, с shell
   `/usr/sbin/nologin`.
 - Единственный authorized key ограничен опциями
-  `restrict,port-forwarding,permitlisten="127.0.0.1:4000"` и source address
-  `192.168.250.1`.
+  `restrict,port-forwarding,permitlisten="127.0.0.1:4000"` и адресом источника.
 - `sshd` оставляет `GatewayPorts no`, поэтому listener доступен только на
-  loopback `onec-infra`.
-- Host key `onec-infra` проверяется строго. Зафиксированный при подготовке
-  ED25519 fingerprint:
-  `SHA256:IKDnDpVRQochIHXHrFR/6vU3gW3NawxqynFVz7kPLII`.
-- Контейнер делит network namespace с `1c-ai-sandbox`, чтобы destination
-  `127.0.0.1:4000` указывал на локальный session manager.
+  loopback сервера 1С.
+- Host key сервера проверяется строго (`StrictHostKeyChecking=yes`);
+  fingerprint в `known_hosts` сверяется с сервером при подготовке.
+- Контейнер делит network namespace с контейнером менеджера, чтобы
+  destination `127.0.0.1:4000` (порт — `TUNNEL_REMOTE_PORT`/`MANAGER_PORT`) указывал на локальный менеджер.
 
 ## Проверка перед запуском
 
-1. `1c-ai-sandbox` запущен, а manager слушает `127.0.0.1:4000` в его network
-   namespace.
+1. Контейнер менеджера запущен, менеджер слушает `127.0.0.1:4000` в его
+   network namespace.
 2. Внешний volume существует и содержит только два файла с указанными mode.
-3. На `onec-infra` свободен `127.0.0.1:4000`.
-4. Fingerprint в `known_hosts` совпадает с fingerprint host key на сервере.
-5. В `manager_url` DEV используется `ws://127.0.0.1:4000/sessions` только после
-   успешного WebSocket Upgrade через persistent tunnel.
+3. На сервере 1С свободен `127.0.0.1:4000`.
+4. Fingerprint в `known_hosts` совпадает с fingerprint host key сервера.
+5. `manager_url` в 1С переключается на `ws://127.0.0.1:4000/sessions` только
+   после успешного WebSocket Upgrade через постоянный туннель.
 
-## Coordinated cutover
+## Переключение
 
-Пока диагностический tunnel занимает remote port, persistent sidecar не
-запускать. При согласованном переключении:
+Если порт на сервере уже занят временным (диагностическим) туннелем,
+постоянный контейнер не запускать. При переключении:
 
-1. остановить диагностический SSH по сохранённому PID/session handle;
-2. подтвердить, что `127.0.0.1:4000` на `onec-infra` свободен;
+1. остановить временный SSH;
+2. подтвердить, что `127.0.0.1:4000` на сервере 1С свободен;
 3. запустить `docker compose -f deploy/dev-tunnel/compose.yml up -d`;
 4. проверить `docker inspect` (`running`, `restart=unless-stopped`) и remote
    listener `127.0.0.1:4000`;
 5. выполнить только HTTP WebSocket Upgrade `/sessions`, ожидая `101`, без
    JSON-RPC;
-6. убедиться, что DEV `server-gbig_pam_ai` active и internal tools отсутствуют
-   в agent-facing `session_list`.
+6. убедиться, что серверная сессия базы активна, а internal-инструменты
+   отсутствуют в agent-facing `session_list`.
 
 При неуспешном Upgrade контейнер останавливается командой:
 
@@ -57,6 +63,5 @@ onec-infra 127.0.0.1:4000 -> SSH -> 1c-ai-sandbox 127.0.0.1:4000
 docker compose -f deploy/dev-tunnel/compose.yml down
 ```
 
-DEV `manager_url` не откатывается автоматически: решение принимается отдельно
-по readback параметров и журналу server channel. PROD tunnel и PROD база не
-затрагиваются.
+`manager_url` в 1С автоматически не откатывается: решение принимается
+отдельно по фактическим параметрам и журналу серверного канала.

@@ -1,14 +1,14 @@
-# ++agent TASK-221 [23.09.2026]
-name: onec-v8sm-dev-tunnel
+# Пример для тестового стенда. Значения задаются через ENV (см. .env.example рядом).
+name: ${TUNNEL_COMPOSE_PROJECT:-onec-v8sm-dev-tunnel}
 
 services:
   reverse-tunnel:
-    image: "${ONEC_V8SM_TUNNEL_IMAGE:-sandbox1c_devcontainer-agent:latest}"
-    container_name: onec-v8sm-dev-tunnel
-    user: "1000:1000"
+    image: "${ONEC_V8SM_TUNNEL_IMAGE:-ssh-client-image:latest}"
+    container_name: ${TUNNEL_CONTAINER_NAME:-onec-v8sm-dev-tunnel}
+    user: "${TUNNEL_UID:-1000}:${TUNNEL_GID:-1000}"
     init: true
     restart: unless-stopped
-    network_mode: "container:1c-ai-sandbox"
+    network_mode: "container:${MANAGER_CONTAINER:-manager-container}"
     read_only: true
     # Образ используется как носитель OpenSSH; его init-скрипт пишет в /etc и несовместим с read-only rootfs.
     entrypoint:
@@ -37,8 +37,8 @@ services:
       - -N
       - -T
       - -R
-      - 127.0.0.1:4000:127.0.0.1:4000
-      - onec-v8sm-dev-tunnel@192.168.250.2
+      - 127.0.0.1:${TUNNEL_REMOTE_PORT:-4000}:127.0.0.1:${MANAGER_PORT:-4000}
+      - ${TUNNEL_SSH_USER:-tunnel-user}@${ONEC_HOST:-onec-host}
     volumes:
       - type: volume
         source: tunnel-secrets
@@ -55,5 +55,4 @@ services:
 volumes:
   tunnel-secrets:
     external: true
-    name: onec-v8sm-dev-tunnel-secrets
-# --agent TASK-221
+    name: ${TUNNEL_SECRETS_VOLUME:-onec-v8sm-dev-tunnel-secrets}

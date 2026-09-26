@@ -31,6 +31,9 @@ pub enum ErrorCode {
     NoActiveVersion,
     /// §5.7: повторный сухой прогон базы, пока идёт текущий (409).
     DryRunBusy,
+    /// Фаза-2 C: индекс словаря прогревается (pull запланирован/идёт) —
+    /// ответ несёт `retry_after_s`, через сколько повторить вызов.
+    ServiceWarmingUp,
     //--agent TASK-225
 }
 
@@ -53,6 +56,7 @@ impl ErrorCode {
             //++agent TASK-225
             Self::NoActiveVersion => "NO_ACTIVE_VERSION",
             Self::DryRunBusy => "DRY_RUN_BUSY",
+            Self::ServiceWarmingUp => "SERVICE_WARMING_UP",
             //--agent TASK-225
         }
     }
@@ -64,6 +68,10 @@ pub struct ServiceError {
     pub correlation_id: Uuid,
     pub status: StatusCode,
     pub retryable: bool,
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    /// Оценка «повторить через N с» — только у SERVICE_WARMING_UP.
+    pub retry_after_s: Option<u64>,
+    //++agent TASK-225
 }
 
 impl ServiceError {
@@ -81,9 +89,12 @@ impl ServiceError {
             //--agent TASK-225
             ErrorCode::PolicyInvalid => (StatusCode::UNPROCESSABLE_ENTITY, false),
             ErrorCode::ResultLimitExceeded => (StatusCode::PAYLOAD_TOO_LARGE, false),
-            ErrorCode::MaskingTimeout | ErrorCode::ServiceNotReady => {
-                (StatusCode::SERVICE_UNAVAILABLE, true)
-            }
+            //++agent TASK-225 [26.09.2026] фаза-2 C: прогрев —
+            // retryable 503, как у ServiceNotReady; точная оценка
+            // приходит через `warming_up` (текст и `retry_after_s`).
+            ErrorCode::MaskingTimeout
+            | ErrorCode::ServiceNotReady
+            | ErrorCode::ServiceWarmingUp => (StatusCode::SERVICE_UNAVAILABLE, true),
             ErrorCode::MaskingFailed
             | ErrorCode::HistoryUnavailable
             | ErrorCode::MappingUnavailable => (StatusCode::SERVICE_UNAVAILABLE, false),
@@ -93,8 +104,24 @@ impl ServiceError {
             correlation_id,
             status,
             retryable,
+            retry_after_s: None,
         }
     }
+
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    /// Прогрев словаря: 503 + retryable + `retry_after_s` (оценка по
+    /// числу значений прошлого pull, минимум 5с). В MCP-ответе
+    /// менеджера — isError с этим текстом, не transport_error.
+    pub fn warming_up(correlation_id: Uuid, retry_after_s: u64) -> Self {
+        Self {
+            code: ErrorCode::ServiceWarmingUp,
+            correlation_id,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retryable: true,
+            retry_after_s: Some(retry_after_s.max(5)),
+        }
+    }
+    //++agent TASK-225
 
     pub fn unauthorized(correlation_id: Uuid) -> Self {
         Self {
@@ -102,6 +129,7 @@ impl ServiceError {
             correlation_id,
             status: StatusCode::UNAUTHORIZED,
             retryable: false,
+            retry_after_s: None,
         }
     }
 
@@ -119,6 +147,22 @@ impl ServiceError {
             _ => "Операция временно недоступна",
         }
     }
+
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    /// Текст для пользователя/агента. У SERVICE_WARMING_UP динамический
+    /// — включает оценку `retry_after_s`.
+    fn user_message(&self) -> std::borrow::Cow<'_, str> {
+        if self.code == ErrorCode::ServiceWarmingUp {
+            return std::borrow::Cow::Owned(format!(
+                "Сервис маскирования прогревает словарь, повторите через {} с",
+                // `warming_up` — единственный конструктор кода — всегда
+                // ставит retry_after_s (≥5).
+                self.retry_after_s.unwrap_or_default()
+            ));
+        }
+        std::borrow::Cow::Borrowed(self.message())
+    }
+    //++agent TASK-225
 }
 
 impl std::fmt::Display for ServiceError {
@@ -137,9 +181,13 @@ struct ErrorEnvelope<'a> {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     code: &'a str,
-    message: &'a str,
+    message: std::borrow::Cow<'a, str>,
     correlation_id: Uuid,
     retryable: bool,
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_s: Option<u64>,
+    //++agent TASK-225
 }
 
 impl IntoResponse for ServiceError {
@@ -158,9 +206,10 @@ impl IntoResponse for ServiceError {
         let envelope = ErrorEnvelope {
             error: ErrorBody {
                 code: self.code.as_str(),
-                message: self.message(),
+                message: self.user_message(),
                 correlation_id: self.correlation_id,
                 retryable: self.retryable,
+                retry_after_s: self.retry_after_s,
             },
         };
         (self.status, Json(envelope)).into_response()

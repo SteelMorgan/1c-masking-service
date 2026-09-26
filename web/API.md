@@ -43,11 +43,10 @@ HTTP bootstrap route отсутствует намеренно.
 
 Reveal возвращает только neutral report v1 (`text` и `table`, scalar cells),
 имеет `Cache-Control: no-store`, не сохраняет раскрытый результат и **не
-аудируется** (итерация 3: раскрытие автоматическое при открытии записи —
+аудируется** (раскрытие автоматическое при открытии записи —
 audit-событие выродилось бы в «запись просмотрена»). Роль `Admin` не имеет
 доступа к reveal.
 
-<!--++agent TASK-224 [08.10.2026] итерация 4-->
 Формат neutral report v1: `{version:1, title?, blocks[]}` — `title` это
 текст запроса/описание вызова, сохранённый на preflight (в `call_contexts`;
 у старых записей и безаргументных terminal-событий `null`). Блоки:
@@ -63,7 +62,6 @@ audit-событие выродилось бы в «запись просмот�
 базы. Mapping токенов живёт только в RAM, поэтому при старте сервиса
 таблицы `history` и `call_contexts` очищаются полностью — после перезапуска
 reveal старых записей в принципе невозможен.
-<!----agent TASK-224-->
 
 ## Admin (только роль `Admin`)
 
@@ -91,7 +89,10 @@ reveal старых записей в принципе невозможен.
   получен (рестарт/refresh не завершён): валидный ответ, не ошибка.
   Лимиты: `path` ≤512, `q` ≤128 символов, до 1000 узлов на уровень и 200
   совпадений поиска (`truncated:true`). Только чтение — CSRF не требуется.
-- tool classes: `GET .../{id}/tools`, `PUT .../{id}/tools/{tool}`;
+- tool classes: `GET .../{id}/tools`, `PUT .../{id}/tools/{tool}`,
+  `DELETE .../{id}/tools/{tool}` (снимает запись классификации — для
+  инструментов, удалённых из 1С; `204`, на несуществующую — `404`,
+  аудит `tool.delete`);
 - dictionary config: `GET .../{id}/dictionaries`,
   `PUT .../{id}/dictionaries/{config_id}`. В GET-ответе у каждого selector —
   вычисляемый `in_manifest` (`true`/`false` — есть ли путь в RAM-manifest,
@@ -101,7 +102,7 @@ reveal старых записей в принципе невозможен.
   `POST .../{id}/policies/{policy_id}/activate`.
 
 
-Tool class допускает только `data-mask`, `metadata-bypass` и
+Tool class допускает только `data-mask`, `no-mask` и
 `deny-pending-review`. Dictionary endpoint принимает только configuration:
 `mode` и до 100 selectors вида `{source_path, category, filter_ast}`. Категория
 обязательна для каждого selector, а его AST ограничен операциями `and`, `or`,
@@ -113,7 +114,6 @@ Tool class допускает только `data-mask`, `metadata-bypass` и
 Для `mode=all` допускается ровно один selector с `source_path="*"`; для
 `mode=part` wildcard запрещён.
 
-<!--++agent TASK-225 [26.09.2026] §4-->
 ## Версионированная настройка (setup)
 
 Версия настройки (`policies`) объединяет правила, словарь
@@ -127,18 +127,28 @@ Tool class допускает только `data-mask`, `metadata-bypass` и
 - `POST .../{id}/setup/imports?replace_draft=0|1` — импорт файла в
   черновик; `409 DRAFT_EXISTS` при `replace_draft=0`.
 - `GET .../{id}/setup/diff?from=active|<n>&to=draft|<n>` —
-  классифицированный diff §3 (`weakening|strengthening|neutral` +
-  warnings §3.6).
+  классифицированный diff (`weakening|strengthening|neutral` +
+  warnings). `from=active` при отсутствии активной версии — сравнение с
+  пустой настройкой: `from_version:null`, все элементы — добавления
+  (усиления). Отсутствующий `to` — `409 NO_DRAFT`/`404 VERSION_NOT_FOUND`. При наличии у to-версии секции `tools` классифицированные
+  инструменты, отсутствующие в ней, идут отдельным neutral-изменением
+  `TOOL_REMOVED` (before=текущий режим, after=null); секции нет или
+  `null` — удалений нет, `"tools":[]` — удаление всех.
 - Черновик: `POST .../setup/draft {from:"active"|"empty"}`,
   `GET .../setup/draft`, `PUT .../setup/draft/{dictionary|rules|tools}`
   и `DELETE` — все под `If-Match: "<draft_hash>"` (`409 DRAFT_CHANGED`);
   `POST .../setup/draft/revert {change_ids,warning_ids}` — возврат
   элементов к состоянию active / исключение предупреждений.
 - `POST .../setup/activate {version,draft_hash,confirmed_weakenings,
-  accepted_strengthenings,excluded_warnings,comment?}` — серверная
+  accepted_strengthenings,excluded_warnings,declined_tool_removals,
+  comment?}` — серверная
   перепроверка diff в одной транзакции: `409 WEAKENING_NOT_CONFIRMED`,
   `409 STALE_CONFIRMATION`, `400 WARNING_NOT_EXCLUDABLE`,
   `409 DRAFT_CHANGED`, `409 SECRET_POLICY_UNSUPPORTED` (F8).
+  `declined_tool_removals` — id изменений `TOOL_REMOVED`, от которых
+  отказались: их записи классификации остаются; неотказанные удаляются
+  той же транзакцией (аудит `tool.delete` на каждый), ответ несёт
+  `tool_removals` — список применённых имён.
 - `POST .../setup/rollback {version,replace_draft}` — `201`, черновик
   `origin='rollback'` (только неактивная версия: активная →
   `409 VERSION_IS_ACTIVE`).
@@ -147,7 +157,7 @@ Tool class допускает только `data-mask`, `metadata-bypass` и
   `GET .../setup/versions/{version}` — полное содержимое версии
   (`dictionary/rules/tools`). Оба маршрута read-only: не пишут
   журнал и audit.
-- `POST .../setup/dry-run {version:"draft"|<n>, limit:1..50}` — §5: сухой
+- `POST .../setup/dry-run {version:"draft"|<n>, limit:1..50}` — сухой
   прогон последних записей истории активной версией и целевой;
   `409 DRY_RUN_BUSY`. Ответ без значений: `records[]` с маскированной
   сеткой `grid{columns,cells[]}` — у ячейки только координаты
@@ -160,18 +170,18 @@ Tool class допускает только `data-mask`, `metadata-bypass` и
 - `GET .../setup/journal?limit` — журнал `setup_versions_journal`.
 - `GET .../setup/draft`, PUT'ы и activate пишут строки журнала и audit
   в одной транзакции.
-- `GET /api/v1/history/{id}/reasons` (Viewer) — §6.3: детальные причины
+- `GET /api/v1/history/{id}/reasons` (Viewer) — детальные причины
   по ячейкам (`detailed:true`, `policy_version`, `policy_state`,
   `active_version`, `reasons[]` с `cells`-счётчиками и `link.admin_path`,
   `cells[]` — только координаты); старая запись без `mask_detail_json` →
   `{detailed:false, legacy_reasons:[…]}`; истёкшая запись →
   `410 HISTORY_EXPIRED`.
-- `GET .../{id}/metadata?fields_of=<объект>` (B13) — поля объекта из
+- `GET .../{id}/metadata?fields_of=<объект>` — поля объекта из
   RAM-manifest (`{object, fields:[{name,type,password_mode}],
   manifest_ready}`), без значений.
 - `GET .../admin/databases` дополнительно отдаёт `setup_state`,
   `active_version`, `draft_version`; `PATCH` принимает `strict_mode`
-  (строгий режим §8.1, по умолчанию включён).
+  (строгий режим, по умолчанию включён).
 
 Legacy-маршруты продолжают работать поверх версий: `PUT dictionaries`
 правит черновик (создаёт из активной при отсутствии) и отвечает
@@ -179,11 +189,10 @@ Legacy-маршруты продолжают работать поверх ве�
 создаёт черновик (`409 DRAFT_EXISTS`); `POST policies/{id}/activate`
 активирует **только черновик** (любой другой статус цели → `409`,
 retired поднимается лишь через `setup/rollback` + `setup/activate`)
-и проходит ту же проверку ослаблений, что и B7 — при наличии
+и проходит ту же проверку ослаблений, что и `setup/activate` — при наличии
 неподтверждённых ослаблений `409 WEAKENING_NOT_CONFIRMED`;
-`PUT tools/{tool}` с `class:"metadata-bypass"` требует
+`PUT tools/{tool}` с `class:"no-mask"` требует
 `confirm_bypass:true` (`400 BYPASS_NOT_CONFIRMED`).
-<!----agent TASK-225-->
 
 `POST /admin/users` и оба invitation-маршрута возвращают
 `{user_id,login,role,activation_token,activation_url,expires_in_seconds}`;
@@ -194,12 +203,10 @@ retired поднимается лишь через `setup/rollback` + `setup/act
 освобождается; иначе `409`. `GET /admin/users` дополнительно возвращает
 `activated`, `invitation_expires_at`, `last_login_at`.
 
-<!--++agent TASK-224 [08.10.2026] итерация 4-->
 Для отключённого пользователя (`status:"disabled"`) `.../invitation` и
 `.../password-reset` возвращают `409` с `error.code="USER_DISABLED"` —
 отдельный код вместо generic conflict, чтобы UI объяснял «сначала включите
 пользователя».
-<!----agent TASK-224-->
 
 ## Страницы и статика
 

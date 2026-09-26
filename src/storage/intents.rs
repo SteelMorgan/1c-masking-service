@@ -65,6 +65,24 @@ impl SqliteStorage {
         })
     }
 
+    //++agent TASK-225 [26.09.2026] фаза-2 C
+    /// Есть ли по базе ожидающий pull (`state='pending'` — intent в
+    /// очереди или выполняется прямо сейчас: worker снимает его только
+    /// при успехе). `needs_attention` сюда не входит — прогрев там
+    /// остановлен до ручного refresh, и ответ агенту должен быть
+    /// обычным SERVICE_NOT_READY, а не обещанием повтора.
+    pub(crate) fn refresh_intent_pending(&self, database_id: Uuid) -> rusqlite::Result<bool> {
+        self.with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM v2_refresh_intents
+                 WHERE database_id=?1 AND state='pending')",
+                [database_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )? != 0)
+        })
+    }
+    //++agent TASK-225
+
     /// §8.1: фиксирует transient-неудачу серии — `attempts+1`,
     /// `first_failed_at` (если NULL), `last_error_*`, `next_attempt_at`
     /// (уже посчитанный caller'ом момент повтора). При достижении

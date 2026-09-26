@@ -98,7 +98,9 @@ pub fn router(state: Arc<HumanState>) -> Router {
         )
         .route(
             "/api/v1/admin/databases/{id}/tools/{tool}",
-            axum::routing::put(handlers::update_tool_classification),
+            axum::routing::put(handlers::update_tool_classification)
+                //++agent TASK-225 [26.09.2026] снятие записи классификации.
+                .delete(handlers::delete_tool_classification),
         )
         .route(
             "/api/v1/admin/databases/{id}/dictionaries",

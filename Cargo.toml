@@ -2,7 +2,7 @@
 name = "onec-masking-service"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "PolyForm-Small-Business-1.0.0"
 
 [lib]
 name = "onec_masking_service"
@@ -19,7 +19,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 hmac = "0.12"
 http = "1"
-# TASK-225 §5a: матчинг словаря через автомат Aho-Corasick
+# Матчинг словаря через автомат Aho-Corasick
 # (LeftmostLongest) вместо перебора HashMap на каждую строку ответа.
 aho-corasick = "1"
 # UDS HTTP/1 клиент к v8-session-manager (POST /internal/v1/tools/call).

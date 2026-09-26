@@ -16,7 +16,6 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::UnixStream;
-use uuid::Uuid;
 
 /// Request bound: selector+cursor — маленький фиксированный JSON.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -64,22 +63,24 @@ impl ManagerClient {
         }
     }
 
-    /// `POST /internal/v1/tools/call` `{database_id,name,arguments}` →
+    /// `POST /internal/v1/tools/call` `{instance_id,name,arguments}` →
     /// `result` успешного ответа. Семантика ошибок различает отказ вызова
     /// (`Rejected`) и недоступность транспорта — pull-runner маппит их
     /// по-разному на судьбу durable intent.
+    //++agent TASK-225 [26.09.2026] O2: маршрут к базе — точный ключ
+    // `instance_id`, менеджер сопоставляет сессию только по нему.
     pub async fn call_tool(
         &self,
-        database_id: Uuid,
+        identity: &crate::domain::DatabaseIdentity,
         name: &str,
         arguments: &Value,
     ) -> Result<Value, ManagerClientError> {
-        let body = serde_json::to_vec(&json!({
-            "database_id": database_id.to_string(),
+        let body = json!({
+            "instance_id": identity.instance_id,
             "name": name,
             "arguments": arguments,
-        }))
-        .map_err(|_| ManagerClientError::InvalidResponse)?;
+        });
+        let body = serde_json::to_vec(&body).map_err(|_| ManagerClientError::InvalidResponse)?;
         let attempt = request_bytes(&self.socket_path, self.expected_uid, TOOLS_CALL_PATH, body);
         let response = tokio::time::timeout(self.call_timeout, attempt)
             .await
@@ -126,9 +127,7 @@ async fn request_bytes(
         .send_request(request)
         .await
         .map_err(|_| ManagerClientError::Transport)?;
-    if !response.status().is_success() {
-        return Err(ManagerClientError::InvalidResponse);
-    }
+    let ok_status = response.status().is_success();
     let mut bytes = Vec::new();
     while let Some(frame) = response.body_mut().frame().await {
         let frame = frame.map_err(|_| ManagerClientError::Transport)?;
@@ -139,6 +138,19 @@ async fn request_bytes(
             bytes.extend_from_slice(&data);
         }
     }
+    //++agent TASK-225 [26.09.2026]
+    // K: менеджер отдаёт отказы уровня вызова не-2xx статусом
+    // (503 `no_target`, 404 `method_not_found`…) —
+    // код конверта важнее статуса: иначе «база не привязана» неотличима
+    // от «менеджер не отвечает». Неразборчивый ответ — по-прежнему
+    // InvalidResponse.
+    if !ok_status {
+        return match parse_call_response(&bytes) {
+            Err(rejected @ ManagerClientError::Rejected { .. }) => Err(rejected),
+            _ => Err(ManagerClientError::InvalidResponse),
+        };
+    }
+    //++agent TASK-225
     Ok(bytes)
 }
 

@@ -6,8 +6,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domain::{
-    DatabaseMode, DatabaseSettings, HistoryForReveal, PolicyRule, RuleAction, RuleSelector,
-    StoredHistory, ToolClass,
+    DatabaseIdentity, DatabaseMode, DatabaseSettings, HistoryForReveal, PolicyRule, RuleAction,
+    RuleSelector, StoredHistory, ToolClass,
 };
 
 const MIGRATION: &str = include_str!("../../migrations/0001_core.sql");
@@ -48,6 +48,16 @@ const REFRESH_BACKOFF_MIGRATION: &str = include_str!("../../migrations/0013_refr
 // Миграция 0014 (ревью-2 N-1): флаг расшифрованных mask-токенов
 // на записи контекста вызова.
 const MASK_TOKEN_FLAG_MIGRATION: &str = include_str!("../../migrations/0014_mask_token_flag.sql");
+// Миграция 0015 (раздел E): переименование класса инструмента
+// metadata-bypass → no-mask — пересборка tool_classifications
+// (CHECK не меняется ALTER'ом) и REPLACE в policies.tools_json.
+const NO_MASK_RENAME_MIGRATION: &str = include_str!("../../migrations/0015_no_mask_rename.sql");
+//++agent TASK-225
+// Миграция 0016 (раздел O2): отображаемые координаты базы (Srvr/Ref)
+// и источник ключа (`ras`|`generated`, выводится из префикса
+// `instance_id`); идентичность — точный ключ `instance_id`.
+const DATABASE_IDENTITY_MIGRATION: &str =
+    include_str!("../../migrations/0016_database_identity.sql");
 //++agent TASK-225
 
 pub enum HistoryWrite {
@@ -266,6 +276,37 @@ impl SqliteStorage {
                 [Utc::now().to_rfc3339()],
             )?;
         }
+        // Миграция 0015 (раздел E): класс metadata-bypass → no-mask.
+        // Пересборка tool_classifications с новым CHECK и перевод
+        // снимков режимов в policies.tools_json — в той же
+        // IMMEDIATE-транзакции, идемпотентна (помечена версией).
+        let has_no_mask_rename: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=15)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_no_mask_rename {
+            transaction.execute_batch(NO_MASK_RENAME_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (15, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        // Миграция 0016 (раздел O2): отображаемые координаты базы.
+        // Идентичность — точный ключ `instance_id` (`ras:`/`gen:`),
+        // координатных индексов и сравнений нет.
+        let has_database_identity: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=16)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_database_identity {
+            apply_add_column_migration(&transaction, "databases", DATABASE_IDENTITY_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
         //++agent TASK-225
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
@@ -317,30 +358,62 @@ impl SqliteStorage {
         operation(&mut connection)
     }
 
-    pub fn ensure_database(&self, database_id: Uuid) -> rusqlite::Result<(DatabaseSettings, bool)> {
+    //++agent TASK-225 [26.09.2026] O2
+    /// Резолюция записи базы — только точное совпадение `instance_id`:
+    /// ключ есть → та же запись; ключа нет → новая `unconfigured` запись.
+    /// Координатных фолбэков, нормализации и переносов generated→ras нет:
+    /// склейка баз исключена по построению, а переход ключа создаёт
+    /// отдельную запись (настройки переносятся export/import).
+    ///
+    /// Возвращает (id записи, настройки, создана ли в этом вызове).
+    pub fn ensure_database(
+        &self,
+        identity: &DatabaseIdentity,
+    ) -> rusqlite::Result<(Uuid, DatabaseSettings, bool)> {
         self.with_connection(|connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(settings) = load_database(&transaction, database_id)? {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some((database_id, settings)) = find_database(&transaction, identity)? {
                 transaction.commit()?;
-                return Ok((settings, false));
+                return Ok((database_id, settings, false));
             }
-            let now = Utc::now().to_rfc3339();
-            transaction.execute(
-                "INSERT INTO databases(id, instance_id, mode, created_at, updated_at) VALUES (?1, ?1, 'unconfigured', ?2, ?2)",
-                params![database_id.to_string(), now],
-            )?;
-            for (tool, class) in default_tool_classes() {
-                transaction.execute(
-                    "INSERT INTO tool_classifications(database_id, tool_name, class, reviewer, updated_at)
-                     VALUES (?1, ?2, ?3, 'built-in-v1', ?4)",
-                    params![database_id.to_string(), tool, class.as_str(), now],
-                )?;
+            let database_id = Uuid::new_v4();
+            insert_database(&transaction, database_id, identity)?;
+            let settings = load_database(&transaction, database_id)?.expect("database inserted");
+            transaction.commit()?;
+            Ok((database_id, settings, true))
+        })
+    }
+
+    /// Посадка записи с заданным id и ключом — миграция deployment-записей
+    /// и тестовые фикстуры. Существующая запись не трогается: ключ не
+    /// перепривязывается (точный матч — единственная семантика).
+    pub fn insert_database(
+        &self,
+        database_id: Uuid,
+        identity: &DatabaseIdentity,
+    ) -> rusqlite::Result<DatabaseSettings> {
+        self.with_connection(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if load_database(&transaction, database_id)?.is_none() {
+                insert_database(&transaction, database_id, identity)?;
             }
             let settings = load_database(&transaction, database_id)?.expect("database inserted");
             transaction.commit()?;
-            Ok((settings, true))
+            Ok(settings)
         })
     }
+
+    /// Read-only резолюция записи по ключу (без создания) — для
+    /// internal-экспорта и read-путей.
+    pub fn lookup_database(
+        &self,
+        identity: &DatabaseIdentity,
+    ) -> rusqlite::Result<Option<(Uuid, DatabaseSettings)>> {
+        self.with_connection(|connection| find_database(connection, identity))
+    }
+    //++agent TASK-225
 
     pub fn set_database_mode(
         &self,
@@ -1105,25 +1178,91 @@ fn read_policy_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRule> {
     })
 }
 
+//++agent TASK-225 [26.09.2026] N
+const DATABASE_COLUMNS: &str = "id,mode,mapping_ttl_seconds,history_ttl_seconds,active_policy_id,active_cache_version,strict_mode,instance_id,cluster_server,infobase_name";
+
+fn database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Uuid, DatabaseSettings)> {
+    let id =
+        Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mode: String = row.get(1)?;
+    Ok((
+        id,
+        DatabaseSettings {
+            mode: DatabaseMode::try_from(mode.as_str())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            mapping_ttl_seconds: row.get::<_, i64>(2)?.max(1) as u64,
+            history_ttl_seconds: row.get::<_, i64>(3)?.max(1) as u64,
+            active_policy_id: row.get(4)?,
+            active_cache_version: row
+                .get::<_, Option<i64>>(5)?
+                .map(|value| value.max(0) as u64),
+            strict_mode: row.get::<_, i64>(6)? != 0,
+            instance_id: row.get(7)?,
+            cluster_server: row.get(8)?,
+            infobase_name: row.get(9)?,
+        },
+    ))
+}
+
 fn load_database(
     connection: &Connection,
     database_id: Uuid,
 ) -> rusqlite::Result<Option<DatabaseSettings>> {
-    connection.query_row(
-        "SELECT mode,mapping_ttl_seconds,history_ttl_seconds,active_policy_id,active_cache_version,strict_mode FROM databases WHERE id=?1",
-        [database_id.to_string()], |row| {
-            let mode: String = row.get(0)?;
-            Ok(DatabaseSettings {
-                mode: DatabaseMode::try_from(mode.as_str()).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                mapping_ttl_seconds: row.get::<_, i64>(1)?.max(1) as u64,
-                history_ttl_seconds: row.get::<_, i64>(2)?.max(1) as u64,
-                active_policy_id: row.get(3)?,
-                active_cache_version: row.get::<_, Option<i64>>(4)?.map(|value| value.max(0) as u64),
-                strict_mode: row.get::<_, i64>(5)? != 0,
-            })
-        },
-    ).optional()
+    connection
+        .query_row(
+            &format!("SELECT {DATABASE_COLUMNS} FROM databases WHERE id=?1"),
+            [database_id.to_string()],
+            database_row,
+        )
+        .optional()
+        .map(|row| row.map(|(_, settings)| settings))
 }
+
+//++agent TASK-225 [26.09.2026] O2
+fn insert_database(
+    connection: &Connection,
+    database_id: Uuid,
+    identity: &DatabaseIdentity,
+) -> rusqlite::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO databases(id, instance_id, display_label, mode,
+            cluster_server, infobase_name, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'unconfigured', ?4, ?5, ?6, ?6)",
+        params![
+            database_id.to_string(),
+            identity.instance_id,
+            identity.infobase_name,
+            identity.cluster_server,
+            identity.infobase_name,
+            now
+        ],
+    )?;
+    for (tool, class) in default_tool_classes() {
+        connection.execute(
+            "INSERT INTO tool_classifications(database_id, tool_name, class, reviewer, updated_at)
+             VALUES (?1, ?2, ?3, 'built-in-v1', ?4)",
+            params![database_id.to_string(), tool, class.as_str(), now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Поиск записи — только точное совпадение `instance_id` (раздел O2):
+/// ключ непрозрачен, координатных фолбэков и нормализации нет.
+fn find_database(
+    connection: &Connection,
+    identity: &DatabaseIdentity,
+) -> rusqlite::Result<Option<(Uuid, DatabaseSettings)>> {
+    connection
+        .query_row(
+            &format!("SELECT {DATABASE_COLUMNS} FROM databases WHERE instance_id=?1"),
+            [&identity.instance_id],
+            database_row,
+        )
+        .optional()
+}
+//++agent TASK-225
 
 fn load_history_from(
     connection: &Connection,
@@ -1159,9 +1298,9 @@ fn default_tool_classes() -> [(&'static str, ToolClass); 6] {
         ("execute_query", ToolClass::DataMask),
         ("find_references_to_object", ToolClass::DataMask),
         ("get_object_by_link", ToolClass::DataMask),
-        ("get_metadata", ToolClass::MetadataBypass),
-        ("get_access_rights", ToolClass::MetadataBypass),
-        ("get_link_of_object", ToolClass::MetadataBypass),
+        ("get_metadata", ToolClass::NoMask),
+        ("get_access_rights", ToolClass::NoMask),
+        ("get_link_of_object", ToolClass::NoMask),
     ]
 }
 

@@ -38,7 +38,9 @@ fn admin() -> Principal {
 
 fn enabled_database(storage: &SqliteStorage) -> Uuid {
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     assert!(storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap());
@@ -390,3 +392,95 @@ async fn b2_reports_refresh_state_and_error_text() {
         .contains("Действующая настройка содержит правила"));
 }
 //++agent TASK-225
+
+// ------------------------------------------------------------------
+// O2: pull маршрутизируется по точному ключу `instance_id`. Legacy-
+// запись (строка до ключевой эпохи, ключ = собственный uuid) живой
+// сессии не имеет — менеджер отвечает `no_target` → transient retry
+// с кодом DATABASE_NOT_CONNECTED.
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn legacy_database_without_coordinates_retries_pull() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    // Legacy-запись: `instance_id` = собственный uuid строки — ни одна
+    // живая сессия таким ключом не владеет.
+    let database_id = Uuid::new_v4();
+    storage
+        .with_connection(|c| {
+            c.execute(
+                "INSERT INTO databases(id, instance_id, mode, created_at, updated_at)
+                 VALUES (?1, ?1, 'enabled', ?2, ?2)",
+                rusqlite::params![database_id.to_string(), chrono::Utc::now().to_rfc3339()],
+            )
+        })
+        .unwrap();
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let fake = FakeManager::spawn(|_, _| Err("no_target".to_owned()));
+
+    enqueue_refresh_intent(&storage, database_id);
+    let completed = state
+        .masking
+        .refresh_due_intents(&fake.client(), 10)
+        .await
+        .unwrap();
+    assert_eq!(completed, 0);
+
+    // Transient: intent живёт и будет повторён, ошибка — «сессии нет».
+    let (attempts, st, _, _, _) = intent_row(&storage, database_id);
+    assert_eq!(attempts, 1);
+    assert_eq!(st, "pending");
+
+    let data = SqliteHumanDataStore::new(storage.clone(), state.masking.clone());
+    let refresh = data
+        .list_databases()
+        .unwrap()
+        .into_iter()
+        .find(|db| db.id == database_id)
+        .unwrap()
+        .refresh;
+    assert_eq!(refresh.state, "retrying");
+    assert_eq!(
+        refresh.last_error_code.as_deref(),
+        Some("DATABASE_NOT_CONNECTED")
+    );
+    let text = refresh.last_error_text.unwrap_or_default();
+    assert!(
+        text.contains("активной сессии"),
+        "подсказка про активную сессию: {text}"
+    );
+}
+
+#[tokio::test]
+async fn no_target_retries_with_database_not_connected_code() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let database_id = enabled_database(&storage);
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let fake = FakeManager::spawn(|_, _| Err("no_target".to_owned()));
+
+    enqueue_refresh_intent(&storage, database_id);
+    let completed = state
+        .masking
+        .refresh_due_intents(&fake.client(), 10)
+        .await
+        .unwrap();
+    assert_eq!(completed, 0);
+
+    // Transient: intent живёт, первая неудача зафиксирована с новым кодом.
+    let (attempts, st, next_at, _, _) = intent_row(&storage, database_id);
+    assert_eq!(attempts, 1);
+    assert!(next_at.is_some(), "повтор отложен по backoff");
+    let data = SqliteHumanDataStore::new(storage.clone(), state.masking.clone());
+    let refresh = data
+        .list_databases()
+        .unwrap()
+        .into_iter()
+        .find(|db| db.id == database_id)
+        .unwrap()
+        .refresh;
+    assert_eq!(refresh.state, "retrying", "intent state={st}");
+    assert_eq!(
+        refresh.last_error_code.as_deref(),
+        Some("DATABASE_NOT_CONNECTED"),
+        "не MANAGER_UNAVAILABLE — менеджер жив"
+    );
+}

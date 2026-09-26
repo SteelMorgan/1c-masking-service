@@ -102,7 +102,7 @@ pub fn dictionary_fingerprint(dictionary: &HashMap<String, String>) -> u64 {
         acc ^ hasher.finish()
     })
 }
-//--agent TASK-225
+//++agent TASK-225
 
 //++agent TASK-225 [25.09.2026]
 /// §5a.2: индекс словаря на Aho-Corasick. `automaton` — только
@@ -719,7 +719,7 @@ impl MaskEngine {
 
     //++agent TASK-225 [25.09.2026]
     /// Проверка «в аргументах есть mask-токен» без обращения к mapping
-    /// store — для классов, которым резолв запрещён (metadata-bypass,
+    /// store — для классов, которым резолв запрещён (no-mask,
     /// data-mask вне режима Enabled): то же ограничение bounds и тот же
     /// обход, что у `resolve_tokens`, но возвращает только факт наличия.
     /// Ошибка bounds трактуется вызывающим как невалидные аргументы.
@@ -984,7 +984,16 @@ impl MaskEngine {
                 match rule.action {
                     RuleAction::Secret => return Ok(SECRET_REMOVED.to_owned()),
                     RuleAction::Mask => return plan(context, &rule.category, &rendered),
-                    RuleAction::Keep => return Ok(rendered),
+                    //++agent TASK-225 [26.09.2026] фаза-2 B
+                    // keep(б) «строжайшее»: keep снимает только
+                    // структурное действие селектора (маску/секрет всего
+                    // поля); словарь и regex внутри значения продолжают
+                    // действовать — раннего возврата больше нет.
+                    //--agent TASK-225
+                    // RuleAction::Keep => return Ok(rendered),
+                    //--agent TASK-225
+                    RuleAction::Keep => break,
+                    //++agent TASK-225
                 }
             }
         }

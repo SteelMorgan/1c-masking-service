@@ -1,3 +1,4 @@
+mod common;
 use std::sync::Arc;
 
 use axum::{
@@ -535,7 +536,9 @@ async fn password_change_requires_origin_csrf_current_password_and_strong_distin
 async fn admin_configuration_is_typed_validated_and_audited() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     let data = SqliteHumanDataStore::new(storage.clone(), masking);
     let actor = onec_masking_service::auth::Principal {
@@ -651,7 +654,9 @@ async fn admin_configuration_is_typed_validated_and_audited() {
 async fn activating_policy_before_first_pull_does_not_make_enabled_database_ready() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(
             database_id,
@@ -693,14 +698,19 @@ async fn activating_policy_before_first_pull_does_not_make_enabled_database_read
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "policy-before-pull".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: serde_json::json!({"query":"SELECT 1"}),
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, ErrorCode::ServiceNotReady);
+    //++agent TASK-225 [26.09.2026] фаза-2 C: снимка ещё нет и pull
+    // запланирован — это прогрев (SERVICE_WARMING_UP + retry_after_s),
+    // а не безликий SERVICE_NOT_READY.
+    assert_eq!(error.code, ErrorCode::ServiceWarmingUp);
+    assert!(error.retry_after_s.unwrap_or(0) >= 5);
+    //++agent TASK-225
 }
 
 //++agent TASK-221 2026-09-23
@@ -708,7 +718,9 @@ async fn activating_policy_before_first_pull_does_not_make_enabled_database_read
 async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     //++agent TASK-225 [26.09.2026] storage нужен в цикле для ensure_database.
     //++agent TASK-225
@@ -730,7 +742,9 @@ async fn configurable_secret_rules_cannot_be_activated_without_premanager_policy
         // свою базу (раньше тест складывал пять черновиков в одну).
         //++agent TASK-225
         let database_id = Uuid::new_v4();
-        storage.ensure_database(database_id).unwrap();
+        storage
+            .insert_database(database_id, &common::test_identity(database_id))
+            .unwrap();
         let policy = data
             .create_policy(
                 &actor,
@@ -776,7 +790,9 @@ async fn secret_policy_activation_http_returns_stable_conflict_code() {
         .unwrap();
     let session = sessions.issue(actor.clone(), Utc::now()).unwrap();
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage, masking));
@@ -1404,7 +1420,9 @@ async fn pages_are_session_guarded_and_static_served() {
 async fn reveal_returns_report_and_writes_no_audit_event() {
     let (storage, auth, sessions, app, admin) = admin_session().await;
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let viewer = viewer_session_for(&auth, &sessions, &admin.principal, "reveal-viewer");
 
     //++agent TASK-224 [08.10.2026] итерация 4: канонический формат отчёта —
@@ -1516,7 +1534,9 @@ fn json_patch(
 async fn database_display_label_renamed_cleared_and_validated() {
     let (storage, auth, sessions, app, admin) = admin_session().await;
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
 
     let uri = format!("/api/v1/admin/databases/{database_id}");
     // Новое имя.
@@ -1602,7 +1622,9 @@ async fn database_display_label_renamed_cleared_and_validated() {
 async fn metadata_route_requires_admin_and_db() {
     let (storage, auth, sessions, app, admin) = admin_session().await;
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let admin_principal = auth
         .authenticate("meta-check", "admin", ADMIN_PASSWORD)
         .unwrap();
@@ -1654,7 +1676,9 @@ async fn metadata_route_reports_empty_manifest_and_tree_levels() {
     let session = sessions.issue(admin, Utc::now()).unwrap();
 
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking.clone()));
@@ -1774,7 +1798,9 @@ async fn metadata_route_bounds_inputs_and_search_output() {
     let session = sessions.issue(admin, Utc::now()).unwrap();
 
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     let setup = human::setup::SetupService::new(storage.clone(), masking.clone());
     let data = Arc::new(SqliteHumanDataStore::new(storage.clone(), masking.clone()));
@@ -1837,7 +1863,9 @@ async fn metadata_route_bounds_inputs_and_search_output() {
 async fn dictionary_configs_mark_stale_selectors_via_manifest() {
     let (storage, _, _) = auth_fixture();
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     let masking = Arc::new(MaskingService::new(storage.clone()));
     let data = SqliteHumanDataStore::new(storage.clone(), masking.clone());
     let actor = onec_masking_service::auth::Principal {

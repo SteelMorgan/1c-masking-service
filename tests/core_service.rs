@@ -27,7 +27,9 @@ async fn configured_state(mode: DatabaseMode) -> (Arc<AppState>, Uuid) {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     assert!(storage.set_database_mode(database_id, mode).unwrap());
     if mode == DatabaseMode::Enabled {
         pull_empty_cache(&state, database_id).await;
@@ -40,7 +42,9 @@ fn expired_history_is_never_loaded_for_idempotent_retry() {
     let storage = SqliteStorage::in_memory().unwrap();
     let database_id = Uuid::new_v4();
     let call_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .write_history(
             database_id,
@@ -79,13 +83,17 @@ async fn unknown_database_is_created_unconfigured_before_business_call() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let (database_id, call_id, correlation_id) = request_ids();
+    //++agent TASK-225 [26.09.2026] N: identity фиксируется до
+    // авто-регистрации — после неё database_id записи уже другой.
+    let identity = common::test_identity(database_id);
+    //++agent TASK-225
     let error = state
         .masking
         .preflight(PreflightRequest {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: identity.clone(),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":"SELECT 1"}),
@@ -93,21 +101,18 @@ async fn unknown_database_is_created_unconfigured_before_business_call() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ActionRequired);
-    assert_eq!(
-        storage
-            .database_settings(database_id)
-            .unwrap()
-            .unwrap()
-            .mode,
-        DatabaseMode::Unconfigured
-    );
+    //++agent TASK-225 [26.09.2026] N: авто-регистрация выдаёт записи
+    // собственный id — проверка идёт по резолву identity.
+    let (database_id, settings) = storage.lookup_database(&identity).unwrap().unwrap();
+    //++agent TASK-225
+    assert_eq!(settings.mode, DatabaseMode::Unconfigured);
     let retry = state
         .masking
         .preflight(PreflightRequest {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: identity.clone(),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":"DIFFERENT RAW ARGUMENT MUST NOT BE STORED"}),
@@ -150,7 +155,7 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -243,7 +248,7 @@ async fn canonical_api_key_alias_is_cut_from_every_copy_before_mapping() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "synthetic-alias".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result: json!({
@@ -297,7 +302,7 @@ async fn query_rows_with_missing_or_degraded_lineage_fail_closed() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "synthetic-degraded".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -341,7 +346,7 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "query-envelope".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
@@ -367,7 +372,7 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "query-envelope".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -408,7 +413,7 @@ async fn password_mode_metadata_cuts_neutral_alias_even_without_secret_flag() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "synthetic-password-mode".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -483,7 +488,7 @@ async fn secret_dictionary_and_regex_rules_cut_entire_value_without_mapping() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "synthetic-secret-rule".to_owned(),
                 tool_name: "find_references_to_object".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -557,7 +562,7 @@ async fn canonical_fio_source_overrides_keep_rule_and_missing_lineage_fails_clos
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "synthetic-fio-source".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -625,7 +630,7 @@ async fn canonical_full_name_source_masks_initials_despite_neutral_alias_and_kee
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "synthetic-full-name".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -691,7 +696,7 @@ async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
                 schema_version: SCHEMA_VERSION,
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "synthetic-multisource".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -747,7 +752,7 @@ async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
                 schema_version: SCHEMA_VERSION,
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "synthetic-type-array".to_owned(),
                 tool_name: "get_object_by_link".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -774,7 +779,9 @@ async fn active_secret_policy_cannot_publish_ready_pull() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -879,7 +886,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
             schema_version: 1,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-policy".to_owned(),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -934,7 +941,7 @@ async fn transport_errors_are_sanitized_before_history_and_unknown_tools_fail_cl
             schema_version: 1,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-error".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::TransportError {
@@ -968,7 +975,7 @@ async fn transport_errors_are_sanitized_before_history_and_unknown_tools_fail_cl
             schema_version: 1,
             call_id: pending_call_id,
             correlation_id: pending_correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-error".to_owned(),
             tool_name: "future_unreviewed_tool".to_owned(),
             arguments: json!({}),
@@ -1015,7 +1022,7 @@ async fn oversized_or_malformed_completed_calls_store_idempotent_sanitized_histo
             schema_version: 1,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-bounds".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result },
@@ -1058,7 +1065,7 @@ async fn disabled_public_projection_is_raw_but_history_is_always_masked() {
         schema_version: SCHEMA_VERSION,
         call_id,
         correlation_id,
-        database_id,
+        identity: common::test_identity(database_id),
         chat_id: "chat-a".to_owned(),
         tool_name: "get_metadata".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
@@ -1127,7 +1134,7 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
                 schema_version: 1,
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-six".to_owned(),
                 tool_name: tool_name.to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
@@ -1164,7 +1171,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             schema_version: 1,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1185,7 +1192,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":format!("WHERE name = '{token}'")}),
@@ -1204,7 +1211,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             schema_version: 1,
             call_id: denied_call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-b".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":token}),
@@ -1242,7 +1249,7 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
             schema_version: 1,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-reveal".to_owned(),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1332,7 +1339,7 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1353,7 +1360,9 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
 fn dictionary_filter_ast_matches_manager_identifier_and_node_bounds() {
     let storage = SqliteStorage::in_memory().unwrap();
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
 
     let valid = json!({
         "source_path":"Справочник.Контрагенты.Наименование",
@@ -1462,7 +1471,7 @@ async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-feed".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1507,7 +1516,7 @@ async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-feed".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1643,7 +1652,7 @@ async fn pull_follows_opaque_cursor_until_final_chunk() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-pages".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -1872,7 +1881,9 @@ async fn durable_intents_drain_per_database_and_isolate_failures() {
     let mut ready_databases = Vec::new();
     for _ in 0..2 {
         let database_id = Uuid::new_v4();
-        storage.ensure_database(database_id).unwrap();
+        storage
+            .insert_database(database_id, &common::test_identity(database_id))
+            .unwrap();
         storage
             .set_database_mode(database_id, DatabaseMode::Enabled)
             .unwrap();
@@ -1880,7 +1891,9 @@ async fn durable_intents_drain_per_database_and_isolate_failures() {
         ready_databases.push(database_id);
     }
     let broken = Uuid::new_v4();
-    storage.ensure_database(broken).unwrap();
+    storage
+        .insert_database(broken, &common::test_identity(broken))
+        .unwrap();
     storage
         .set_database_mode(broken, DatabaseMode::Enabled)
         .unwrap();
@@ -1921,7 +1934,9 @@ async fn durable_intents_drain_per_database_and_isolate_failures() {
 async fn startup_rewires_enabled_databases_with_durable_intent() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -1945,7 +1960,9 @@ async fn pull_accepts_large_composite_type_and_rejects_oversized_field_type() {
     composite_type.push_str(&"X".repeat(17_242 - composite_type.len()));
     assert_eq!(composite_type.len(), 17_242);
     let accepted_db = Uuid::new_v4();
-    storage.ensure_database(accepted_db).unwrap();
+    storage
+        .insert_database(accepted_db, &common::test_identity(accepted_db))
+        .unwrap();
     storage
         .set_database_mode(accepted_db, DatabaseMode::Enabled)
         .unwrap();
@@ -1976,7 +1993,9 @@ async fn pull_accepts_large_composite_type_and_rejects_oversized_field_type() {
 
     let oversized_type = "T".repeat(1024 * 1024 + 1);
     let rejected_db = Uuid::new_v4();
-    storage.ensure_database(rejected_db).unwrap();
+    storage
+        .insert_database(rejected_db, &common::test_identity(rejected_db))
+        .unwrap();
     storage
         .set_database_mode(rejected_db, DatabaseMode::Enabled)
         .unwrap();
@@ -2011,7 +2030,9 @@ async fn all_dictionary_mode_expands_only_safe_catalog_string_fields() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -2079,7 +2100,9 @@ async fn all_dictionary_mode_fails_when_explicit_allowlist_exceeds_hard_cap() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -2146,7 +2169,9 @@ async fn all_dictionary_mode_expands_ru_catalog_prefix() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let state = AppState::new(storage.clone(), "https://masking.test");
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -2251,7 +2276,7 @@ async fn finalize_report_preserves_query_column_order_marks_masked_and_scalars()
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-report".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": query}),
@@ -2264,7 +2289,7 @@ async fn finalize_report_preserves_query_column_order_marks_masked_and_scalars()
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-report".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2352,7 +2377,7 @@ async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-ttl".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": "SELECT 1"}),
@@ -2365,7 +2390,7 @@ async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-ttl".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2412,7 +2437,9 @@ async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
 fn service_start_purges_history_and_call_contexts() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .write_history(
             database_id,
@@ -2464,7 +2491,7 @@ async fn call_title_never_persists_raw_secrets_from_arguments() {
         schema_version: SCHEMA_VERSION,
         call_id,
         correlation_id,
-        database_id,
+        identity: common::test_identity(database_id),
         chat_id: "chat-secret".to_owned(),
         tool_name: "execute_query".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
@@ -2479,7 +2506,7 @@ async fn call_title_never_persists_raw_secrets_from_arguments() {
         schema_version: SCHEMA_VERSION,
         call_id,
         correlation_id,
-        database_id,
+        identity: common::test_identity(database_id),
         chat_id: "chat-secret".to_owned(),
         tool_name: "execute_query".to_owned(),
         arguments,
@@ -2634,7 +2661,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "totally_unknown_tool".to_owned(),
             arguments: json!({"a": 1}),
@@ -2666,7 +2693,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id,
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-a".to_owned(),
                 tool_name: "totally_unknown_tool".to_owned(),
                 arguments: json!({"a": 2}),
@@ -2685,13 +2712,13 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
         .set_tool_classification(
             database_id,
             "totally_unknown_tool",
-            onec_masking_service::domain::ToolClass::MetadataBypass,
+            onec_masking_service::domain::ToolClass::NoMask,
             "admin-1",
         )
         .unwrap();
     let (class, auto_added, denied_count, _, _) =
         classification_row(storage, database_id, "totally_unknown_tool").unwrap();
-    assert_eq!(class, "metadata-bypass");
+    assert_eq!(class, "no-mask");
     assert_eq!(auto_added, 0);
     assert_eq!(denied_count, 3);
 
@@ -2702,7 +2729,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "totally_unknown_tool".to_owned(),
             arguments: json!({"a": 3}),
@@ -2727,7 +2754,7 @@ async fn invalid_tool_name_is_denied_audited_and_not_registered() {
                 schema_version: SCHEMA_VERSION,
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-a".to_owned(),
                 tool_name: tool_name.to_owned(),
                 arguments: json!({}),
@@ -2765,7 +2792,7 @@ async fn auto_registration_limit_denies_without_new_row() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "over_limit_tool".to_owned(),
             arguments: json!({}),
@@ -2790,7 +2817,7 @@ async fn unconfigured_database_denies_before_auto_registration() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "brand_new_tool".to_owned(),
             arguments: json!({}),
@@ -2814,7 +2841,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2845,7 +2872,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"link": token}),
@@ -2862,7 +2889,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-b".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"link": token}),
@@ -2871,15 +2898,15 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::MaskTokenInvalid);
 
-    // metadata-bypass: само наличие токена — отказ до ухода в 1С
-    // (get_metadata — metadata-bypass по встроенной классификации).
+    // no-mask: само наличие токена — отказ до ухода в 1С
+    // (get_metadata — no-mask по встроенной классификации).
     let error = state
         .masking
         .preflight(PreflightRequest {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "get_metadata".to_owned(),
             arguments: json!({"link": token}),
@@ -2896,7 +2923,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"link": token}),
@@ -2929,7 +2956,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -2957,7 +2984,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": format!("ВЫБРАТЬ \"{token}\" КАК")}),
@@ -2979,7 +3006,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3036,7 +3063,7 @@ async fn parse_error_without_tokens_keeps_message() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": "ВЫБРАТЬ 1 КАК В"}),
@@ -3051,7 +3078,7 @@ async fn parse_error_without_tokens_keeps_message() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3092,7 +3119,7 @@ async fn parse_error_without_context_strips_text() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-noctx".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3131,13 +3158,109 @@ async fn parse_error_without_context_strips_text() {
         "в истории текст тоже зачищен: {stored_text}"
     );
 }
+
+//++agent TASK-225 [26.09.2026] фаза-2 B
+// keep(б) «строжайшее»: keep уровня source_path/name/type снимает
+// только структурную маску — словарь и regex действуют внутри
+// значения. keep по source_path здесь подавляет name-маску
+// (source_path — первый селектор в проходе), но поле не «открывается»
+// целиком: значения из словаря и совпадения regex маскируются.
+#[tokio::test]
+async fn keep_rule_leaves_dictionary_and_regex_active_inside_value() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let path = "Справочник.Партнеры.Комментарий";
+    let dict_value = "ACME-TRADE";
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                rules: vec![
+                    PolicyRule {
+                        selector: RuleSelector::SourcePath,
+                        pattern: path.to_owned(),
+                        action: RuleAction::Keep,
+                        category: "KEEP".to_owned(),
+                        priority: 999,
+                        rule_id: None,
+                    },
+                    PolicyRule {
+                        selector: RuleSelector::Name,
+                        pattern: "customer".to_owned(),
+                        action: RuleAction::Mask,
+                        category: "CUSTOMER".to_owned(),
+                        priority: 0,
+                        rule_id: None,
+                    },
+                    PolicyRule {
+                        selector: RuleSelector::Regex,
+                        pattern: "СЕКРЕТ-[0-9]+".to_owned(),
+                        action: RuleAction::Mask,
+                        category: "NUMS".to_owned(),
+                        priority: 0,
+                        rule_id: None,
+                    },
+                ],
+                dictionary: HashMap::from([(dict_value.to_owned(), "PARTNER".to_owned())]),
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+
+    let raw = format!("контрагент {dict_value}, контракт СЕКРЕТ-778899");
+    let call_id = Uuid::new_v4();
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-keep-b".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"customer": raw}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[{"name":"customer","sources":[path]}]}),
+                lineage: vec![json!({"column":"customer","source_path":path})],
+            },
+        })
+        .await
+        .unwrap();
+    let rendered = serde_json::to_string(&response.public_result).unwrap();
+    // Структурная маска снята keep: поле не стало целиком токеном.
+    assert!(!rendered.contains("[MASK:v1:CUSTOMER:"), "{rendered}");
+    assert!(rendered.contains("контрагент"), "{rendered}");
+    // Словарь и regex внутри keep-поля маскируют.
+    assert!(!rendered.contains(dict_value), "{rendered}");
+    assert!(rendered.contains("[MASK:v1:PARTNER:"), "{rendered}");
+    assert!(!rendered.contains("СЕКРЕТ-778899"), "{rendered}");
+    assert!(rendered.contains("[MASK:v1:NUMS:"), "{rendered}");
+
+    state
+        .storage
+        .with_connection(|connection| {
+            let reasons: String = connection.query_row(
+                "SELECT mask_reasons_json FROM history WHERE call_id=?1",
+                [call_id.to_string()],
+                |row| row.get(0),
+            )?;
+            // Причина keep-правила записана; словарь/regex — тоже.
+            assert!(reasons.contains("source_path:keep:keep"), "{reasons}");
+            assert!(reasons.contains("dictionary:PARTNER"), "{reasons}");
+            assert!(reasons.contains("regex:NUMS"), "{reasons}");
+            Ok(())
+        })
+        .unwrap();
+}
 //++agent TASK-225
 
 #[tokio::test]
 async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
 
-    // metadata-bypass инструмент с непрозрачным результатом (весь
+    // no-mask инструмент с непрозрачным результатом (весь
     // ToolCallResult как JSON, field_sources пустые) — проходит
     // финализацию, публичная форма оборачивается сервисом.
     let response = state
@@ -3146,7 +3269,7 @@ async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "get_metadata".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3173,7 +3296,7 @@ async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3210,13 +3333,49 @@ async fn terminal_event_accepts_manager_valid_tool_names() {
                 error_code: "TOOL_PENDING_REVIEW".to_owned(),
                 scope: onec_masking_service::domain::TerminalScope {
                     kind: onec_masking_service::domain::TerminalScopeKind::Verified,
-                    database_id: Some(database_id),
+                    cluster_server: Some(common::TEST_CLUSTER_SERVER.to_owned()),
+                    infobase_name: Some(common::test_infobase_name(database_id)),
+                    instance_id: Some(format!(
+                        "ras:{}:{}",
+                        database_id,
+                        common::test_infobase_guid(database_id)
+                    )),
                     chat_id: Some("chat-a".to_owned()),
                 },
             })
             .unwrap();
         assert_eq!(response.status, "recorded");
     }
+}
+
+//++agent TASK-225 [26.09.2026] фаза-2 L R4-1: регресс — терминал
+// SERVICE_WARMING_UP (отказ preflight на прогреве) обязан приниматься
+// сервисом, иначе outbox менеджера ретраит его бесконечно.
+#[tokio::test]
+async fn terminal_event_accepts_service_warming_up() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let response = state
+        .masking
+        .record_terminal_event(onec_masking_service::domain::TerminalEventRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            tool_name: "execute_query".to_owned(),
+            error_code: "SERVICE_WARMING_UP".to_owned(),
+            scope: onec_masking_service::domain::TerminalScope {
+                kind: onec_masking_service::domain::TerminalScopeKind::Verified,
+                cluster_server: Some(common::TEST_CLUSTER_SERVER.to_owned()),
+                infobase_name: Some(common::test_infobase_name(database_id)),
+                instance_id: Some(format!(
+                    "ras:{}:{}",
+                    database_id,
+                    common::test_infobase_guid(database_id)
+                )),
+                chat_id: Some("chat-a".to_owned()),
+            },
+        })
+        .unwrap();
+    assert_eq!(response.status, "recorded");
 }
 //++agent TASK-225
 
@@ -3261,7 +3420,7 @@ async fn sourceless_columns_with_primitive_values_pass_lineage_check() {
                 schema_version: SCHEMA_VERSION,
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-sourceless".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -3399,7 +3558,7 @@ async fn sourceless_columns_fail_closed_on_violations() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-sourceless".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -3464,7 +3623,7 @@ async fn sourceless_column_values_are_masked_like_regular_columns() {
             schema_version: SCHEMA_VERSION,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-sourceless".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3485,7 +3644,7 @@ async fn sourceless_column_values_are_masked_like_regular_columns() {
 //++agent TASK-225
 
 //++agent TASK-225 [25.09.2026]
-// Двойная сериализация: бизнес-result metadata-bypass инструмента —
+// Двойная сериализация: бизнес-result no-mask инструмента —
 // JSON-строка (BSL возвращает сериализованный JSON). В text должна
 // уйти сама строка, а не экранированный литерал `"{\"valid\":...}"`.
 #[tokio::test]
@@ -3496,7 +3655,7 @@ async fn string_business_result_goes_to_text_verbatim() {
         .set_tool_classification(
             database_id,
             "validate_query",
-            onec_masking_service::domain::ToolClass::MetadataBypass,
+            onec_masking_service::domain::ToolClass::NoMask,
             "admin-test",
         )
         .unwrap();
@@ -3508,7 +3667,7 @@ async fn string_business_result_goes_to_text_verbatim() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "validate_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3536,7 +3695,7 @@ async fn opaque_tool_call_result_passes_through_without_rewrap() {
         .set_tool_classification(
             database_id,
             "infobase_info",
-            onec_masking_service::domain::ToolClass::MetadataBypass,
+            onec_masking_service::domain::ToolClass::NoMask,
             "admin-test",
         )
         .unwrap();
@@ -3551,7 +3710,7 @@ async fn opaque_tool_call_result_passes_through_without_rewrap() {
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-a".to_owned(),
             tool_name: "infobase_info".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3573,7 +3732,9 @@ async fn opaque_tool_call_result_passes_through_without_rewrap() {
 #[test]
 fn strict_mode_defaults_to_on_for_new_databases() {
     let storage = SqliteStorage::in_memory().unwrap();
-    let (settings, created) = storage.ensure_database(Uuid::new_v4()).unwrap();
+    let (_database_id, settings, created) = storage
+        .ensure_database(&common::test_identity(Uuid::new_v4()))
+        .unwrap();
     assert!(created);
     assert!(settings.strict_mode);
 }
@@ -3592,7 +3753,7 @@ async fn finalize_unverified(
             schema_version: SCHEMA_VERSION,
             call_id,
             correlation_id,
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-strict".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -3822,7 +3983,7 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-parse".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 arguments: json!({"query": "ВЫБРАТЬ 1"}),
@@ -3835,7 +3996,7 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
                 schema_version: SCHEMA_VERSION,
                 call_id,
                 correlation_id: Uuid::new_v4(),
-                database_id,
+                identity: common::test_identity(database_id),
                 chat_id: "chat-parse".to_owned(),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
@@ -3869,5 +4030,176 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
         .unwrap();
     assert!(stored.contains("QUERY_PARSE_ERROR"));
     assert!(!stored.contains(dict_word));
+}
+//++agent TASK-225
+//++agent TASK-225 [26.09.2026] фаза-2 C
+/// Холодный старт: база включена, снимка ещё нет, pull-intent стоит —
+/// агент получает SERVICE_WARMING_UP с retry_after_s>=5 (retryable),
+/// а не безликий SERVICE_NOT_READY. Нет intent — прогрева нет,
+/// ответ остаётся SERVICE_NOT_READY. Одинаково на preflight и finalize.
+#[tokio::test]
+async fn warming_up_while_pull_pending_reports_retry_after() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
+    assert!(storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap());
+
+    let preflight = |call_id: Uuid| {
+        let state = state.clone();
+        async move {
+            state
+                .masking
+                .preflight(PreflightRequest {
+                    schema_version: SCHEMA_VERSION,
+                    call_id,
+                    correlation_id: Uuid::new_v4(),
+                    identity: common::test_identity(database_id),
+                    chat_id: "chat-warm".to_owned(),
+                    tool_name: "execute_query".to_owned(),
+                    arguments: json!({"query":"SELECT 1"}),
+                })
+                .await
+        }
+    };
+
+    // Intent не стоит — прогрева нет: обычный безликий отказ.
+    let error = preflight(Uuid::new_v4()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::ServiceNotReady);
+    assert_eq!(error.retry_after_s, None);
+
+    // Intent поставлен — прогрев идёт: понятный код + оценка повтора.
+    enqueue_refresh_intent(&storage, database_id);
+    let error = preflight(Uuid::new_v4()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::ServiceWarmingUp);
+    assert!(error.retryable);
+    assert!(error.retry_after_s.unwrap_or(0) >= 5);
+
+    // finalize на той же фазе отвечает тем же контрактом.
+    let error = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-warm".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success":true,"data":[]}),
+            },
+            field_sources: FieldSources::default(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ServiceWarmingUp);
+    assert!(error.retry_after_s.unwrap_or(0) >= 5);
+
+    // Оценка по числу значений прошлого pull: source_stats активной
+    // генерации задаёт scale (~100 тыс. значений/с, минимум 5с).
+    storage
+        .with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cache_generations(database_id,version,digest,metadata_count,
+                    dictionary_count,selectors_json,source_stats_json,status,created_at)
+                 VALUES (?1,1,'d',0,0,'{}','[{\"source_path\":\"a\",\"category\":\"C\",\"values\":2000000,\"bytes\":1}]',
+                    'active',?2)",
+                rusqlite::params![database_id.to_string(), chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let error = preflight(Uuid::new_v4()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::ServiceWarmingUp);
+    assert_eq!(error.retry_after_s, Some(20));
+}
+
+/// Пропуск пересборки: повторный pull с тем же словарём переиспользует
+/// автомат значений (ветка fingerprint-совпадения → `with_actions`),
+/// отпечаток снимка ненулевой и стабилен.
+#[tokio::test]
+async fn pull_with_unchanged_dictionary_reuses_index() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
+    assert!(storage
+        .set_database_mode(database_id, DatabaseMode::Enabled)
+        .unwrap());
+    storage
+        .set_dictionary_config(
+            database_id,
+            "part",
+            &[json!({"source_path":"Catalog.Organizations.Description","category":"ORG"})],
+        )
+        .unwrap();
+
+    let feed = || {
+        FakeManager::spawn(|name, _| match name {
+            METADATA_TOOL => Ok(metadata_page(
+                vec![metadata_item(
+                    "Catalog.Organizations.Description",
+                    "Description",
+                    "String",
+                    false,
+                )],
+                None,
+                true,
+            )),
+            _ => Ok(dictionary_page(
+                vec![dictionary_value(
+                    "Catalog.Organizations.Description",
+                    "ORG",
+                    "ООО Вектор",
+                )],
+                None,
+                true,
+            )),
+        })
+    };
+
+    let fake = feed();
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let first = state
+        .masking
+        .policy_snapshot_view(database_id)
+        .await
+        .expect("snapshot after pull");
+    assert!(first.dictionary_index.is_some());
+    assert_ne!(first.dictionary_fingerprint, 0);
+
+    // Тот же feed — второй pull: словарь совпал → отпечаток тот же,
+    // индекс на месте (переиспользование автомата — внутри
+    // `with_actions`, пересборки значений не было).
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let second = state
+        .masking
+        .policy_snapshot_view(database_id)
+        .await
+        .expect("snapshot after re-pull");
+    assert_eq!(second.dictionary_fingerprint, first.dictionary_fingerprint);
+    assert!(second.dictionary_index.is_some());
 }
 //++agent TASK-225

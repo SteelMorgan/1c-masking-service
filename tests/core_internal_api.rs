@@ -158,7 +158,10 @@ async fn internal_router_respects_configured_body_limit_before_handler() {
         "schema_version":1,
         "call_id":Uuid::new_v4(),
         "correlation_id":Uuid::new_v4(),
-        "database_id":database_id,
+        "cluster_server":common::TEST_CLUSTER_SERVER,
+        "infobase_name":common::test_infobase_name(database_id),
+        "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
+
         "chat_id":"synthetic-chat",
         "tool_name":"execute_query",
         "arguments":{"query":"SELECT 1"}
@@ -167,7 +170,10 @@ async fn internal_router_respects_configured_body_limit_before_handler() {
         "schema_version":1,
         "call_id":Uuid::new_v4(),
         "correlation_id":Uuid::new_v4(),
-        "database_id":database_id,
+        "cluster_server":common::TEST_CLUSTER_SERVER,
+        "infobase_name":common::test_infobase_name(database_id),
+        "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
+
         "chat_id":"synthetic-chat",
         "tool_name":"execute_query",
         "outcome":{"kind":"transport_error","error":{"message":"synthetic-timeout"}}
@@ -247,7 +253,7 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
         "correlation_id":Uuid::new_v4(),
         "tool_name":"execute_query",
         "error_code":"CHAT_IDENTITY_REQUIRED",
-        "scope":{"kind":"unverified","database_id":Uuid::new_v4(),"chat_id":"candidate"}
+        "scope":{"kind":"unverified","cluster_server":"test-srv","chat_id":"candidate"}
     });
     assert_eq!(
         app.clone()
@@ -299,7 +305,12 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
         })
         .unwrap();
     let candidate_database_id = Uuid::new_v4();
-    storage.ensure_database(candidate_database_id).unwrap();
+    storage
+        .insert_database(
+            candidate_database_id,
+            &common::test_identity(candidate_database_id),
+        )
+        .unwrap();
     storage
         .set_database_mode(candidate_database_id, DatabaseMode::Disabled)
         .unwrap();
@@ -309,7 +320,7 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
             schema_version: 1,
             call_id,
             correlation_id,
-            database_id: candidate_database_id,
+            identity: common::test_identity(candidate_database_id),
             chat_id: "candidate-chat".to_owned(),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
@@ -359,7 +370,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":denied_call_id,
                 "correlation_id":correlation_id,
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(database_id),
+                "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"execute_query",
                 "arguments":{"query":"SELECT 1"}
@@ -384,7 +398,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "correlation_id":correlation_id,
                 "tool_name":"execute_query",
                 "error_code":"SERVICE_NOT_READY",
-                "scope":{"kind":"verified","database_id":database_id,"chat_id":"trusted-conversation"}
+                "scope":{"kind":"verified","cluster_server":common::TEST_CLUSTER_SERVER,"infobase_name":common::test_infobase_name(database_id),"instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),"chat_id":"trusted-conversation"}
             }),
         ))
         .await
@@ -419,6 +433,14 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
         })
         .unwrap();
 
+    //++agent TASK-225 [26.09.2026] N: авто-регистрация создаёт запись с
+    // собственным id — резолвим его по identity для дальнейших assert'ов.
+    let identity_seed = database_id;
+    let (database_id, _) = storage
+        .lookup_database(&common::test_identity(identity_seed))
+        .unwrap()
+        .unwrap();
+    //++agent TASK-225
     assert!(storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap());
@@ -433,7 +455,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":not_ready_call_id,
                 "correlation_id":Uuid::new_v4(),
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(identity_seed),
+                "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"execute_query",
                 "arguments":{"query":"SELECT 1"}
@@ -465,7 +490,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":Uuid::new_v4(),
                 "correlation_id":Uuid::new_v4(),
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(identity_seed),
+                "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"execute_query",
                 "outcome":{"kind":"tool_result","result":{
@@ -487,7 +515,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":Uuid::new_v4(),
                 "correlation_id":Uuid::new_v4(),
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(identity_seed),
+                "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"get_metadata",
                 "outcome":{"kind":"tool_result","result":{
@@ -530,7 +561,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":call_id,
                 "correlation_id":Uuid::new_v4(),
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(identity_seed),
+                "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"execute_query",
                 //++agent TASK-222: контракт Р2 — непрозрачный бизнес-result;
@@ -584,7 +618,10 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "schema_version":1,
                 "call_id":malformed_call_id,
                 "correlation_id":Uuid::new_v4(),
-                "database_id":database_id,
+                "cluster_server":common::TEST_CLUSTER_SERVER,
+                "infobase_name":common::test_infobase_name(identity_seed),
+                "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
+
                 "chat_id":"trusted-conversation",
                 "tool_name":"execute_query",
                 "outcome":{"kind":"tool_result","result":{
@@ -620,7 +657,9 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
 async fn all_mode_cold_start_expands_wildcard_selectors_after_metadata_pull() {
     let storage = Arc::new(SqliteStorage::in_memory().unwrap());
     let database_id = Uuid::new_v4();
-    storage.ensure_database(database_id).unwrap();
+    storage
+        .insert_database(database_id, &common::test_identity(database_id))
+        .unwrap();
     storage
         .set_database_mode(database_id, DatabaseMode::Enabled)
         .unwrap();
@@ -691,7 +730,7 @@ async fn all_mode_cold_start_expands_wildcard_selectors_after_metadata_pull() {
             schema_version: 1,
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
-            database_id,
+            identity: common::test_identity(database_id),
             chat_id: "chat-all-mode".to_owned(),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
