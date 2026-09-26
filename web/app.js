@@ -632,7 +632,11 @@ async function viewerPage() {
     $('#chatList').replaceChildren();
     $('#recordList').replaceChildren();
     $$('#dbList > button').forEach(b => b.classList.toggle('on', b.dataset.id === (db && db.id)));
-    $('#vExportBtn').hidden = !db; // TASK-225
+    //**agent TASK-225 [26.09.2026 04:30:00] кнопка в верхней панели: видна всегда, активна при выбранной базе
+    // $('#vExportBtn').hidden = !db; // TASK-225
+    $('#vExportBtn').disabled = !db;
+    $('#vExportBtn').title = db ? `Экспорт действующей настройки базы ${db.display_label || shortId(db.id)}` : 'Сначала выберите базу';
+    //**agent TASK-225
     crumbs();
     if (db) loadChats(db);
   };
