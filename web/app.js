@@ -634,10 +634,17 @@ function detectCallError(record) {
     if (code && callErrorInfo(code)) {
       return { code, message: typeof value.message === 'string' ? value.message : (err && err.message) || '' };
     }
-    if (value.structured_content) { const hit = fromValue(value.structured_content, depth + 1); if (hit) return hit; }
+    //**agent TASK-225 [27.09.2026 14:00:00] доработка D: сначала content[].text —
+    // там исходное сообщение (для терминальных записей structured_content без message)
+    // if (value.structured_content) { const hit = fromValue(value.structured_content, depth + 1); if (hit) return hit; }
+    // if (Array.isArray(value.content)) {
+    //   for (const c of value.content) { const hit = c && typeof c.text === 'string' ? fromText(c.text, depth + 1) : null; if (hit) return hit; }
+    // }
     if (Array.isArray(value.content)) {
       for (const c of value.content) { const hit = c && typeof c.text === 'string' ? fromText(c.text, depth + 1) : null; if (hit) return hit; }
     }
+    if (value.structured_content) { const hit = fromValue(value.structured_content, depth + 1); if (hit) return hit; }
+    //**agent TASK-225
     return null;
   };
   const fromText = (text, depth) => {
@@ -1105,6 +1112,13 @@ async function viewerPage() {
   // идентификаторы, исход и текст запроса из МАСКИРОВАННОЙ записи
   // (viewer.record, никогда viewer.revealed); результат не копируется —
   // лишь число строк. Полей, которых нет в записи, в блоке нет.
+  // Исходы записей истории (service.rs: finalize/persist_*): tool_result — отдельно выше.
+  const AGENT_OUTCOME_TEXT = {
+    transport_error: 'сбой связи с 1С',
+    sanitized_error: 'результат отброшен сервисом как небезопасный/некорректный',
+    terminal_denial: 'вызов отклонён сервисом',
+    denied: 'вызов отклонён',
+  };
   const agentCallText = record => {
     const db = viewer.database;
     const report = record.report || {};
@@ -1119,7 +1133,17 @@ async function viewerPage() {
     const corr = /correlation_id\W{1,3}([0-9a-f-]{36})/i.exec((report.blocks || []).filter(b => b && b.kind === 'text').map(b => b.text).join('\n'));
     if (corr) ids += `; correlation_id: ${corr[1]}`;
     lines.push(ids);
-    lines.push(`- Исход: ${record.outcome}${hit ? ` [${hit.code} — ${hit.title}]` : ''}`);
+    //**agent TASK-225 [27.09.2026 14:00:00] доработка D: исход по-человечески + текст ошибки
+    // lines.push(`- Исход: ${record.outcome}${hit ? ` [${hit.code} — ${hit.title}]` : ''}`);
+    const outcomeText = record.outcome === 'tool_result'
+      ? (hit ? 'ответ инструмента с ошибкой' : 'успешно')
+      : (AGENT_OUTCOME_TEXT[record.outcome] || 'прочий исход');
+    lines.push(`- Исход: ${outcomeText} (${record.outcome})${hit ? ` [${hit.code} — ${hit.title}]` : ''}`);
+    if (hit && hit.message) {
+      const msg = String(hit.message);
+      lines.push(`- Текст ошибки: ${msg.length > 500 ? `${msg.slice(0, 500)}…` : msg}`);
+    }
+    //**agent TASK-225
     const rows = (report.blocks || []).filter(b => b && b.kind === 'table' && Array.isArray(b.rows))
       .reduce((n, b) => n + b.rows.length, 0);
     if (rows) lines.push(`- Строк в результате: ${rows}`);
