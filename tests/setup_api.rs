@@ -2968,3 +2968,261 @@ async fn r4_rollback_draft_emits_no_tool_removals() {
 
 // Импорт-сторона (origin=import → удаления есть) покрыта тестами
 // H.6 выше (`h6_file_with_tools_marks_missing_as_removable_tool_removed`).
+
+// ------------------------------------------------------------------
+// T (phase-decisions-2): DELETE /admin/databases/{id} — каскадное
+// снятие записи базы, audit database.delete, RBAC/CSRF, заново
+// регистрируется unconfigured при повторном вызове.
+//++agent TASK-225 [27.09.2026 00:00:00]
+
+// Строки во всех таблицах с database_id, чтобы DELETE реально
+// покрывал каскад, а не только пустую запись databases.
+fn seed_database_relations(storage: &SqliteStorage, database_id: Uuid) {
+    let database_id = database_id.to_string();
+    let policy_id = Uuid::new_v4().to_string();
+    storage
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE databases SET display_label='old-db' WHERE id=?1",
+                [&database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO policies(id,database_id,version,status,created_at)
+                 VALUES (?1,?2,1,'active','2026-01-01T00:00:00Z')",
+                rusqlite::params![policy_id, database_id],
+            )?;
+            // База указывает на активную политику — edge FK без cascade.
+            connection.execute(
+                "UPDATE databases SET active_policy_id=?1 WHERE id=?2",
+                rusqlite::params![policy_id, database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,
+                   action,category,priority,created_at)
+                 VALUES (?1,?2,'source_path','Catalog.Номенклатура.Name','mask','PII',1,
+                   '2026-01-01T00:00:00Z')",
+                rusqlite::params![Uuid::new_v4().to_string(), policy_id],
+            )?;
+            connection.execute(
+                "INSERT INTO tool_classifications(database_id,tool_name,class,updated_at)
+                 VALUES (?1,'seed_tool','data-mask','2026-01-01T00:00:00Z')",
+                [&database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO dictionary_configs(id,database_id,mode,updated_at)
+                 VALUES (?1,?2,'all','2026-01-01T00:00:00Z')",
+                rusqlite::params![Uuid::new_v4().to_string(), database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO cache_generations(database_id,version,digest,status,created_at,activated_at)
+                 VALUES (?1,1,'d','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [&database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO v2_refresh_intents(database_id,phase,reason,created_at)
+                 VALUES (?1,'full','test','2026-01-01T00:00:00Z')",
+                [&database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO setup_imports(id,database_id,actor_id,sha256,size_bytes,schema,result,created_at)
+                 VALUES (?1,?2,?3,'s',1,'masking-setup/v1','accepted','2026-01-01T00:00:00Z')",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    database_id,
+                    Uuid::new_v4().to_string()
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO setup_journal(database_id,at,actor_kind,action)
+                 VALUES (?1,'2026-01-01T00:00:00Z','human','export')",
+                [&database_id],
+            )?;
+            connection.execute(
+                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,
+                   policy_version,mask_reasons_json,public_result_json,report_json,
+                   created_at,expires_at)
+                 VALUES (?1,?2,'c',?3,'t','tool_result',1,'[]','{}','{}',
+                   '2026-01-01T00:00:00Z','2999-01-01T00:00:00Z')",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    database_id,
+                    Uuid::new_v4().to_string()
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO call_contexts(call_id,database_id,chat_id,tool_name,created_at,expires_at)
+                 VALUES (?1,?2,'c','t','2026-01-01T00:00:00Z','2999-01-01T00:00:00Z')",
+                rusqlite::params![Uuid::new_v4().to_string(), database_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delete_database_cascades_all_rows_and_keeps_audit() {
+    let (storage, _, _, masking, app, admin, database_id) = fixture().await;
+    seed_database_relations(&storage, database_id);
+    // RAM-снапшот manifest до удаления — после DELETE его быть не должно.
+    assert!(masking.seed_metadata_manifest(
+        database_id,
+        vec![onec_masking_service::domain::FeedMetadataItem {
+            source_path: "Справочник.Контрагенты.ИНН".into(),
+            field_name: "ИНН".into(),
+            field_type: "String(12)".into(),
+            password_mode: false,
+        }],
+    ));
+
+    let response = app
+        .clone()
+        .oneshot(delete_request(
+            &format!("/api/v1/admin/databases/{database_id}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let database_id_s = database_id.to_string();
+    let counts = storage
+        .with_connection(|connection| {
+            let count = |sql: &str| -> rusqlite::Result<i64> {
+                connection.query_row(sql, [&database_id_s], |row| row.get(0))
+            };
+            Ok((
+                count("SELECT COUNT(*) FROM databases WHERE id=?1")?,
+                count("SELECT COUNT(*) FROM policies WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM tool_classifications WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM dictionary_configs WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM cache_generations WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM v2_refresh_intents WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM setup_imports WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM setup_journal WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM history WHERE database_id=?1")?,
+                count("SELECT COUNT(*) FROM call_contexts WHERE database_id=?1")?,
+                connection.query_row("SELECT COUNT(*) FROM policy_rules", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+                count(
+                    "SELECT COUNT(*) FROM audit_events
+                     WHERE database_id=?1 AND action='database.delete'
+                       AND actor_id IS NOT NULL AND code='old-db'",
+                )?,
+            ))
+        })
+        .unwrap();
+    // Каждая каскадная таблица пуста, audit database.delete остался.
+    assert_eq!(
+        counts,
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
+        "counts={counts:?}"
+    );
+    // RAM-состояние по базе сброшено.
+    assert!(masking
+        .metadata_manifest_view(database_id, |items| items.len())
+        .is_none());
+
+    // Повтор — 404.
+    let response = app
+        .oneshot(delete_request(
+            &format!("/api/v1/admin/databases/{database_id}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_database_requires_admin_csrf_and_origin() {
+    let (_, auth, sessions, _, app, admin, database_id) = fixture().await;
+    let uri = format!("/api/v1/admin/databases/{database_id}");
+
+    // Viewer — 403.
+    let admin_principal = auth
+        .authenticate("setup-api-t", "admin", ADMIN_PASSWORD)
+        .unwrap();
+    let (_, activation) = auth
+        .create_user(&admin_principal, "viewer-t", Role::Viewer, Uuid::new_v4())
+        .unwrap();
+    auth.activate("viewer-t", &activation, "viewer passphrase t")
+        .unwrap();
+    let viewer = auth
+        .authenticate("viewer-t-login", "viewer-t", "viewer passphrase t")
+        .unwrap();
+    let viewer_session = sessions.issue(viewer, Utc::now()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &viewer_session))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Без CSRF — 403; чужой origin — 403.
+    let no_csrf = Request::builder()
+        .method("DELETE")
+        .uri(&uri)
+        .header("origin", ORIGIN)
+        .header("cookie", cookie(&admin.token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(no_csrf).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let foreign_origin = Request::builder()
+        .method("DELETE")
+        .uri(&uri)
+        .header("origin", "https://evil.test")
+        .header("cookie", cookie(&admin.token))
+        .header("x-csrf-token", &admin.csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(foreign_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Запись на месте — ни одна из попыток не прошла.
+    let response = app
+        .clone()
+        .oneshot(delete_request(&uri, &admin))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn deleted_database_re_registers_as_unconfigured_on_next_call() {
+    use onec_masking_service::domain::{DatabaseMode, PreflightRequest, SCHEMA_VERSION};
+    let (storage, _, _, masking, app, admin, database_id) = fixture().await;
+    let response = app
+        .oneshot(delete_request(
+            &format!("/api/v1/admin/databases/{database_id}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Та же личность делает вызов — авто-регистрация заново.
+    let identity = common::test_identity(database_id);
+    let response = masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: identity.clone(),
+            chat_id: "chat-t".to_owned(),
+            tool_name: "get_metadata".to_owned(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.decision, "allow");
+
+    // Запись создана заново — режим unconfigured.
+    let (_new_id, settings) = storage
+        .lookup_database(&identity)
+        .unwrap()
+        .expect("база должна перерегистрироваться");
+    assert_eq!(settings.mode, DatabaseMode::Unconfigured);
+}
+//++agent TASK-225

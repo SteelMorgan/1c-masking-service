@@ -410,6 +410,17 @@ pub trait HumanDataStore: Send + Sync {
         database_id: Uuid,
         correlation_id: Uuid,
     ) -> Result<(), HumanDataError>;
+    //++agent TASK-225 [27.09.2026 00:00:00] T: удаление записи базы —
+    // каскад по всем таблицам с database_id в одной tx + сброс
+    // RAM-состояния сервиса. `NotFound`, если записи нет; повторный
+    // вызов регистрирует базу заново (штатная авто-регистрация).
+    //++agent TASK-225
+    fn delete_database<'a>(
+        &'a self,
+        actor: &'a Principal,
+        database_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HumanDataError>> + Send + 'a>>;
     fn list_tool_classifications(
         &self,
         database_id: Uuid,

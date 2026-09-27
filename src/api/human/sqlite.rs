@@ -339,6 +339,72 @@ impl HumanDataStore for SqliteHumanDataStore {
         //++agent TASK-222
     }
 
+    //++agent TASK-225 [27.09.2026 00:00:00] T: удаление базы — явные
+    // DELETE по всем таблицам с database_id в одной транзакции (не
+    // полагаемся на FK CASCADE), затем сама запись databases.
+    // audit_events не каскадятся — событие database.delete переживает
+    // удаление; display_label/id уходит в code, чтобы по журналу было
+    // видно, что удалили. RAM-состояние сервиса сбрасывается после
+    // durable-успеха в той же async-обёртке.
+    fn delete_database<'a>(
+        &'a self,
+        actor: &'a Principal,
+        database_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HumanDataError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.storage
+                .with_connection(|connection| {
+                    let tx = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let label: String = tx.query_row(
+                        "SELECT COALESCE(display_label,id) FROM databases WHERE id=?1",
+                        [database_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    // active_policy_id — FK на policies без cascade: сначала
+                    // разрываем ссылку, иначе DELETE FROM policies не пройдёт.
+                    tx.execute(
+                        "UPDATE databases SET active_policy_id=NULL WHERE id=?1",
+                        [database_id.to_string()],
+                    )?;
+                    for statement in [
+                        "DELETE FROM call_contexts WHERE database_id=?1",
+                        "DELETE FROM policy_rules WHERE policy_id IN \
+                            (SELECT id FROM policies WHERE database_id=?1)",
+                        "DELETE FROM policies WHERE database_id=?1",
+                        "DELETE FROM tool_classifications WHERE database_id=?1",
+                        "DELETE FROM dictionary_configs WHERE database_id=?1",
+                        "DELETE FROM cache_generations WHERE database_id=?1",
+                        "DELETE FROM v2_refresh_intents WHERE database_id=?1",
+                        "DELETE FROM setup_imports WHERE database_id=?1",
+                        "DELETE FROM setup_journal WHERE database_id=?1",
+                        "DELETE FROM history WHERE database_id=?1",
+                    ] {
+                        tx.execute(statement, [database_id.to_string()])?;
+                    }
+                    let now = Utc::now().to_rfc3339();
+                    tx.execute(
+                        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,code,outcome,correlation_id,created_at)
+                         VALUES ('human',?1,'database.delete',?2,?3,'success',?4,?5)",
+                        params![
+                            actor.user_id.to_string(),
+                            database_id.to_string(),
+                            label,
+                            correlation_id.to_string(),
+                            now
+                        ],
+                    )?;
+                    tx.execute("DELETE FROM databases WHERE id=?1", [database_id.to_string()])?;
+                    tx.commit()
+                })
+                .map_err(sql_error)?;
+            self.masking.purge_database_state(database_id).await;
+            Ok(())
+        })
+    }
+    //++agent TASK-225
+
     fn list_tool_classifications(
         &self,
         database_id: Uuid,

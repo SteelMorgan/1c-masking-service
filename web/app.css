@@ -390,3 +390,6 @@ pre.report.hl{outline:2px solid var(--accent);outline-offset:2px}
 .top #vExportBtn{margin-right:8px}
 @media (max-width:560px){.top #vExportBtn{padding-left:8px;padding-right:8px;font-size:12px}}
 /*++agent TASK-225*/
+/*++agent TASK-225 [27.09.2026 08:30:42] опасная зона карточки базы */
+.dzone{margin-top:18px;border-top:1px solid var(--line);padding-top:12px}
+/*++agent TASK-225*/

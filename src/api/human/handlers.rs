@@ -679,6 +679,27 @@ pub async fn refresh_database(
     }
 }
 
+//++agent TASK-225 [27.09.2026 00:00:00] T: удаление записи базы — мёртвые
+// записи со старыми ключами координат должны сниматься из реестра, иначе
+// вечно крутят refresh. Admin + CSRF + same-origin; каскад и аудит — в
+// data-слое вместе со сбросом RAM-состояния сервиса. Повторный вызов
+// базы регистрирует её заново — специальной обработки не нужно.
+//++agent TASK-225
+pub async fn delete_database(
+    State(state): State<Arc<HumanState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match admin_mutation(&state, &headers) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    match state.data.delete_database(&actor, id, Uuid::new_v4()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => data_error(error).into_response(),
+    }
+}
+
 //++agent TASK-224 [24.09.2026]
 /// Ленивое дерево метаданных для вкладки «Справочники» (только чтение,
 /// Admin; CSRF не нужен). Границы длины — до обращения к store.

@@ -79,7 +79,10 @@ pub fn router(state: Arc<HumanState>) -> Router {
         .route("/api/v1/admin/databases", get(handlers::admin_databases))
         .route(
             "/api/v1/admin/databases/{id}",
-            patch(handlers::update_database),
+            //**agent TASK-225 [27.09.2026 00:00:00] T: DELETE — снятие записи базы.
+            //    patch(handlers::update_database),
+            patch(handlers::update_database).delete(handlers::delete_database),
+            //**agent TASK-225
         )
         .route(
             "/api/v1/admin/databases/{id}/refresh",

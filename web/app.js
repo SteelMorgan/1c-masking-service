@@ -1427,6 +1427,73 @@ async function adminPage() {
     }
   });
 
+  //++agent TASK-225 [27.09.2026 08:30:42] удаление базы (DELETE /admin/databases/{id}).
+  // Необратимо и стирает всю настройку, поэтому подтверждение вводом имени, а не
+  // одним кликом; кнопка только у Admin (защита на сервере, здесь - не соблазнять).
+  $('#dbDelete').hidden = !(state.session && state.session.role === 'Admin');
+  const dbDel = { target: null, expect: '' };
+  const dbDelMatch = () => $('#dbDelInput').value.trim() === dbDel.expect;
+  const dbDelNotify = text => {
+    const note = $('#dbsOk');
+    note.textContent = text;
+    note.hidden = false;
+    setTimeout(() => { if (note.textContent === text) note.hidden = true; }, 6000);
+  };
+  const dbDelForget = async () => {
+    // Карточку удалённой базы гасим сразу: опрос статуса и правки не должны
+    // продолжаться по несуществующему id.
+    dbs.current = null;
+    if (dbs.refreshTimer) { clearInterval(dbs.refreshTimer); dbs.refreshTimer = null; }
+    $('#dbCard').hidden = true;
+    await loadDatabases();
+  };
+  $('#dbDelete').addEventListener('click', () => {
+    if (!dbs.current) return;
+    dbDel.target = dbs.current;
+    dbDel.expect = dbs.current.display_label || dbs.current.id;
+    $('#dbDelName').textContent = dbDel.expect;
+    $('#dbDelExpect').textContent = dbDel.expect;
+    $('#dbDelInput').value = '';
+    $('#dbDelErr').hidden = true;
+    $('#dbDelYes').disabled = true;
+    $('#dbDelYes').textContent = 'Удалить базу';
+    openOverlay('dlgDbDelete');
+    $('#dbDelInput').focus();
+  });
+  $('#dbDelInput').addEventListener('input', () => { $('#dbDelYes').disabled = !dbDelMatch(); });
+  $('#dbDelInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && dbDelMatch() && !$('#dbDelYes').disabled) $('#dbDelYes').click();
+  });
+  $('#dbDelNo').addEventListener('click', () => { closeOverlays(); dbDel.target = null; });
+  $('#dbDelYes').addEventListener('click', async () => {
+    if (!dbDel.target || !dbDelMatch()) return;
+    const target = dbDel.target;
+    const name = dbDel.expect;
+    const btn = $('#dbDelYes');
+    btn.disabled = true;
+    btn.textContent = 'Удаление…';
+    $('#dbDelErr').hidden = true;
+    try {
+      await api(`/api/v1/admin/databases/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
+      closeOverlays();
+      dbDel.target = null;
+      await dbDelForget();
+      dbDelNotify(`База «${name}» удалена.`);
+    } catch (error) {
+      if (error.status === 404) {
+        closeOverlays();
+        dbDel.target = null;
+        await dbDelForget();
+        dbDelNotify(`База «${name}» уже удалена или не найдена — список обновлён.`);
+        return;
+      }
+      showError($('#dbDelErr'), error);
+      btn.textContent = 'Удалить базу';
+      btn.disabled = !dbDelMatch();
+    }
+  });
+  //++agent TASK-225
+
   const renderRefreshState = db => {
     const tag = $('#refreshState');
     //**agent TASK-224 [25.09.2026 12:50:00] итерация 5: refresh_stage='active'

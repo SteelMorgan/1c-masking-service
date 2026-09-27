@@ -195,6 +195,32 @@ impl MaskingService {
         let entry = manifests.get(database_id)?;
         Some((entry.completed_at, view(&entry.items)))
     }
+    //++agent TASK-225 [27.09.2026 00:00:00] T: сброс RAM-состояния
+    // удалённой базы — снапшоты политики/словаря, manifest, токены,
+    // семафоры, dry_run-флаг и idempotent-кэш висячими не остаются.
+    // Повторный вызов удалённой базы регистрирует её заново как
+    // unconfigured (штатная авто-регистрация).
+    pub async fn purge_database_state(&self, database_id: Uuid) {
+        self.policy_cache.write().await.remove(&database_id);
+        self.mappings.write().await.purge_database(database_id);
+        if let Ok(mut manifests) = self.metadata_manifests.lock() {
+            manifests.retain(|id, _| id != database_id);
+        }
+        if let Ok(mut workers) = self.database_workers.lock() {
+            workers.remove(&database_id);
+        }
+        if let Ok(mut admission) = self.admission_by_database.lock() {
+            admission.remove(&database_id);
+        }
+        if let Ok(mut lock) = self.dry_run_lock.lock() {
+            lock.remove(&database_id);
+        }
+        if let Ok(mut responses) = self.completed_responses.lock() {
+            responses.retain(|key, _| key.0 != database_id);
+        }
+    }
+    //++agent TASK-225
+
     /// Тестовая загрузка manifest в RAM-store напрямую, минуя pull:
     /// integration-тесты human API не поднимают manager feed. Durable
     /// commit не выполняется — только для тестов.
