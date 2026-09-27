@@ -68,6 +68,9 @@
             <!--++agent TASK-225 [26.09.2026 03:00:00] «Почему скрыто» (B9)-->
             <button class="btn sm tgl" id="whyBtn" type="button"><i class="ii">i</i> Почему скрыто</button>
             <!--++agent TASK-225-->
+            <!--++agent TASK-225 [27.09.2026 13:00:00] ссылка на вызов для агента (без результата)-->
+            <button class="btn sm" id="agentCopyBtn" type="button" title="Идентификаторы вызова и текст запроса — без результата и без раскрытых значений">Скопировать для агента</button>
+            <!--++agent TASK-225-->
             <div class="pill" id="maskToggle" role="group" aria-label="Какие значения показать" hidden>
               <button type="button" data-view="real">Реальные</button>
               <button type="button" data-view="masked">Маскированные</button>
@@ -80,6 +83,9 @@
         <!----agent TASK-224-->
         <div class="note warn" id="revealWarn" hidden></div>
         <div class="note err" id="revealErr" hidden></div>
+        <!--++agent TASK-225 [27.09.2026 12:00:00] пояснение штатного отказа защиты/настройки-->
+        <div class="note info" id="callNote" hidden></div>
+        <!--++agent TASK-225-->
         <div id="reportBody"></div>
         <!--++agent TASK-225 [26.09.2026 03:00:00] панель причин маскирования-->
         <aside class="whyp" id="whyPanel" hidden>

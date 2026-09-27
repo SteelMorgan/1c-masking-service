@@ -556,6 +556,158 @@ const OUTCOME_LABELS = {
   denied: ['err', 'отклонено'],
 };
 
+//++agent TASK-225 [27.09.2026 12:00:00] штатные отказы защиты 1С и сервиса
+// не должны выглядеть как сбой: код из результата вызова → вид + пояснение.
+// Вид: protection — защита сработала штатно (информационный тег), config —
+// поправить настройку, query — ошибка текста запроса, technical — сбой.
+const CALL_ERROR_KIND = {
+  protection: ['acc', 'Защита сработала'],
+  config: ['warn', 'Нужна настройка'],
+  query: ['warn', 'Ошибка запроса'],
+  technical: ['err', 'Технический сбой'],
+};
+const LINEAGE_TECH = {
+  kind: 'protection', title: 'Не удалось проверить происхождение колонок',
+  hint: 'Проверка происхождения колонок технически не выполнилась, поэтому результат не выдан ради безопасности. Упростите запрос или повторите позже.',
+};
+const DICT_HINT = 'Откройте настройку словаря в админке и исправьте источник значений.';
+const CALL_ERROR_CODES = {
+  SOURCE_LINEAGE_UNVERIFIED: {
+    kind: 'protection', title: 'Выражение над защищёнными полями запрещено',
+    hint: 'Запрос вычисляет значение из полей (ПОДСТРОКА, склейка, агрегат, условие по полю), происхождение которого нельзя однозначно проверить. Так можно вытащить секрет или ПДн по частям, поэтому результат не выдан. Выбирайте поле напрямую, без преобразований.',
+  },
+  LINEAGE_INVALID_SCHEMA: LINEAGE_TECH,
+  LINEAGE_NATIVE_UNAVAILABLE: LINEAGE_TECH,
+  SECRET_SCAN_DEPTH_LIMIT: {
+    kind: 'protection', title: 'Результат слишком глубоко вложен',
+    hint: 'Проверить такой результат на секреты невозможно, поэтому он не выдан. Уменьшите вложенность выборки.',
+  },
+  DICTIONARY_SECRET_SOURCE_DENIED: { kind: 'config', title: 'Источник словаря — секретное поле', hint: `Секретное поле нельзя использовать источником словаря. ${DICT_HINT}` },
+  DICTIONARY_SOURCE_NOT_ALLOWED: { kind: 'config', title: 'Источник словаря не разрешён', hint: `Источник не входит в допустимые. ${DICT_HINT}` },
+  DICTIONARY_SOURCE_TYPE_UNSUPPORTED: { kind: 'config', title: 'Тип источника словаря не поддерживается', hint: `Источником словаря может быть только строковое поле. ${DICT_HINT}` },
+  DICTIONARY_WILDCARD_ALLOWLIST_REQUIRED: { kind: 'config', title: 'Шаблону источника нужен список разрешённых', hint: `Источник задан шаблоном (*) — перечислите разрешённые объекты явно. ${DICT_HINT}` },
+  DICTIONARY_SELECTOR_INVALID: { kind: 'config', title: 'Некорректный селектор словаря', hint: `Селектор источника не распознан. ${DICT_HINT}` },
+  DICTIONARY_SOURCE_INVALID: { kind: 'config', title: 'Некорректный источник словаря', hint: `Источник словаря не найден или задан неверно. ${DICT_HINT}` },
+  ACTION_REQUIRED: { kind: 'config', title: 'База требует настройки', hint: 'Маскирование для базы ещё не настроено: завершите настройку в админке, затем повторите вызов.' },
+  QUERY_PARSE_ERROR: { kind: 'query', title: 'Ошибка в тексте запроса', hint: 'Запрос не разобран — это не защита. Исправьте синтаксис запроса.' },
+  QUERY_EXECUTION_ERROR: { kind: 'query', title: 'Ошибка выполнения запроса в 1С', hint: 'Запрос разобран, но 1С не смогла его выполнить. Проверьте имена таблиц, полей и параметры.' },
+  CURSOR_INVALID: { kind: 'technical', title: 'Курсор выборки недействителен', hint: 'Курсор устарел или повреждён — запросите данные заново с начала.' },
+  METADATA_SELECTOR_INVALID: { kind: 'technical', title: 'Некорректный селектор метаданных', hint: 'Проверьте имя объекта метаданных в вызове.' },
+  FILTER_AST_UNSUPPORTED: { kind: 'technical', title: 'Фильтр не поддерживается', hint: 'Упростите условие отбора.' },
+  SOURCE_TOOL_FAILED: { kind: 'technical', title: 'Инструмент-источник завершился ошибкой', hint: 'Сбой на стороне 1С — подробности в журнале регистрации.' },
+  FEED_: { kind: 'technical', title: 'Ошибка ленты данных', hint: 'Технический сбой выдачи данных — повторите позже.' },
+  SERVICE_RESULT_UNAVAILABLE: { kind: 'technical', title: 'Результат недоступен', hint: 'Сервис не смог безопасно обработать результат. Найдите correlation_id в журнале сервиса.' },
+  SERVICE_TEMP_UNAVAILABLE: { kind: 'technical', title: 'Операция временно недоступна', hint: 'Временный сбой сервиса или связи с 1С — повторите позже; correlation_id — для журнала.' },
+};
+// Тексты, которые сервис пишет в историю сам (safe_*_error в service.rs).
+const CALL_ERROR_TEXTS = [
+  [/^База требует настройки пользователем/, 'ACTION_REQUIRED'],
+  [/^Результат недоступен/, 'SERVICE_RESULT_UNAVAILABLE'],
+  [/^Операция временно недоступна/, 'SERVICE_TEMP_UNAVAILABLE'],
+];
+const callErrorInfo = code => CALL_ERROR_CODES[code]
+  || (typeof code === 'string' && code.startsWith('FEED_') ? CALL_ERROR_CODES.FEED_ : null);
+// Ищет известный код в тексте блока: JSON {"error":"КОД"} / {"error":{"code":…}}
+// (возможно внутри content[].text), иначе — служебные фразы сервиса.
+// Неизвестный код → null (запись рисуется как раньше).
+function detectCallError(record) {
+  const report = record && record.report;
+  if (!report || !Array.isArray(report.blocks)) return null;
+  const fromValue = (value, depth) => {
+    if (!value || typeof value !== 'object' || depth > 4) return null;
+    const err = value.error;
+    const code = typeof err === 'string' ? err : (err && typeof err.code === 'string' ? err.code : null);
+    if (code && callErrorInfo(code)) {
+      return { code, message: typeof value.message === 'string' ? value.message : (err && err.message) || '' };
+    }
+    if (value.structured_content) { const hit = fromValue(value.structured_content, depth + 1); if (hit) return hit; }
+    if (Array.isArray(value.content)) {
+      for (const c of value.content) { const hit = c && typeof c.text === 'string' ? fromText(c.text, depth + 1) : null; if (hit) return hit; }
+    }
+    return null;
+  };
+  const fromText = (text, depth) => {
+    const t = text.trim();
+    if (t.startsWith('{')) {
+      try { const hit = fromValue(JSON.parse(t), depth); if (hit) return hit; } catch (_) { /* не JSON */ }
+    }
+    for (const [re, code] of CALL_ERROR_TEXTS) if (re.test(t)) return { code, message: t };
+    return null;
+  };
+  for (const block of report.blocks) {
+    if (block && block.kind === 'text' && typeof block.text === 'string') {
+      const hit = fromText(block.text, 0);
+      if (hit) return { ...hit, ...callErrorInfo(hit.code) };
+    }
+  }
+  return null;
+}
+// Статус записи для тега: распознанный отказ перекрывает outcome.
+function callStatus(record) {
+  const hit = detectCallError(record);
+  if (hit) {
+    const [cls, label] = CALL_ERROR_KIND[hit.kind];
+    return { cls, label, hit };
+  }
+  const [cls, label] = OUTCOME_LABELS[record.outcome] || ['mut', record.outcome];
+  return { cls, label, hit: null };
+}
+//++agent TASK-225
+
+//++agent TASK-225 [27.09.2026 12:30:00] текст запроса — блок кода «как в
+// конфигураторе»: подсветка ключевых слов языка запросов 1С, строк, чисел,
+// комментариев и параметров. Только отображение: собирается из текстовых
+// узлов (без innerHTML), копируется исходный текст.
+const QUERY_KEYWORDS = new Set((
+  'ВЫБРАТЬ ИЗ ГДЕ И ИЛИ НЕ КАК ПЕРВЫЕ РАЗЛИЧНЫЕ РАЗРЕШЕННЫЕ СОЕДИНЕНИЕ ЛЕВОЕ ПРАВОЕ ВНУТРЕННЕЕ ПОЛНОЕ ПО '
+  + 'СГРУППИРОВАТЬ УПОРЯДОЧИТЬ УБЫВ ВОЗР ИМЕЮЩИЕ ОБЪЕДИНИТЬ ВСЕ ВЫБОР КОГДА ТОГДА ИНАЧЕ КОНЕЦ ЕСТЬ NULL '
+  + 'ЗНАЧЕНИЕ ПОДОБНО МЕЖДУ В ИЕРАРХИИ ИСТИНА ЛОЖЬ НЕОПРЕДЕЛЕНО КОЛИЧЕСТВО СУММА МАКСИМУМ МИНИМУМ СРЕДНЕЕ '
+  + 'ПОДСТРОКА ВЫРАЗИТЬ ДАТАВРЕМЯ ПОМЕСТИТЬ ИНДЕКСИРОВАТЬ ССЫЛКА ДЛЯ ИЗМЕНЕНИЯ ИТОГИ '
+  + 'SELECT FROM WHERE AND OR NOT AS TOP DISTINCT ALLOWED JOIN LEFT RIGHT INNER FULL OUTER ON BY GROUP ORDER '
+  + 'DESC ASC HAVING UNION ALL CASE WHEN THEN ELSE END IS VALUE LIKE BETWEEN IN HIERARCHY TRUE FALSE UNDEFINED '
+  + 'COUNT SUM MAX MIN AVG SUBSTRING CAST DATETIME INTO INDEX REFS FOR UPDATE TOTALS'
+).split(' '));
+// Перед этими словами — перенос строки при переформатировании однострочного запроса.
+const QUERY_BREAK_BEFORE = new Set('ИЗ ГДЕ СГРУППИРОВАТЬ УПОРЯДОЧИТЬ ИМЕЮЩИЕ ОБЪЕДИНИТЬ ЛЕВОЕ ПРАВОЕ ВНУТРЕННЕЕ ПОЛНОЕ СОЕДИНЕНИЕ FROM WHERE GROUP ORDER HAVING UNION LEFT RIGHT INNER FULL JOIN'.split(' '));
+const QUERY_JOIN_QUAL = new Set('ЛЕВОЕ ПРАВОЕ ВНУТРЕННЕЕ ПОЛНОЕ LEFT RIGHT INNER FULL OUTER'.split(' '));
+const QUERY_TOKEN_RE = /(\/\/[^\n]*)|("(?:[^"]|"")*"?)|(&[\wА-Яа-яЁё]+)|(\d+(?:\.\d+)?)|([A-Za-zА-Яа-яЁё_][\wА-Яа-яЁё]*)|(\s+)|([^\s])/gu;
+function tokenizeQuery(text) {
+  const out = [];
+  QUERY_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = QUERY_TOKEN_RE.exec(text))) {
+    const kind = m[1] ? 'cm' : m[2] ? 'str' : m[3] ? 'par' : m[4] ? 'num'
+      : m[5] ? (QUERY_KEYWORDS.has(m[5].toUpperCase()) ? 'kw' : 'id') : m[6] ? 'ws' : 'p';
+    out.push({ kind, text: m[0] });
+  }
+  return out;
+}
+// Однострочный длинный запрос → переносы перед ключевыми разделами.
+function reflowQuery(tokens, source) {
+  if (source.includes('\n') || source.length <= 80) return tokens;
+  let prevWord = '';
+  let seenWord = false;
+  return tokens.map((tok, i) => {
+    if (tok.kind === 'ws') {
+      const next = tokens[i + 1];
+      const up = next && next.kind === 'kw' ? next.text.toUpperCase() : '';
+      const brk = seenWord && QUERY_BREAK_BEFORE.has(up)
+        && !((up === 'СОЕДИНЕНИЕ' || up === 'JOIN' || up === 'OUTER') && QUERY_JOIN_QUAL.has(prevWord));
+      return brk ? { kind: 'ws', text: '\n' } : tok;
+    }
+    if (tok.kind === 'kw' || tok.kind === 'id') { prevWord = tok.text.toUpperCase(); seenWord = true; }
+    return tok;
+  });
+}
+function renderQueryCode(node, text) {
+  node.replaceChildren();
+  reflowQuery(tokenizeQuery(text), text).forEach(tok => {
+    if (tok.kind === 'ws' || tok.kind === 'id' || tok.kind === 'p') node.append(document.createTextNode(tok.text));
+    else node.append(el('span', `q-${tok.kind}`, tok.text));
+  });
+}
+//++agent TASK-225
+
 async function viewerPage() {
   let session;
   try {
@@ -688,8 +840,19 @@ async function viewerPage() {
     const text = (typeof report.title === 'string' && report.title.trim())
       ? report.title
       : record.tool_name;
-    title.textContent = text;
+    //**agent TASK-225 [27.09.2026 12:30:00] запрос — подсвеченный блок кода + копирование
+    // title.textContent = text;
+    const isQuery = typeof report.title === 'string' && !!report.title.trim();
+    title.classList.toggle('qcode', isQuery);
+    if (isQuery) renderQueryCode(title, text); else title.textContent = text;
     title.title = text;
+    $$('.rep-q .q-copy').forEach(n => n.remove());
+    if (isQuery) {
+      const copy = copyButton(text, 'копировать запрос');
+      copy.classList.add('q-copy');
+      title.after(copy);
+    }
+    //**agent TASK-225
     //++agent TASK-224 [25.09.2026 12:25:00] итерация 5: свёрнут до 2 строк;
     // «Развернуть» — только если текст реально обрезан.
     title.classList.add('clamp');
@@ -697,10 +860,24 @@ async function viewerPage() {
     more.textContent = 'Развернуть';
     requestAnimationFrame(() => { more.hidden = title.scrollHeight <= title.clientHeight + 1; });
     //++agent TASK-224
-    const [cls, label] = OUTCOME_LABELS[record.outcome] || ['mut', record.outcome];
+    //**agent TASK-225 [27.09.2026 12:00:00] штатный отказ — вид + пояснение
+    // const [cls, label] = OUTCOME_LABELS[record.outcome] || ['mut', record.outcome];
+    const { cls, label, hit } = callStatus(record);
     const status = $('#reportStatus');
     status.className = `tag ${cls}`;
     status.textContent = label;
+    status.title = hit ? `${hit.title}. ${hit.hint}` : '';
+    const note = $('#callNote');
+    note.hidden = !hit;
+    if (hit) {
+      note.className = `note ${hit.kind === 'protection' ? 'info' : hit.kind === 'technical' ? 'err' : 'warn'}`;
+      const head = el('b', '', hit.title);
+      const code = el('span', 'mono small muted', hit.code);
+      code.title = hit.message || hit.code;
+      note.replaceChildren(head, document.createTextNode(' '), code,
+        el('div', 'hint', hit.hint));
+    }
+    //**agent TASK-225
     const meta = $('#reportMeta');
     //**agent TASK-224 [25.09.2026 12:25:00] итерация 5: meta — иконки, русская метка
     // meta.replaceChildren(
@@ -750,6 +927,18 @@ async function viewerPage() {
       })
       .catch(error => {
         if (viewer.record !== record || error.status === 401) return;
+        //++agent TASK-225 [27.09.2026 12:30:00] соответствия для раскрытия
+        // живут только в памяти сервиса (migrations/0009_call_contexts.sql) —
+        // после перезапуска/истечения срока 404 штатен: нейтральная подсказка.
+        const warn = $('#revealWarn');
+        warn.className = 'note warn';
+        if (error.code === 'MAPPING_UNAVAILABLE') warn.className = 'note info';
+        if (error.status === 404 || error.code === 'NOT_FOUND') {
+          warn.className = 'note info';
+          showError(warn, { message: 'Раскрытие недоступно: данные для раскрытия хранятся только в памяти сервиса и были очищены (перезапуск сервиса или истёк срок хранения). Маскированный результат остаётся доступен.' });
+          return;
+        }
+        //++agent TASK-225
         // Не стена ошибки: маскированный отчёт уже на экране, плашка — warn.
         showError($('#revealWarn'), error.code === 'MAPPING_UNAVAILABLE'
           ? { message: 'Реальные значения недоступны: срок хранения соответствий истёк или сервис перезапускался. Показаны маскированные данные.' }
@@ -818,10 +1007,17 @@ async function viewerPage() {
         const btn = el('button');
         btn.type = 'button';
         btn.dataset.id = item.id;
-        const [cls, label] = OUTCOME_LABELS[item.outcome] || ['mut', item.outcome];
+        //**agent TASK-225 [27.09.2026 12:00:00] отказ защиты — не «ошибка»
+        // const [cls, label] = OUTCOME_LABELS[item.outcome] || ['mut', item.outcome];
+        // btn.append(el('b', '', fmtTime(item.created_at)), document.createTextNode(' '),
+        //   el('span', 'mono small', item.tool_name), document.createElement('br'),
+        //   el('span', `tag ${cls}`, label));
+        const { cls, label, hit } = callStatus(item);
+        const tag = el('span', `tag ${cls}`, label);
+        if (hit) tag.title = `${hit.title} (${hit.code})`;
         btn.append(el('b', '', fmtTime(item.created_at)), document.createTextNode(' '),
-          el('span', 'mono small', item.tool_name), document.createElement('br'),
-          el('span', `tag ${cls}`, label));
+          el('span', 'mono small', item.tool_name), document.createElement('br'), tag);
+        //**agent TASK-225
         btn.addEventListener('click', () => selectRecord(item));
         return btn;
       }, 'В чате нет записей');
@@ -853,6 +1049,38 @@ async function viewerPage() {
     $('#reportMore').textContent = collapsed ? 'Развернуть' : 'Свернуть';
   });
   $('#revealNote').prepend(svgIcon('eye'));
+
+  //++agent TASK-225 [27.09.2026 13:00:00] «Скопировать для агента»: только
+  // идентификаторы, исход и текст запроса из МАСКИРОВАННОЙ записи
+  // (viewer.record, никогда viewer.revealed); результат не копируется —
+  // лишь число строк. Полей, которых нет в записи, в блоке нет.
+  const agentCallText = record => {
+    const db = viewer.database;
+    const report = record.report || {};
+    const hit = detectCallError(record);
+    const lines = ['Вызов MCP (сервис маскирования)'];
+    if (db) lines.push(`- База: ${db.display_label || 'без названия'} (${db.id})`);
+    else if (record.database_id) lines.push(`- База: ${record.database_id}`);
+    lines.push(`- Инструмент: ${record.tool_name}`);
+    if (record.created_at) lines.push(`- Время: ${record.created_at}`);
+    if (record.chat_id) lines.push(`- Чат: ${record.chat_id}`);
+    let ids = `- id записи истории: ${record.id}`;
+    const corr = /correlation_id\W{1,3}([0-9a-f-]{36})/i.exec((report.blocks || []).filter(b => b && b.kind === 'text').map(b => b.text).join('\n'));
+    if (corr) ids += `; correlation_id: ${corr[1]}`;
+    lines.push(ids);
+    lines.push(`- Исход: ${record.outcome}${hit ? ` [${hit.code} — ${hit.title}]` : ''}`);
+    const rows = (report.blocks || []).filter(b => b && b.kind === 'table' && Array.isArray(b.rows))
+      .reduce((n, b) => n + b.rows.length, 0);
+    if (rows) lines.push(`- Строк в результате: ${rows}`);
+    if (typeof report.title === 'string' && report.title.trim()) {
+      lines.push('- Запрос:', '  ```', ...report.title.split('\n').map(l => `  ${l}`), '  ```');
+    }
+    return lines.join('\n');
+  };
+  $('#agentCopyBtn').addEventListener('click', event => {
+    if (viewer.record) copyText(agentCallText(viewer.record), event.currentTarget);
+  });
+  //++agent TASK-225
   //**agent TASK-224
   //--agent TASK-224
 
