@@ -2828,6 +2828,107 @@ async fn unconfigured_database_denies_before_auto_registration() {
     assert!(classification_row(&storage, database_id, "brand_new_tool").is_none());
 }
 
+//++agent TASK-225 [27.09.2026 00:00:00] S: белый список ненастроенной
+// базы — get_metadata проходит как no-mask без политики.
+#[tokio::test]
+async fn unconfigured_database_allows_whitelisted_get_metadata() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    let response = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-a".to_owned(),
+            tool_name: "get_metadata".to_owned(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.decision, "allow");
+}
+
+#[tokio::test]
+async fn unconfigured_database_denies_non_whitelisted_execute_query() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    let error = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-a".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"queryText":"ВЫБРАТЬ 1"}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ActionRequired);
+}
+
+#[tokio::test]
+async fn unconfigured_pull_stores_metadata_without_dictionary() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let state = AppState::new(storage.clone(), "https://masking.test");
+    let database_id = Uuid::new_v4();
+    common::seed_database(&storage, database_id);
+    // Словарь фейк отдаёт нарочно непустым: metadata-only pull не должен
+    // его вообще запрашивать — проверяется отсутствием вызовов.
+    let fake = FakeManager::spawn(|name, _| match name {
+        METADATA_TOOL => Ok(metadata_page(
+            vec![metadata_item(
+                "Справочник.Test.Name",
+                "Name",
+                "String(50)",
+                false,
+            )],
+            None,
+            true,
+        )),
+        DICTIONARY_TOOL => Ok(dictionary_page(
+            vec![dictionary_value("Справочник.Test.Name", "FIO", "Иванов")],
+            None,
+            true,
+        )),
+        _ => Ok(dictionary_page(Vec::new(), None, true)),
+    });
+    enqueue_refresh_intent(&storage, database_id);
+    assert_eq!(
+        state
+            .masking
+            .refresh_due_intents(&fake.client(), 10)
+            .await
+            .unwrap(),
+        1,
+        "metadata-only pull должен завершаться успехом"
+    );
+    assert_eq!(fake.calls_for(METADATA_TOOL).len(), 1);
+    assert!(fake.calls_for(DICTIONARY_TOOL).is_empty());
+    assert!(state.masking.has_metadata_manifest(database_id));
+    assert!(!state.masking.database_ready(database_id).await);
+    let (metadata_count, dictionary_count, last_ok): (i64, i64, Option<String>) = storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT c.metadata_count, c.dictionary_count, d.last_refresh_ok_at
+                 FROM cache_generations c JOIN databases d ON d.id=c.database_id
+                 WHERE c.database_id=?1 AND c.status='active'",
+                [database_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!(metadata_count, 1);
+    assert_eq!(dictionary_count, 0);
+    assert!(last_ok.is_some(), "refresh успеха не зафиксирован");
+}
+//++agent TASK-225
+
 #[tokio::test]
 async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;

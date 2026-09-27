@@ -2453,7 +2453,14 @@ async function adminPage() {
     $('#setupEmpty').hidden = !empty;
     $('#setupEditor').hidden = empty;
     if (empty) {
-      const ask = `«Подготовь стартовую настройку маскирования для базы ${db.display_label || db.id}»`;
+      //++agent TASK-225 [27.09.2026 08:10:00]
+      // Промпт адресует конкретную базу: имя неоднозначно (DEV-копия и
+      // рабочая база часто называются похоже), поэтому id записи сервиса +
+      // координаты ИБ, а навык назван явно.
+      const where = [db.cluster_server, db.infobase_name].filter(Boolean).join(' / ');
+      const ask = `«Выполни навык masking-initial-setup для базы ${db.display_label || db.infobase_name || db.id}`
+        + `${where ? ` (${where})` : ''}, id в сервисе маскирования: ${db.id}»`;
+      //++agent TASK-225
       $('#emptyAsk').textContent = ask;
       $('#emptyNoManifest').hidden = meta.ready !== false;
       return;

@@ -49,6 +49,12 @@ const UNVERIFIED_TERMINAL_CODES: &[&str] = &[
     "SERVICE_NOT_READY",
 ];
 
+//++agent TASK-225 [27.09.2026 00:00:00] S: белый список инструментов
+// ненастроенной базы — только чтение метаданных (данных в ответе нет);
+// вызов идёт обычным путём как no-mask, без политики и ready-состояния.
+const UNCONFIGURED_WHITELIST: &[&str] = &["get_metadata"];
+//++agent TASK-225
+
 pub struct MaskingService {
     storage: Arc<SqliteStorage>,
     mappings: RwLock<MappingStore>,
@@ -419,7 +425,12 @@ impl MaskingService {
             effective_history_ttl(&settings),
         );
         //++agent TASK-224
-        if created || settings.mode == DatabaseMode::Unconfigured {
+        //++agent TASK-225 [27.09.2026 00:00:00] S: ненастроенной базе
+        // доступен только белый список — остальные отказываются
+        // ACTION_REQUIRED, как раньше.
+        let unconfigured_allow = (created || settings.mode == DatabaseMode::Unconfigured)
+            && UNCONFIGURED_WHITELIST.contains(&request.tool_name.as_str());
+        if (created || settings.mode == DatabaseMode::Unconfigured) && !unconfigured_allow {
             return self.persist_preflight_denial(
                 &request,
                 database_id,
@@ -438,6 +449,14 @@ impl MaskingService {
                 )
             }
         };
+        // У ненастроенной базы классификаций ещё нет — без навязанного
+        // no-mask белый список упал бы в deny-pending-review.
+        let class = if unconfigured_allow {
+            ToolClass::NoMask
+        } else {
+            class
+        };
+        //++agent TASK-225
         //++agent TASK-225 [25.09.2026]
         // Отказ по классу deny-pending-review пишется отдельным путём:
         // та же durable-запись, но с учётом tool_classifications
@@ -726,7 +745,12 @@ impl MaskingService {
             .acquire_owned()
             .await
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
-        if created || settings.mode == DatabaseMode::Unconfigured {
+        //++agent TASK-225 [27.09.2026 00:00:00] S: тот же белый список,
+        // что в preflight — иначе finalize отказал бы вызову, который
+        // preflight уже допустил.
+        let unconfigured_allow = (created || settings.mode == DatabaseMode::Unconfigured)
+            && UNCONFIGURED_WHITELIST.contains(&request.tool_name.as_str());
+        if (created || settings.mode == DatabaseMode::Unconfigured) && !unconfigured_allow {
             return Err(ServiceError::new(
                 ErrorCode::ActionRequired,
                 request.correlation_id,
@@ -736,6 +760,12 @@ impl MaskingService {
             .storage
             .tool_class(database_id, &request.tool_name)
             .map_err(|_| ServiceError::new(ErrorCode::ServiceNotReady, request.correlation_id))?;
+        let class = if unconfigured_allow {
+            ToolClass::NoMask
+        } else {
+            class
+        };
+        //++agent TASK-225
         if class == ToolClass::DenyPendingReview {
             return Err(ServiceError::new(
                 ErrorCode::ToolPendingReview,

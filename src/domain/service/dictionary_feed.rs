@@ -365,9 +365,15 @@ impl MaskingService {
             .database_settings(database_id)
             .map_err(|_| PullError::Transient("STORAGE_UNAVAILABLE"))?
             .ok_or(PullError::Skipped)?;
-        if settings.mode != DatabaseMode::Enabled {
+        //++agent TASK-225 [27.09.2026 00:00:00] S: ненастроенной базе
+        // нужен manifest метаданных для админки — pull только метаданных;
+        // словарь и автомат появятся с первой активацией. Disabled
+        // пропускается, как раньше.
+        if settings.mode == DatabaseMode::Disabled {
             return Err(PullError::Skipped);
         }
+        let metadata_only = settings.mode == DatabaseMode::Unconfigured;
+        //++agent TASK-225
         //++agent TASK-225 [26.09.2026] O2: маршрут feed-вызова — точный
         // ключ instance_id записи; менеджер сопоставляет сессию только
         // по нему.
@@ -410,9 +416,16 @@ impl MaskingService {
             .map(|item| item.source_path.as_str())
             .collect();
 
-        let selectors = self
-            .dictionary_selectors(database_id, &metadata, &rules)
-            .map_err(PullError::Invalid)?;
+        //++agent TASK-225 [27.09.2026 00:00:00] S: metadata-only pull —
+        // словарные селекторы не расширяются и страницы словаря не
+        // запрашиваются.
+        let selectors = if metadata_only {
+            Vec::new()
+        } else {
+            self.dictionary_selectors(database_id, &metadata, &rules)
+                .map_err(PullError::Invalid)?
+        };
+        //++agent TASK-225
         let mut dictionary_values: Vec<FeedDictionaryValue> = Vec::new();
         let mut dictionary_bytes = 0usize;
         let mut dictionary_sources: HashSet<String> = HashSet::new();
@@ -549,7 +562,11 @@ impl MaskingService {
             // получит корректный MINOR-9-ключ сравнения.
             dictionary_fingerprint: new_fingerprint,
             //++agent TASK-225
-            ready: true,
+            //++agent TASK-225 [27.09.2026 00:00:00] S: metadata-only
+            // снапшот не объявляет готовность — политики и словаря нет;
+            // ready публикуется только полным pull активной базы.
+            ready: !metadata_only,
+            //++agent TASK-225
         };
         let digest = pull_digest(&metadata, &dictionary_values);
         let target_version = self
