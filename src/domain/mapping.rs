@@ -262,6 +262,16 @@ impl MappingStore {
         Some(entry.original.clone())
     }
 
+    //++agent TASK-225 [27.09.2026 00:00:00] T: удаление базы из реестра —
+    // её токены без записи мертвы и неразрешимы, висячими не держим.
+    pub fn purge_database(&mut self, database_id: Uuid) {
+        self.by_token
+            .retain(|_, entry| entry.database_id != database_id);
+        self.by_reverse
+            .retain(|_, token| self.by_token.contains_key(token));
+    }
+    //++agent TASK-225
+
     pub fn cleanup(&mut self, limit: usize) -> usize {
         let now = Utc::now();
         let expired: Vec<String> = self

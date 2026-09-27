@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, TimeDelta, Utc};
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -58,11 +59,17 @@ impl SessionService {
         now: DateTime<Utc>,
     ) -> Result<IssuedSession, AuthError> {
         let token = random_token();
-        let csrf_token = random_token();
+        //++agent TASK-224 [24.09.2026]
+        // Б11: CSRF детерминированно выводится из хеша сессионного токена —
+        // GET /session может вернуть его существующей сессии без хранения
+        // открытым текстом и без инвалидации других вкладок той же сессии.
+        let token_hash = hash_token(&token);
+        let csrf_token = derive_csrf_token(&token_hash);
+        //--agent TASK-224
         let idle_expires_at = add_duration(now, self.idle_ttl)?;
         let absolute_expires_at = add_duration(now, self.absolute_ttl)?;
         self.store.insert_session(NewSession {
-            token_hash: hash_token(&token),
+            token_hash,
             csrf_hash: hash_token(&csrf_token),
             user_id: principal.user_id,
             auth_epoch: principal.auth_epoch,
@@ -120,7 +127,25 @@ impl SessionService {
     pub fn revoke(&self, token: &str, now: DateTime<Utc>) -> Result<(), AuthError> {
         self.store.revoke_session(&hash_token(token), now)
     }
+
+    //++agent TASK-224 [24.09.2026]
+    /// CSRF-токен, привязанный к живой сессии (Б11): тот же, что выдан при
+    /// login/activate/change_password. Детерминирован от token_hash — утечка
+    /// БД не даёт ни cookie, ни способа подделать запрос без неё.
+    pub fn csrf_for_session_token(&self, token: &str) -> String {
+        derive_csrf_token(&hash_token(token))
+    }
+    //--agent TASK-224
 }
+
+//++agent TASK-224 [24.09.2026]
+fn derive_csrf_token(token_hash: &[u8; 32]) -> String {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(token_hash).expect("HMAC accepts keys of any length");
+    mac.update(b"human-csrf-v1");
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+//--agent TASK-224
 
 fn add_duration(now: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>, AuthError> {
     let delta = TimeDelta::from_std(duration).map_err(|_| AuthError::Unavailable)?;

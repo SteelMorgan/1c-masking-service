@@ -70,6 +70,9 @@ pub fn human_app(state: Arc<AppState>) -> Result<Router, AppBuildError> {
         sessions: Arc::new(auth::SessionService::new(auth_store)),
         data: human_data,
         expected_origin: state.expected_origin.clone(),
+        //++agent TASK-225 [26.09.2026]
+        setup: api::human::setup::SetupService::new(state.storage.clone(), state.masking.clone()),
+        //++agent TASK-225
     });
     Ok(api::human::router(human_state))
 }

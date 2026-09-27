@@ -20,14 +20,15 @@ use super::models::FeedMetadataItem;
 /// как Rust-recomputed proof не трактуется никогда.
 pub(crate) struct MetadataManifestEntry {
     pub generation: Uuid,
-    #[allow(dead_code)] // содержимое manifest — trusted state для All-expansion/diagnostics
+    //++agent TASK-224 [24.09.2026] items/completed_at читаются Admin-деревом
+    // метаданных через MaskingService::metadata_manifest_view.
+    //--agent TASK-224
     pub items: Vec<FeedMetadataItem>,
     #[allow(dead_code)] // читается Admin status/digest-proof
     pub digest: String,
     #[allow(dead_code)] // читается Admin status/audit trail
     pub declared_digest: String,
     pub bytes: usize,
-    #[allow(dead_code)] // читается Admin status/diagnostics
     pub completed_at: DateTime<Utc>,
 }
 
@@ -49,7 +50,6 @@ pub(crate) struct MetadataManifestStore {
 }
 
 impl MetadataManifestStore {
-    #[allow(dead_code)] // потребитель — Admin status/diagnostics
     pub fn get(&self, database_id: Uuid) -> Option<&MetadataManifestEntry> {
         self.entries.get(&database_id)
     }

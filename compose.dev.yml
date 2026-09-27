@@ -1,8 +1,9 @@
-name: onec-masking-service-dev
+name: ${MASKING_COMPOSE_PROJECT:-onec-masking-service-dev}
 
-# Rollout prerequisite (do not replace with a workspace bind mount):
-# docker exec -u 1000:1000 1c-ai-sandbox \
-#   install -d -m 0700 /workspaces/work/run/1c-masking
+# Пример для тестового стенда. Значения задаются через ENV (см. .env.example).
+# Предусловие: в общем с менеджером volume MASKING_SHARED_VOLUME заранее создан
+# каталог MASKING_SHARED_SUBPATH (mode 0700, владелец MASKING_UID:MASKING_GID),
+# например: docker exec -u 1000:1000 <контейнер-менеджера> install -d -m 0700 <путь>
 
 services:
   masking-service:
@@ -10,7 +11,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "1000:1000"
+    user: "${MASKING_UID:-1000}:${MASKING_GID:-1000}"
     init: true
     restart: unless-stopped
     environment:
@@ -19,8 +20,8 @@ services:
       MASKING_SOCKET_PATH: /run/1c-masking/service.sock
       MASKING_CONTROL_SOCKET_PATH: /run/1c-masking/control.sock
       MASKING_HUMAN_BIND: 0.0.0.0:8787
-      MASKING_MANAGER_UID: "1000"
-      # TASK-222: internal listener менеджера (service → manager tool.call)
+      MASKING_MANAGER_UID: "${MASKING_MANAGER_UID:-1000}"
+      # internal listener менеджера (service → manager tool.call)
       # на общем shared-runtime volume.
       MASKING_MANAGER_SOCKET_PATH: /run/1c-masking/manager.sock
       RUST_LOG: "${MASKING_RUST_LOG:-info}"
@@ -35,7 +36,7 @@ services:
         target: /run/1c-masking
         volume:
           nocopy: true
-          subpath: run/1c-masking
+          subpath: ${MASKING_SHARED_SUBPATH:-run/1c-masking}
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
@@ -62,7 +63,7 @@ services:
 volumes:
   masking-data:
     external: true
-    name: onec-masking-service-dev-state
+    name: ${MASKING_STATE_VOLUME:-masking-service-state}
   shared-runtime:
     external: true
-    name: agent-work-sandbox-1c
+    name: ${MASKING_SHARED_VOLUME:-manager-shared-runtime}
