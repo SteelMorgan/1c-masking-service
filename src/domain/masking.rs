@@ -1534,7 +1534,24 @@ fn collect_field_literals(
                             literals.insert(text.to_owned());
                         }
                     } else if !child.is_null() {
-                        return Err(());
+                        //++agent TASK-225 [27.09.2026 00:00:00] U: ячейка
+                        // FIO-поля может быть ссылкой — граница
+                        // сериализует её плоским объектом `_objectRef`
+                        // (контракт колонок). Литералом идёт
+                        // человекочитаемое представление; uuid/имя типа
+                        // именем не являются. Ссылка без представления —
+                        // литерала нет, но и отказа нет. Не-ссылочный
+                        // объект или массив — прежний отказ (fail-closed).
+                        if is_object_ref(child) {
+                            if let Some(literal) = object_ref_literal(child) {
+                                if !literal.is_empty() && literal != SECRET_REMOVED {
+                                    literals.insert(literal);
+                                }
+                            }
+                        } else {
+                            return Err(());
+                        }
+                        //++agent TASK-225
                     }
                 }
                 collect_field_literals(child, fields, literals, depth + 1)?;
@@ -1549,6 +1566,35 @@ fn collect_field_literals(
     }
     Ok(())
 }
+
+//++agent TASK-225 [27.09.2026 00:00:00] U: ссылочная ячейка по контракту
+// границы — плоский объект с `_objectRef: true`.
+fn is_object_ref(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.get("_objectRef") == Some(&Value::Bool(true)))
+}
+
+/// Строковое представление ссылочной ячейки — человекочитаемое имя
+/// объекта по тем же ключам, что в отчёте (`report_cell`). Не-строковое
+/// или отсутствующее представление → `None`.
+fn object_ref_literal(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    for key in [
+        "Представление",
+        "presentation",
+        "ПредставлениеСсылки",
+        "name",
+        "text",
+        "value",
+    ] {
+        if let Some(text) = object.get(key).and_then(Value::as_str) {
+            return Some(text.to_owned());
+        }
+    }
+    None
+}
+//++agent TASK-225
 
 fn compact_secret_name(name: &str) -> bool {
     let compact: String = name

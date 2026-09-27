@@ -4304,3 +4304,124 @@ async fn pull_with_unchanged_dictionary_reuses_index() {
     assert!(second.dictionary_index.is_some());
 }
 //++agent TASK-225
+
+//++agent TASK-225 [27.09.2026 00:00:00] U: регрессия «Результат
+// недоступен» — FIO-именованная колонка (`…Контрагент`) со ссылочной
+// ячейкой _objectRef роняла сбор FIO-литералов (объект вместо строки).
+// Представление ссылки — строковый литерал; прочие не-примитивы —
+// прежний fail-closed отказ.
+#[tokio::test]
+async fn objectref_cell_in_fio_named_column_masks_instead_of_sanitized_failure() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    // Представление живёт в словаре под CPARTY и одновременно ведёт себя
+    // как FIO-литерал колонки — категория выбирается детерминированно.
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                dictionary: HashMap::from([(
+                    "Иванов Иван Иванович".to_owned(),
+                    "CPARTY".to_owned(),
+                )]),
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-u".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": true,
+                    "data": [{
+                        "Контрагент": {
+                            "_objectRef": true,
+                            "УникальныйИдентификатор": "b0000000-0000-0000-0000-000000000000",
+                            "ТипОбъекта": "СправочникСсылка._ДемоКонтрагенты",
+                            "Представление": "Иванов Иван Иванович"
+                        },
+                        "Н": "Иванов Иван Иванович"
+                    }]
+                }),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[
+                    {"name":"Контрагент",
+                     "sources":["Справочник.big_MarketAccounts.Контрагент"]},
+                    {"name":"Н",
+                     "sources":["Справочник.big_MarketAccounts.Наименование"]}
+                ]}),
+                lineage: vec![
+                    json!({"column":"Контрагент",
+                           "source_path":"Справочник.big_MarketAccounts.Контрагент"}),
+                    json!({"column":"Н",
+                           "source_path":"Справочник.big_MarketAccounts.Наименование"}),
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        response.public_result["is_error"],
+        json!(false),
+        "{:?}",
+        response.public_result
+    );
+    let text = response.public_result["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!text.contains("Иванов"), "{text}");
+    // И _objectRef.Представление, и обычное строковое поле —
+    // одна детерминированная категория FIO, словарный CPARTY не
+    // доходит (литеральный проход раньше словарного).
+    assert!(text.contains("[MASK:v1:FIO:"), "{text}");
+    assert!(!text.contains("[MASK:v1:CPARTY:"), "{text}");
+}
+
+#[tokio::test]
+async fn non_ref_object_in_fio_named_column_still_fails_closed() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    let response = state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-u".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({
+                    "success": true,
+                    "data": [{"Контрагент": {"x": 1}}]
+                }),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[
+                    {"name":"Контрагент",
+                     "sources":["Справочник.big_MarketAccounts.Контрагент"]}
+                ]}),
+                lineage: vec![json!({
+                    "column":"Контрагент",
+                    "source_path":"Справочник.big_MarketAccounts.Контрагент"
+                })],
+            },
+        })
+        .await
+        .unwrap();
+    // Произвольный объект в FIO-колонке — литерал недоказуем: отказ
+    // сохраняется (без раскрытия причины наружу).
+    assert_eq!(response.public_result["is_error"], json!(true));
+    assert!(response.public_result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Результат недоступен"));
+}
+//++agent TASK-225
