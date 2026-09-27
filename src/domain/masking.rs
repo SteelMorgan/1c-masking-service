@@ -766,7 +766,33 @@ impl MaskEngine {
                 .ok_or(ProcessingError)?;
             resolved.insert(token, original);
         }
-        replace_tokens(value, &resolved, 0).map_err(|_| ProcessingError)
+        let mut output = replace_tokens(value, &resolved, 0).map_err(|_| ProcessingError)?;
+        //++agent TASK-225 [27.09.2026 00:00:00] W: защита в глубину при
+        // reveal — записи, созданные до фикса слоя-1, могут хранить
+        // оригинал с вложенным токеном; разворачиваем рекурсивно в
+        // пределах партии (тот же resolve_for_batch: база+чат+партия).
+        // Токен вне партии остаётся текстом — разворачивать нечего.
+        for _ in 0..8 {
+            let mut nested = HashSet::new();
+            collect_tokens(&output, &self.token, &mut nested, 0).map_err(|_| ProcessingError)?;
+            if nested.is_empty() {
+                break;
+            }
+            let mut resolved = HashMap::new();
+            for token in nested {
+                if let Some(original) =
+                    mappings.resolve_for_batch(database_id, chat_id, batch_id, &token)
+                {
+                    resolved.insert(token, original);
+                }
+            }
+            if resolved.is_empty() {
+                break;
+            }
+            output = replace_tokens(&output, &resolved, 0).map_err(|_| ProcessingError)?;
+        }
+        Ok(output)
+        //++agent TASK-225
     }
 
     fn walk(
@@ -1390,6 +1416,15 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 }
 
 fn plan(context: &mut WalkContext<'_>, category: &str, original: &str) -> Result<String, ()> {
+    //++agent TASK-225 [27.09.2026 00:00:00] W: mapping хранит исходное
+    // значение, а не промежуточную форму — `original` может содержать
+    // токены более ранних проходов этой же партии (FIO-литералы/текст
+    // до структурной маски ячейки, regex поверх токена); разворачиваем
+    // их здесь, иначе reveal снимал бы один уровень и показывал
+    // вложенный [MASK:…]. Токены не из этой партии остаются — их
+    // разворот выполняет защита слоя-2 в resolve_tokens_for_batch.
+    let original = expand_batch_tokens(original, &context.candidates);
+    //++agent TASK-225
     context
         .mappings
         .plan_token(
@@ -1397,12 +1432,57 @@ fn plan(context: &mut WalkContext<'_>, category: &str, original: &str) -> Result
             context.database_id,
             context.chat_id,
             category,
-            original,
+            &original,
             context.batch_id,
             context.ttl_seconds,
         )
         .map_err(|_| ())
 }
+
+//++agent TASK-225 [27.09.2026 00:00:00] W: токены той же партии в
+// сохраняемом оригинале разворачиваются в исходные значения — иначе
+// mapping хранил бы промежуточную форму и reveal отдавал вложенный
+// токен. Токен не из партии остаётся текстом (слой-2 при reveal).
+// Глубина ограничена — цепочки длиннее отрезаются детерминированно.
+fn expand_batch_tokens(text: &str, candidates: &[MappingCandidate]) -> String {
+    const MAX_PASSES: usize = 8;
+    let mut current = text.to_owned();
+    for _ in 0..MAX_PASSES {
+        if !current.contains("[MASK:v1:") {
+            break;
+        }
+        let mut output = String::with_capacity(current.len());
+        let mut cursor = 0usize;
+        let mut expanded = false;
+        while let Some(rel) = current[cursor..].find("[MASK:v1:") {
+            let open = cursor + rel;
+            let Some(rel_close) = current[open..].find(']') else {
+                break;
+            };
+            let close = open + rel_close + 1;
+            let token = &current[open..close];
+            if let Some(found) = candidates.iter().find(|c| c.token == token) {
+                output.push_str(&current[cursor..open]);
+                output.push_str(&found.original);
+                cursor = close;
+                expanded = true;
+            } else {
+                // Не наш токен — фрагмент до следующей позиции переносим
+                // без подстановки.
+                cursor = open;
+                output.push_str(&current[cursor..cursor + "[MASK:v1:".len()]);
+                cursor += "[MASK:v1:".len();
+            }
+        }
+        output.push_str(&current[cursor..]);
+        current = output;
+        if !expanded {
+            break;
+        }
+    }
+    current
+}
+//++agent TASK-225
 
 //++agent TASK-225 [25.09.2026]
 // Типизация токена unverified-ячейки по фактическому JSON-типу:

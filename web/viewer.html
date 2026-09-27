@@ -78,7 +78,7 @@
           </div>
         </div>
         <div class="rep-meta" id="reportMeta"></div>
-        <p class="hintline" id="revealNote" hidden>Показаны реальные значения — только в этой вкладке; сбрасываются при уходе с записи. Экспорт и копирование всегда маскированные.</p>
+        <p class="hintline" id="revealNote" hidden>Показаны реальные значения — только в этой вкладке; сбрасываются при уходе с записи. Копирование и CSV выгружают то, что на экране.</p>
         <!--**agent TASK-224-->
         <!----agent TASK-224-->
         <div class="note warn" id="revealWarn" hidden></div>
@@ -100,6 +100,13 @@
     </div>
   </div>
 
+  <!--++agent TASK-225 [27.09.2026 09:16:39] подтверждение выгрузки реальных значений-->
+  <div class="overlay" id="dlgRealCopy"><div class="card dialog" role="alertdialog" aria-labelledby="realCopyTitle">
+    <h2 id="realCopyTitle">Реальные значения</h2>
+    <p>Вы копируете реальные значения (не маскированные). Дальше их сохранность — ваша ответственность: не вставляйте их в чат с агентом.</p>
+    <div class="row right"><button class="btn" id="realCopyCancel" type="button">Отмена</button><button class="btn primary" id="realCopyGo" type="button">Скопировать реальные</button></div>
+  </div></div>
+  <!--++agent TASK-225-->
   <!--++agent TASK-225 [26.09.2026 03:00:00] экспорт действующей версии (Viewer: только active)-->
   <div class="overlay" id="dlgVExport"><div class="card dialog">
     <h2>Экспорт настройки</h2>

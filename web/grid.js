@@ -24,6 +24,11 @@
                     всё»; без него выгружаются загруженные в grid строки.
                     Вызывающий отвечает за то, ЧТО экспортируется (модуль
                     сам не фильтрует реальные/маскированные версии).
+     realValues?    true — на экране реальные значения (TASK-225): подписи
+                    кнопок говорят «реальные», выгрузка идёт через confirmReal.
+     confirmReal?(proceed)  подтверждение выгрузки реальных значений;
+                    вызывающий вызывает proceed() после согласия человека.
+     onRealCopied?()  уведомление: скопирована одна ячейка с реальным значением.
 
    instance:
      setData({columns?, rows})   — замена данных; сортировка, фильтры, поиск,
@@ -220,11 +225,15 @@ window.MaskingGrid = (() => {
     const filterBtn = iconBtn('filter', 'Фильтры');
     filterBtn.title = 'Показать строку фильтров по колонкам';
     const copyAllBtn = iconBtn('copy', 'Копировать');
-    copyAllBtn.title = 'Скопировать таблицу (маскированные значения) в буфер';
+    copyAllBtn.title = options.realValues // TASK-225
+      ? 'Скопировать таблицу (реальные значения) в буфер'
+      : 'Скопировать таблицу (маскированные значения) в буфер';
     const colWrap = el('span', 'dg-colwrap');
     const colsBtn = iconBtn('cols', 'Колонки');
     const exportBtn = iconBtn('download', 'CSV');
-    exportBtn.title = 'Скачать CSV (маскированные значения)';
+    exportBtn.title = options.realValues // TASK-225
+      ? 'Скачать CSV (реальные значения)'
+      : 'Скачать CSV (маскированные значения)';
     const fontMinus = el('button', 'btn sm ghost', 'A−');
     fontMinus.type = 'button';
     fontMinus.title = 'Уменьшить шрифт';
@@ -439,6 +448,10 @@ window.MaskingGrid = (() => {
             if (navigator.clipboard && window.isSecureContext) {
               navigator.clipboard.writeText(raw).then(() => flash(td), () => flash(td));
             }
+            //++agent TASK-225 [27.09.2026 09:16:39] одна ячейка — без модалки,
+            // но человек должен видеть, что взял реальное значение.
+            if (options.realValues && options.onRealCopied) options.onRealCopied();
+            //++agent TASK-225
             function flash(node) {
               node.classList.add('dg-copied');
               setTimeout(() => node.classList.remove('dg-copied'), 600);
@@ -501,9 +514,20 @@ window.MaskingGrid = (() => {
       state.page = 0;
       renderAll(); // шапка нужна: поля фильтров и стрелки сортировки чистятся
     });
-    copyAllBtn.addEventListener('click', () => {
-      // То же правило, что у CSV: данные просит вызывающий — при раскрытом
-      // виде сюда подаются маскированные строки, не реальные.
+    //++agent TASK-225 [27.09.2026 09:16:39] выгрузка реальных значений —
+    // осознанное действие человека: подтверждение решает вызывающий
+    // (options.confirmReal), модуль лишь не обходит его.
+    const guardReal = action => {
+      if (options.realValues && options.confirmReal) options.confirmReal(action);
+      else action();
+    };
+    //++agent TASK-225
+    copyAllBtn.addEventListener('click', () => guardReal(() => {
+      //**agent TASK-225 [27.09.2026 09:16:39]
+      // // То же правило, что у CSV: данные просит вызывающий — при раскрытом
+      // // виде сюда подаются маскированные строки, не реальные.
+      // Данные просит вызывающий: выгружается то, что на экране.
+      //**agent TASK-225
       const data = options.exportRows ? options.exportRows() : { columns: state.columns, rows: state.rows };
       const visibleIdx = new Set(visibleColumns().map(({ i }) => i));
       const text = data.columns
@@ -535,7 +559,7 @@ window.MaskingGrid = (() => {
         area.remove();
         done();
       }
-    });
+    })); // TASK-225: guardReal
     //--agent TASK-224
     colsBtn.addEventListener('click', event => {
       event.stopPropagation();
@@ -549,7 +573,7 @@ window.MaskingGrid = (() => {
       state.page = 0;
       renderRows();
     });
-    exportBtn.addEventListener('click', () => {
+    exportBtn.addEventListener('click', () => guardReal(() => {
       if (!state.exportEnabled) return;
       const data = options.exportRows ? options.exportRows() : { columns: state.columns, rows: state.rows };
       const visibleIdx = new Set(visibleColumns().map(({ i }) => i));
@@ -562,7 +586,7 @@ window.MaskingGrid = (() => {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    });
+    })); // TASK-225: guardReal
 
     state.types = state.columns.map((c, i) => detectType(state.rows, i, c.type));
     renderAll();
@@ -587,8 +611,13 @@ window.MaskingGrid = (() => {
         // exportHint.hidden = enabled || !hint;
         // exportHint.textContent = hint || '';
         exportHint.hidden = true;
-        exportBtn.title = enabled ? 'Скачать CSV (маскированные значения)' : (hint || 'Экспорт недоступен');
-        copyAllBtn.title = enabled ? 'Скопировать таблицу (маскированные значения) в буфер' : (hint || 'Копирование недоступно');
+        //**agent TASK-225 [27.09.2026 09:16:39] подпись по тому, что на экране
+        // exportBtn.title = enabled ? 'Скачать CSV (маскированные значения)' : (hint || 'Экспорт недоступен');
+        // copyAllBtn.title = enabled ? 'Скопировать таблицу (маскированные значения) в буфер' : (hint || 'Копирование недоступно');
+        const kind = options.realValues ? 'реальные значения' : 'маскированные значения';
+        exportBtn.title = enabled ? `Скачать CSV (${kind})` : (hint || 'Экспорт недоступен');
+        copyAllBtn.title = enabled ? `Скопировать таблицу (${kind}) в буфер` : (hint || 'Копирование недоступно');
+        //**agent TASK-225
         //**agent TASK-224
       },
       destroy() {

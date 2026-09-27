@@ -4425,3 +4425,81 @@ async fn non_ref_object_in_fio_named_column_still_fails_closed() {
         .contains("Результат недоступен"));
 }
 //++agent TASK-225
+
+//++agent TASK-225 [27.09.2026 00:00:00] W: регрессия вложенного токена —
+// ячейка под source_path-правилом содержит FIO-подстроку: FIO-проход
+// заменяет её токеном до структурной маски, и ACCOUNT-маппинг хранил
+// промежуточную форму — reveal снимал один уровень. Маппинг обязан
+// хранить исходное значение ячейки.
+#[tokio::test]
+async fn reveal_of_structural_token_returns_cell_without_nested_tokens() {
+    let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
+    state
+        .masking
+        .set_policy_snapshot(
+            database_id,
+            PolicySnapshot {
+                rules: vec![PolicyRule {
+                    selector: RuleSelector::SourcePath,
+                    pattern: "Справочник.big_MarketAccounts.Наименование".to_owned(),
+                    action: RuleAction::Mask,
+                    category: "ACCOUNT".to_owned(),
+                    priority: 0,
+                    rule_id: None,
+                }],
+                ..PolicySnapshot::default()
+            },
+        )
+        .await;
+    let call_id = Uuid::new_v4();
+    let raw = "Иванов Иван Иванович / DEMOSPOT1";
+    state
+        .masking
+        .finalize(FinalizeRequest {
+            schema_version: SCHEMA_VERSION,
+            call_id,
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            chat_id: "chat-w".to_owned(),
+            tool_name: "execute_query".to_owned(),
+            outcome: FinalizeOutcome::ToolResult {
+                result: json!({"success": true, "data": [{"Наименование": raw}]}),
+            },
+            field_sources: FieldSources {
+                schema: json!({"columns":[{
+                    "name":"Наименование",
+                    "sources":["Справочник.big_MarketAccounts.Наименование"]
+                }]}),
+                lineage: vec![json!({
+                    "column":"Наименование",
+                    "source_path":"Справочник.big_MarketAccounts.Наименование"
+                })],
+            },
+        })
+        .await
+        .unwrap();
+    let history_id = state
+        .storage
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT id FROM history WHERE call_id=?1",
+                [call_id.to_string()],
+                |row| {
+                    let value: String = row.get(0)?;
+                    Uuid::parse_str(&value).map_err(|_| rusqlite::Error::InvalidQuery)
+                },
+            )
+        })
+        .unwrap();
+    let revealed = state
+        .masking
+        .reveal_history(history_id, database_id, "chat-w")
+        .await
+        .unwrap();
+    let rendered = serde_json::to_string(&revealed).unwrap();
+    // Раскрытие отдаёт исходное значение ячейки целиком — без
+    // вложенного [MASK:…] от FIO-прохода.
+    assert!(rendered.contains(raw), "{rendered}");
+    assert!(!rendered.contains("[MASK:"), "{rendered}");
+}
+//++agent TASK-225

@@ -418,8 +418,8 @@ async function activatePage() {
 //++agent TASK-224 [24.09.2026] итерация 3
 // Табличные блоки — через изолированный MaskingGrid (web/grid.js): вход
 // {columns, rows}, без знаний о backend. Reveal-дифф и маск-токены приходят
-// снаружи через renderCell; CSV-экспорт отдаёт ТОЛЬКО маскированные строки
-// (exportRows), при показе раскрытых значений выключен с причиной.
+// снаружи через renderCell; CSV-экспорт отдаёт то, что на экране
+// (exportRows); реальные — после подтверждения (TASK-225, realCopy).
 //--agent TASK-224
 
 //++agent TASK-224 [25.09.2026 12:25:00] итерация 5: иконки — inline SVG через
@@ -474,7 +474,10 @@ function appendMaskedText(target, text) {
 //**agent TASK-225 [26.09.2026 03:00:00] decorate(node, blockIndex, rowIndex, column) —
 // подсветка ячеек причины «Почему скрыто» (B9) без знания о причинах внутри рендера.
 // function renderReport(target, report, maskedReport, grids, exportPrefix) {
-function renderReport(target, report, maskedReport, grids, exportPrefix, decorate) {
+//**agent TASK-225 [27.09.2026 09:16:39] realCopy = {confirm(proceed), notify()}
+// function renderReport(target, report, maskedReport, grids, exportPrefix, decorate) {
+function renderReport(target, report, maskedReport, grids, exportPrefix, decorate, realCopy) {
+//**agent TASK-225
 //**agent TASK-225
   target.replaceChildren();
   // Старые grid-инстансы уничтожаем — снимаются их document-слушатели.
@@ -511,11 +514,20 @@ function renderReport(target, report, maskedReport, grids, exportPrefix, decorat
         columns: block.columns,
         rows: block.rows,
         exportFileName: `${exportPrefix || 'report'}-${index + 1}.csv`,
-        // CSV — всегда маскированная версия блока, независимо от того, что
-        // показано на экране.
-        exportRows: () => (maskedBlock
-          ? { columns: maskedBlock.columns || block.columns, rows: maskedBlock.rows || block.rows }
-          : { columns: block.columns, rows: block.rows }),
+        //**agent TASK-225 [27.09.2026 09:16:39] блокировка выгрузки раскрытых
+        // значений ничего не защищала (текст выделяется и копируется хоткеем):
+        // CSV/«Копировать» выгружают то, что на экране, а реальные — только
+        // после подтверждения человека (realCopy от просмотрщика).
+        // // CSV — всегда маскированная версия блока, независимо от того, что
+        // // показано на экране.
+        // exportRows: () => (maskedBlock
+        //   ? { columns: maskedBlock.columns || block.columns, rows: maskedBlock.rows || block.rows }
+        //   : { columns: block.columns, rows: block.rows }),
+        exportRows: () => ({ columns: block.columns, rows: block.rows }),
+        realValues: !!maskedReport,
+        confirmReal: realCopy && realCopy.confirm,
+        onRealCopied: realCopy && realCopy.notify,
+        //**agent TASK-225
         renderCell: (td, value, rowIndex, colIndex, type) => {
           const maskedValue = maskedBlock && maskedBlock.rows && maskedBlock.rows[rowIndex]
             ? maskedBlock.rows[rowIndex][colIndex] : undefined;
@@ -534,10 +546,12 @@ function renderReport(target, report, maskedReport, grids, exportPrefix, decorat
           if (decorate) decorate(td, index, rowIndex, block.columns[colIndex]); // TASK-225
         },
       });
-      if (maskedReport) {
-        grid.setExportEnabled(false,
-          'Экспорт недоступен, пока показаны реальные значения — CSV выгружает только маскированные.');
-      }
+      //--agent TASK-225 [27.09.2026 09:16:39] выгрузка раскрытых значений разрешена
+      // if (maskedReport) {
+      //   grid.setExportEnabled(false,
+      //     'Экспорт недоступен, пока показаны реальные значения — CSV выгружает только маскированные.');
+      // }
+      //--agent TASK-225
       if (grids) grids.push(grid);
     }
   });
@@ -818,6 +832,7 @@ async function viewerPage() {
       viewer.grids,
       viewer.record.id,
       whyDecorate, // TASK-225
+      realCopy, // TASK-225: подтверждение выгрузки реальных значений
     );
     $('#revealNote').hidden = !revealed;
     $('#maskToggle').hidden = !viewer.revealed;
@@ -1049,6 +1064,42 @@ async function viewerPage() {
     $('#reportMore').textContent = collapsed ? 'Развернуть' : 'Свернуть';
   });
   $('#revealNote').prepend(svgIcon('eye'));
+
+  //++agent TASK-225 [27.09.2026 09:16:39] выгрузка реальных значений:
+  // первое «Копировать»/CSV в рамках раскрытия записи — модалка, дальше без
+  // вопросов. Подтверждение привязано к объекту viewer.revealed: уход с
+  // записи обнуляет его, и следующее раскрытие спросит снова.
+  let realCopyPending = null;
+  const realToast = message => {
+    const node = el('div', 'toast', message);
+    node.setAttribute('role', 'status');
+    document.body.append(node);
+    setTimeout(() => node.remove(), 1800);
+  };
+  const realCopy = {
+    confirm(proceed) {
+      if (viewer.revealed && viewer.realCopyAck === viewer.revealed) {
+        proceed();
+        realToast('Скопировано (реальные значения)');
+        return;
+      }
+      realCopyPending = proceed;
+      openOverlay('dlgRealCopy');
+    },
+    notify() { realToast('Скопировано (реальное значение)'); },
+  };
+  $('#realCopyCancel').addEventListener('click', () => { realCopyPending = null; closeOverlays(); });
+  $('#realCopyGo').addEventListener('click', () => {
+    const proceed = realCopyPending;
+    realCopyPending = null;
+    viewer.realCopyAck = viewer.revealed;
+    closeOverlays();
+    if (proceed) {
+      proceed();
+      realToast('Скопировано (реальные значения)');
+    }
+  });
+  //++agent TASK-225
 
   //++agent TASK-225 [27.09.2026 13:00:00] «Скопировать для агента»: только
   // идентификаторы, исход и текст запроса из МАСКИРОВАННОЙ записи
