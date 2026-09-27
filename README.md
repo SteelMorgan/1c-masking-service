@@ -12,6 +12,19 @@ Unix socket, human API/UI на отдельном TCP-listener.
 через UI; агент и `Admin` раскрытия не получают. В историю и логи пишется
 только замаскированная форма.
 
+> **Рассчитан на определённый набор инструментов.** В текущем виде («как
+> есть») сервис работает в связке
+> [v8-session-manager](https://github.com/1c-neurofish/v8-session-manager)
+> (MCP-хаб, вызывает сервис на каждый вызов инструмента) →
+> [wt-mcp-adapter](https://github.com/SteelMorgan/wt-mcp-adapter) +
+> web-transport-addin (транспорт 1С ↔ менеджер) →
+> [1c-mcp-tools](https://github.com/SteelMorgan/1c-mcp-tools) (прикладной слой:
+> инструменты данных и граница данных в 1С). Он опирается на их контракты:
+> конверт ответа с `field_sources`, внутренние feed-инструменты, опознание базы
+> по координатам ИБ. С другим MCP-сервером для 1С без доработки не заработает.
+> Как устроена связка — транспортный и прикладной слои, жизненный цикл
+> сессии: [схема стека](https://github.com/1c-neurofish/v8-session-manager/blob/main/docs/architecture/STACK_OVERVIEW.md).
+
 ## Быстрый старт
 
 Нужны Rust stable + Cargo и Unix-подобная ОС (UDS, peer credentials, file
@@ -92,6 +105,7 @@ RAS сервис работает с генерируемыми GUID, стаби
 [v8-session-manager](https://github.com/1c-neurofish/v8-session-manager), а
 граница данных и внутренние feed-инструменты живут в расширении 1С
 [1c-mcp-tools](https://github.com/SteelMorgan/1c-mcp-tools).
+Общая схема слоёв связки — [STACK_OVERVIEW](https://github.com/1c-neurofish/v8-session-manager/blob/main/docs/architecture/STACK_OVERVIEW.md).
 
 #### v8-session-manager — шлюз (MCP-хаб)
 - На **каждый** публичный вызов инструмента агентом (при `masking.enabled`)
