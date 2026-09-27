@@ -498,7 +498,11 @@ struct FieldEvidence {
 impl MaskEngine {
     pub fn new() -> Self {
         Self {
-            secret_name: RegexBuilder::new(r"(^|[_\-.])(password|passwd|secret|access.?token|refresh.?token|api.?key|private.?key|authorization|парол|токен|секрет|ключ)([_\-.]|$)")
+            //++agent TASK-225 [27.09.2026] Y4 консолидация
+            // Alternation расширена до набора SECRET_NAME_COMPACT_MARKERS
+            // (bounded-варианты; `ключ` остаётся только здесь и только
+            // с границами слова). Зеркало — ЭтоИмяСекрета границы 1С.
+            secret_name: RegexBuilder::new(r"(^|[_\-.])(password|passwd|passphrase|секретнаяфраза|secret|access.?token|refresh.?token|token|api.?key|ключapi|ключапи|private.?key|приватныйключ|access.?key|refresh.?key|authorization|авторизац|парол|токен|секрет|ключ)([_\-.]|$)")
                 .case_insensitive(true).build().expect("static regex"),
             secret_value: RegexBuilder::new(r"(?i)(bearer\s+[a-z0-9._~+/=-]{8,}|authorization\s*[:=]\s*\S+|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)")
                 .case_insensitive(true).build().expect("static regex"),
@@ -506,7 +510,7 @@ impl MaskEngine {
             // Имена ключей — из secret_name; значение — кавычки либо
             // непробельный литерал. Левой границы нет: недорезание опаснее
             // лишнего среза в durable-заголовке.
-            secret_assignment: RegexBuilder::new(r#"(password|passwd|secret|token|api.?key|private.?key|access.?token|refresh.?token|authorization|парол\w*|токен\w*|секрет\w*|ключ\w*)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;)]+)"#)
+            secret_assignment: RegexBuilder::new(r#"(password|passwd|passphrase|секретнаяфраза|secret|token|api.?key|private.?key|access.?token|refresh.?token|authorization|парол\w*|токен\w*|секрет\w*|ключ\w*)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;)]+)"#)
                 .case_insensitive(true).build().expect("static regex"),
             //--agent TASK-224
             fio_name: RegexBuilder::new(r"(^|[_\-.])(фио|full.?name|person.?name|employee.?name|контрагент|физлицо)([_\-.]|$)")
@@ -1674,7 +1678,36 @@ fn object_ref_literal(value: &Value) -> Option<String> {
     }
     None
 }
-//++agent TASK-225
+//++agent TASK-225 [27.09.2026] Y4 консолидация
+/// Единый компакт-список маркеров секретных имён полей: подстрока в
+/// имени после нормализации (lower + удаление не-алфанумерики).
+/// Зеркало — `ЭтоИмяСекрета` в mcp_ROCTUPГраницаДанныхСервер (1C);
+/// держать синхронно. Используется здесь и в
+/// domain/service/dictionary_feed.rs::metadata_is_secret.
+/// accesstoken/refreshtoken не нужны отдельно — покрываются `token`.
+/// Голый `ключ` отсутствует намеренно: подстрочная проверка без границ
+/// слова ложноположительна (КлючНастройки); в сервисе он остаётся только
+/// в `secret_name`-regex с границами [_\-.].
+pub(crate) const SECRET_NAME_COMPACT_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "пароль",
+    "секретнаяфраза",
+    "secret",
+    "секрет",
+    "token",
+    "токен",
+    "apikey",
+    "ключapi",
+    "ключапи",
+    "privatekey",
+    "приватныйключ",
+    "accesskey",
+    "refreshkey",
+    "authorization",
+    "авторизац",
+];
 
 fn compact_secret_name(name: &str) -> bool {
     let compact: String = name
@@ -1682,22 +1715,9 @@ fn compact_secret_name(name: &str) -> bool {
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect();
-    [
-        "password",
-        "passwd",
-        "secret",
-        "accesstoken",
-        "refreshtoken",
-        "apikey",
-        "privatekey",
-        "authorization",
-        "пароль",
-        "токен",
-        "секрет",
-        "приватныйключ",
-    ]
-    .iter()
-    .any(|marker| compact.contains(marker))
+    SECRET_NAME_COMPACT_MARKERS
+        .iter()
+        .any(|marker| compact.contains(marker))
 }
 
 fn collect_secret_literals(

@@ -253,22 +253,14 @@ fn metadata_is_secret(item: &FeedMetadataItem) -> bool {
         .chars()
         .filter(|character| character.is_alphanumeric())
         .collect();
-    [
-        "password",
-        "passwd",
-        "secret",
-        "access_token",
-        "refresh_token",
-        "api_key",
-        "private_key",
-        "authorization",
-        "пароль",
-        "токен",
-        "секрет",
-        "приватныйключ",
-    ]
-    .iter()
-    .any(|marker| name.contains(marker) || compact.contains(&marker.replace('_', "")))
+    //++agent TASK-225 [27.09.2026] Y4 консолидация
+    // Единый список с domain/masking.rs::SECRET_NAME_COMPACT_MARKERS и
+    // ЭтоИмяСекрета границы 1С — держать синхронно. Подстрочная проверка
+    // по compact-форме (как в 1С и masking.rs) покрывает и snake_case
+    // варианты (access_token -> accesstoken через token).
+    crate::domain::masking::SECRET_NAME_COMPACT_MARKERS
+        .iter()
+        .any(|marker| compact.contains(marker))
 }
 
 impl MaskingService {
