@@ -32,7 +32,7 @@ ROCTUP units соответствующие GPL-3.0 notices и source availabili
 
 | Донор и pinned URL | Commit | License status | Компоненты и идеи | Статус в 1С-расширении / этом сервисе | Изменения и границы |
 |---|---|---|---|---|---|
-| [ROCTUP/1c-mcp-toolkit](https://github.com/ROCTUP/1c-mcp-toolkit/tree/fe12903af7a367a9d67dd055c13f4b59bb59d83c) | `fe12903af7a367a9d67dd055c13f4b59bb59d83c` | GPL-3.0; license upstream должна сопровождать фактические copied units | Выбранные tool cores (`execute_query`, `get_metadata`, `get_object_by_link`, `get_link_of_object`, `find_references_to_object`, `get_access_rights`), transitive masking/policy/dictionary closure, QueryLineageAnalyzer, включая native/template assets | В 1С-расширении 1c-mcp-tools — `copied` units/assets и `adapted` context/обвязка. В `1c-masking-service` **нет copied/adapted ROCTUP units**: Rust `MaskEngine`/`MappingStore` являются service-owned implementation | В расширении адаптированы server/service context, собственный WS transport, state и secret precedence. Не переносятся upstream transport, client-form state как policy owner и старый mapper как владелец изменяемой policy. Если ROCTUP code появится в сервисе, нужно добавить неизменённые GPL copyright/LICENSE/NOTICE и обеспечить source availability. |
+| [ROCTUP/1c-mcp-toolkit](https://github.com/ROCTUP/1c-mcp-toolkit/tree/fe12903af7a367a9d67dd055c13f4b59bb59d83c) | `fe12903af7a367a9d67dd055c13f4b59bb59d83c` | GPL-3.0; license upstream должна сопровождать фактические copied units | Выбранные tool cores (`execute_query`, `get_metadata`, `get_object_by_link`, `get_link_of_object`, `find_references_to_object`, `get_access_rights`), transitive masking/policy/dictionary closure, QueryLineageAnalyzer (native/template assets — сняты с поставки расширения, источники остаются upstream-архивом в `third_party/`) | В 1С-расширении 1c-mcp-tools — `copied` units/assets и `adapted` context/обвязка. В `1c-masking-service` **нет copied/adapted ROCTUP units**: Rust `MaskEngine`/`MappingStore` являются service-owned implementation | В расширении адаптированы server/service context, собственный WS transport, state и secret precedence. Не переносятся upstream transport, client-form state как policy owner и старый mapper как владелец изменяемой policy. Если ROCTUP code появится в сервисе, нужно добавить неизменённые GPL copyright/LICENSE/NOTICE и обеспечить source availability. |
 | [alonehobo/1c-trusted-gateway](https://github.com/alonehobo/1c-trusted-gateway/tree/a5cc656e3f3763800706ec752fd33fb2e18318e4) | `a5cc656e3f3763800706ec752fd33fb2e18318e4` | LICENSE не обнаружена; GitHub API для pin сообщает `license=null`. Это не разрешение на копирование | Только `concept`: recursive JSON, exact/prefix/composite type policy, forced field names, contextual regex, masked-column UX и идентификация отчёта | В `1c-masking-service` и в 1С-расширении **code copy отсутствует**; зафиксированы только attribution и идеи | Любая реализация должна быть независимой. Копирование кода запрещено до письменного разрешения или обнаружения применимой лицензии. Нельзя называть собственные Rust modules `copied` или `adapted` от этого проекта. |
 
 ## Детали ROCTUP: что перенесено в 1С-расширение
@@ -44,8 +44,11 @@ ROCTUP units соответствующие GPL-3.0 notices и source availabili
   `НайтиСсылкиНаОбъект`, `ПолучитьПраваДоступа`;
 - closure автоматического маскирования, обратной подстановки, policy,
   dictionary и regex;
-- templates/native assets `QueryLineageAnalyzer` (`RegexHelper` удалён
-  вместе с мёртвым regex-путём — его единственным потребителем).
+- templates/native assets `QueryLineageAnalyzer` — **снят с поставки**:
+  нативная компонента больше не входит в расширение и не подключается
+  (lineage вычисляется платформенной `СхемаЗапроса`); upstream-исходники
+  остаются в `third_party/` репозитория 1c-mcp-tools как архив. `RegexHelper`
+  удалён вместе с мёртвым regex-путём — его единственным потребителем.
 
 Отдельно от перенесённого кода написаны context adapters: registration/dispatch,
 server/service context, per-call state, защищённое TTL-сопоставление,
