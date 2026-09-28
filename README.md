@@ -1,5 +1,7 @@
 # 1c-masking-service
 
+![1c-masking-service: ответы 1С проходят через шлюз маскирования, и агент получает обезличенные данные](docs/assets/banner.png)
+
 Внешний сервис маскирования ответов 1С-инструментов для ИИ-агента. Реализация —
 `onec-masking-service` 0.1.0 (Rust/Axum): SQLite-хранилище, internal API на
 Unix socket, human API/UI на отдельном TCP-listener.
