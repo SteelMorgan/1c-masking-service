@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS history (
     UNIQUE (database_id, chat_id, call_id)
 );
 CREATE INDEX IF NOT EXISTS history_expires_idx ON history(expires_at);
-CREATE INDEX IF NOT EXISTS history_chat_idx ON history(database_id, chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS history_db_created_idx ON history(database_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

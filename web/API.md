@@ -59,8 +59,9 @@ HTTP bootstrap route отсутствует намеренно.
 `database_id`/`history_id` отвечает `404`, как несуществующий.
 
 - `GET /api/v1/databases` — только назначенные базы
-- `GET /api/v1/chats?database_id=<uuid>`
-- `GET /api/v1/history?database_id=<uuid>&chat_id=<id>&limit=30..50`
+- `GET /api/v1/history?database_id=<uuid>&limit=30..50` — плоская лента
+  истории базы; у записи `caller_label` — самоназвание вызывающего клиента
+  (только отображение и аудит, не идентичность и не граница доступа)
 - `POST /api/v1/history/{history_id}/reveal`
 
 Reveal возвращает только neutral report v1 (`text` и `table`, scalar cells),

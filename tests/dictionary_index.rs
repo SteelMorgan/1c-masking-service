@@ -55,7 +55,6 @@ fn mask_strings(
         .mask(
             &input,
             Uuid::nil(),
-            "chat",
             batch,
             3600,
             policy,
@@ -478,7 +477,6 @@ fn wildcard_name_match_is_unicode_case_insensitive() {
         .mask(
             &input,
             Uuid::nil(),
-            "chat",
             Uuid::new_v4(),
             3600,
             &snapshot,
@@ -559,7 +557,6 @@ fn bench_dictionary_automaton_1m() {
         .mask(
             &input,
             Uuid::nil(),
-            "bench",
             Uuid::new_v4(),
             3600,
             &snapshot,
@@ -590,7 +587,6 @@ fn bench_dictionary_automaton_1m() {
     let _ = engine.mask(
         &input,
         Uuid::nil(),
-        "bench",
         batch,
         3600,
         &legacy,
@@ -602,7 +598,6 @@ fn bench_dictionary_automaton_1m() {
     let _ = engine.mask(
         &input,
         Uuid::nil(),
-        "bench",
         batch,
         3600,
         &indexed,
@@ -677,7 +672,6 @@ fn bench_dictionary_keep_automaton_1m() {
         .mask(
             &input,
             Uuid::nil(),
-            "bench",
             Uuid::new_v4(),
             3600,
             &snapshot,

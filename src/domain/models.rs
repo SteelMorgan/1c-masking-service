@@ -72,7 +72,10 @@ pub struct PreflightRequest {
     pub correlation_id: Uuid,
     #[serde(flatten)]
     pub identity: DatabaseIdentity,
-    pub chat_id: String,
+    /// Самоназвание вызывающего клиента — только атрибут аудита, не
+    /// механизм доступа (см. `valid_caller`).
+    #[serde(default)]
+    pub caller: Option<String>,
     pub tool_name: String,
     pub arguments: Value,
 }
@@ -142,8 +145,9 @@ pub struct TerminalScope {
     #[serde(default)]
     pub infobase_name: Option<String>,
     //++agent TASK-225
+    /// Атрибут аудита вызывающего; допустим в обоих видах scope.
     #[serde(default)]
-    pub chat_id: Option<String>,
+    pub caller: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -190,7 +194,9 @@ pub struct FinalizeRequest {
     #[serde(flatten)]
     pub identity: DatabaseIdentity,
     //++agent TASK-225
-    pub chat_id: String,
+    /// См. `PreflightRequest::caller`.
+    #[serde(default)]
+    pub caller: Option<String>,
     pub tool_name: String,
     pub outcome: FinalizeOutcome,
     #[serde(default)]

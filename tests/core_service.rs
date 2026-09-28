@@ -48,7 +48,7 @@ fn expired_history_is_never_loaded_for_idempotent_retry() {
     storage
         .write_history(
             database_id,
-            "chat-expired",
+            Some("chat-expired"),
             call_id,
             "execute_query",
             "tool_result",
@@ -73,7 +73,7 @@ fn expired_history_is_never_loaded_for_idempotent_retry() {
         .unwrap();
 
     assert!(storage
-        .load_history(database_id, "chat-expired", call_id)
+        .load_history(database_id, call_id)
         .unwrap()
         .is_none());
 }
@@ -94,7 +94,7 @@ async fn unknown_database_is_created_unconfigured_before_business_call() {
             call_id,
             correlation_id,
             identity: identity.clone(),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":"SELECT 1"}),
         })
@@ -113,7 +113,7 @@ async fn unknown_database_is_created_unconfigured_before_business_call() {
             call_id,
             correlation_id,
             identity: identity.clone(),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":"DIFFERENT RAW ARGUMENT MUST NOT BE STORED"}),
         })
@@ -126,7 +126,7 @@ async fn unknown_database_is_created_unconfigured_before_business_call() {
                 "SELECT COUNT(*),
                         (SELECT COUNT(*) FROM audit_events WHERE action='call.denied' AND correlation_id=?1),
                         public_result_json || report_json || mask_reasons_json
-                 FROM history WHERE database_id=?2 AND chat_id='chat-a' AND call_id=?3",
+                 FROM history WHERE database_id=?2 AND caller_label='chat-a' AND call_id=?3",
                 rusqlite::params![
                     correlation_id.to_string(),
                     database_id.to_string(),
@@ -156,7 +156,7 @@ async fn finalize_masks_every_public_copy_and_never_persists_raw_values() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 // Контракт Р2: непрозрачный бизнес-result; сырое значение
@@ -249,7 +249,7 @@ async fn canonical_api_key_alias_is_cut_from_every_copy_before_mapping() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "synthetic-alias".to_owned(),
+            caller: Some("synthetic-alias".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result: json!({
                 "success": true,
@@ -303,7 +303,7 @@ async fn query_rows_with_missing_or_degraded_lineage_fail_closed() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "synthetic-degraded".to_owned(),
+                caller: Some("synthetic-degraded".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
@@ -347,7 +347,7 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "query-envelope".to_owned(),
+                caller: Some("query-envelope".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
                 field_sources: FieldSources::default(),
@@ -373,7 +373,7 @@ async fn successful_query_requires_a_recognized_tabular_envelope() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "query-envelope".to_owned(),
+            caller: Some("query-envelope".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"data":[]}),
@@ -414,7 +414,7 @@ async fn password_mode_metadata_cuts_neutral_alias_even_without_secret_flag() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "synthetic-password-mode".to_owned(),
+            caller: Some("synthetic-password-mode".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -489,7 +489,7 @@ async fn secret_dictionary_and_regex_rules_cut_entire_value_without_mapping() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "synthetic-secret-rule".to_owned(),
+                caller: Some("synthetic-secret-rule".to_owned()),
                 tool_name: "find_references_to_object".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
@@ -563,7 +563,7 @@ async fn canonical_fio_source_overrides_keep_rule_and_missing_lineage_fails_clos
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "synthetic-fio-source".to_owned(),
+                caller: Some("synthetic-fio-source".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
@@ -631,7 +631,7 @@ async fn canonical_full_name_source_masks_initials_despite_neutral_alias_and_kee
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "synthetic-full-name".to_owned(),
+            caller: Some("synthetic-full-name".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -697,7 +697,7 @@ async fn second_canonical_source_applies_stricter_mask_or_secret_rule() {
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "synthetic-multisource".to_owned(),
+                caller: Some("synthetic-multisource".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
@@ -753,7 +753,7 @@ async fn schema_type_array_and_legacy_scalar_feed_type_policy() {
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "synthetic-type-array".to_owned(),
+                caller: Some("synthetic-type-array".to_owned()),
                 tool_name: "get_object_by_link".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({"success":true,"НейтральноеПоле":raw}),
@@ -887,7 +887,7 @@ async fn stricter_same_level_rule_wins_and_policy_evidence_is_persisted_without_
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-policy".to_owned(),
+            caller: Some("chat-policy".to_owned()),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -942,7 +942,7 @@ async fn transport_errors_are_sanitized_before_history_and_unknown_tools_fail_cl
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-error".to_owned(),
+            caller: Some("chat-error".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::TransportError {
                 error: json!({"message":raw_error}),
@@ -976,7 +976,7 @@ async fn transport_errors_are_sanitized_before_history_and_unknown_tools_fail_cl
             call_id: pending_call_id,
             correlation_id: pending_correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-error".to_owned(),
+            caller: Some("chat-error".to_owned()),
             tool_name: "future_unreviewed_tool".to_owned(),
             arguments: json!({}),
         })
@@ -1023,7 +1023,7 @@ async fn oversized_or_malformed_completed_calls_store_idempotent_sanitized_histo
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-bounds".to_owned(),
+            caller: Some("chat-bounds".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult { result },
             field_sources: FieldSources::default(),
@@ -1041,7 +1041,7 @@ async fn oversized_or_malformed_completed_calls_store_idempotent_sanitized_histo
                 let (count, outcome, stored, reasons): (i64, String, String, String) = connection
                     .query_row(
                     "SELECT COUNT(*),outcome,public_result_json || report_json,mask_reasons_json
-                         FROM history WHERE database_id=?1 AND chat_id=?2 AND call_id=?3",
+                         FROM history WHERE database_id=?1 AND caller_label=?2 AND call_id=?3",
                     rusqlite::params![database_id.to_string(), "chat-bounds", call_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
@@ -1066,7 +1066,7 @@ async fn disabled_public_projection_is_raw_but_history_is_always_masked() {
         call_id,
         correlation_id,
         identity: common::test_identity(database_id),
-        chat_id: "chat-a".to_owned(),
+        caller: Some("chat-a".to_owned()),
         tool_name: "get_metadata".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
             result: json!({"success":true,"ФИО":raw_name,"access_token":raw_secret}),
@@ -1135,7 +1135,7 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-six".to_owned(),
+                caller: Some("chat-six".to_owned()),
                 tool_name: tool_name.to_owned(),
                 outcome: FinalizeOutcome::ToolResult { result },
                 field_sources,
@@ -1149,7 +1149,7 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
         .with_connection(|connection| {
             let (count, raw_count): (i64, i64) = connection.query_row(
                 "SELECT COUNT(*),SUM(instr(public_result_json,?1)>0 OR instr(report_json,?1)>0)
-                 FROM history WHERE database_id=?2 AND chat_id='chat-six'",
+                 FROM history WHERE database_id=?2 AND caller_label='chat-six'",
                 rusqlite::params![raw, database_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -1161,7 +1161,7 @@ async fn all_six_selected_tool_classes_create_automatic_masked_history() {
 }
 
 #[tokio::test]
-async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
+async fn mask_tokens_resolve_for_any_caller_of_the_same_database() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let (_, call_id, correlation_id) = request_ids();
     let raw_name = "Сидоров Сидор Сидорович";
@@ -1172,7 +1172,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"ФИО":raw_name}),
@@ -1193,7 +1193,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query":format!("WHERE name = '{token}'")}),
         })
@@ -1204,6 +1204,24 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
         .unwrap()
         .contains(raw_name));
 
+    // Другой клиент той же базы получает то же разрешение токена:
+    // вызывающий — атрибут аудита, а не граница доступа.
+    let other_client = state
+        .masking
+        .preflight(PreflightRequest {
+            schema_version: 1,
+            call_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            identity: common::test_identity(database_id),
+            caller: Some("another-client/2.0 #0000beef".to_owned()),
+            tool_name: "execute_query".to_owned(),
+            arguments: json!({"query":token}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(other_client.arguments["query"], json!(raw_name));
+
+    // Неизвестный токен (формат верный, записи нет) — отказ до вызова 1С.
     let denied_call_id = Uuid::new_v4();
     let denied = state
         .masking
@@ -1212,9 +1230,9 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
             call_id: denied_call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-b".to_owned(),
+            caller: None,
             tool_name: "execute_query".to_owned(),
-            arguments: json!({"query":token}),
+            arguments: json!({"query":"[MASK:v1:FIO:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA]"}),
         })
         .await
         .unwrap_err();
@@ -1239,7 +1257,7 @@ async fn mask_tokens_resolve_only_inside_exact_database_and_chat_scope() {
 }
 
 #[tokio::test]
-async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
+async fn reveal_uses_history_batch_and_exact_database_scope() {
     let (state, database_id) = configured_state(DatabaseMode::Enabled).await;
     let call_id = Uuid::new_v4();
     let raw_name = "Орлов Олег Олегович";
@@ -1250,7 +1268,7 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-reveal".to_owned(),
+            caller: Some("chat-reveal".to_owned()),
             tool_name: "get_object_by_link".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -1276,7 +1294,7 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
         .unwrap();
     let revealed = state
         .masking
-        .reveal_history(history_id, database_id, "chat-reveal")
+        .reveal_history(history_id, database_id)
         .await
         .unwrap();
     let rendered = serde_json::to_string(&revealed).unwrap();
@@ -1285,14 +1303,14 @@ async fn reveal_uses_history_batch_and_exact_database_chat_scope() {
     assert!(rendered.contains("[SECRET_REMOVED]"));
     let foreign = state
         .masking
-        .reveal_history(history_id, database_id, "other-chat")
+        .reveal_history(history_id, Uuid::new_v4())
         .await
         .unwrap_err();
     assert_eq!(foreign.code, ErrorCode::HistoryUnavailable);
     let restarted = AppState::new(state.storage.clone(), "https://masking.test");
     let unavailable = restarted
         .masking
-        .reveal_history(history_id, database_id, "chat-reveal")
+        .reveal_history(history_id, database_id)
         .await
         .unwrap_err();
     //++agent TASK-224 [08.10.2026] итерация 4: рестарт очищает историю
@@ -1340,7 +1358,7 @@ async fn dictionary_and_regex_detectors_apply_to_free_text() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"note":"ООО Ромашка, ИНН 7707083893"}),
@@ -1472,7 +1490,7 @@ async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-feed".to_owned(),
+            caller: Some("chat-feed".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"note":"Контрагент ООО Вектор"}),
@@ -1517,7 +1535,7 @@ async fn pull_publishes_snapshot_atomically_and_failed_pull_keeps_previous() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-feed".to_owned(),
+            caller: Some("chat-feed".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"note":"ООО Вектор / ООО Новый"}),
@@ -1653,7 +1671,7 @@ async fn pull_follows_opaque_cursor_until_final_chunk() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-pages".to_owned(),
+            caller: Some("chat-pages".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"note":"ООО Первый и ООО Второй"}),
@@ -2277,7 +2295,7 @@ async fn finalize_report_preserves_query_column_order_marks_masked_and_scalars()
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-report".to_owned(),
+            caller: Some("chat-report".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": query}),
         })
@@ -2290,7 +2308,7 @@ async fn finalize_report_preserves_query_column_order_marks_masked_and_scalars()
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-report".to_owned(),
+            caller: Some("chat-report".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -2378,7 +2396,7 @@ async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-ttl".to_owned(),
+            caller: Some("chat-ttl".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": "SELECT 1"}),
         })
@@ -2391,7 +2409,7 @@ async fn history_and_call_context_live_no_longer_than_the_shorter_ttl() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-ttl".to_owned(),
+            caller: Some("chat-ttl".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"Дата": "2026-10-08"}]}),
@@ -2443,7 +2461,7 @@ fn service_start_purges_history_and_call_contexts() {
     storage
         .write_history(
             database_id,
-            "chat-purge",
+            Some("chat-purge"),
             Uuid::new_v4(),
             "execute_query",
             "tool_result",
@@ -2461,7 +2479,7 @@ fn service_start_purges_history_and_call_contexts() {
         .write_call_context(
             Uuid::new_v4(),
             database_id,
-            "chat-purge",
+            Some("chat-purge"),
             "execute_query",
             Some("SELECT 1"),
             86_400,
@@ -2492,7 +2510,7 @@ async fn call_title_never_persists_raw_secrets_from_arguments() {
         call_id,
         correlation_id,
         identity: common::test_identity(database_id),
-        chat_id: "chat-secret".to_owned(),
+        caller: Some("chat-secret".to_owned()),
         tool_name: "execute_query".to_owned(),
         outcome: FinalizeOutcome::ToolResult {
             result: json!({"success": true, "data": [{"Дата": "2026-10-08"}]}),
@@ -2507,7 +2525,7 @@ async fn call_title_never_persists_raw_secrets_from_arguments() {
         call_id,
         correlation_id,
         identity: common::test_identity(database_id),
-        chat_id: "chat-secret".to_owned(),
+        caller: Some("chat-secret".to_owned()),
         tool_name: "execute_query".to_owned(),
         arguments,
     };
@@ -2662,7 +2680,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "totally_unknown_tool".to_owned(),
             arguments: json!({"a": 1}),
         })
@@ -2694,7 +2712,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
                 call_id,
                 correlation_id,
                 identity: common::test_identity(database_id),
-                chat_id: "chat-a".to_owned(),
+                caller: Some("chat-a".to_owned()),
                 tool_name: "totally_unknown_tool".to_owned(),
                 arguments: json!({"a": 2}),
             })
@@ -2730,7 +2748,7 @@ async fn unknown_tool_is_denied_auto_registered_and_counted() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "totally_unknown_tool".to_owned(),
             arguments: json!({"a": 3}),
         })
@@ -2755,7 +2773,7 @@ async fn invalid_tool_name_is_denied_audited_and_not_registered() {
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-a".to_owned(),
+                caller: Some("chat-a".to_owned()),
                 tool_name: tool_name.to_owned(),
                 arguments: json!({}),
             })
@@ -2793,7 +2811,7 @@ async fn auto_registration_limit_denies_without_new_row() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "over_limit_tool".to_owned(),
             arguments: json!({}),
         })
@@ -2818,7 +2836,7 @@ async fn unconfigured_database_denies_before_auto_registration() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "brand_new_tool".to_owned(),
             arguments: json!({}),
         })
@@ -2842,7 +2860,7 @@ async fn unconfigured_database_allows_whitelisted_get_metadata() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "get_metadata".to_owned(),
             arguments: json!({}),
         })
@@ -2863,7 +2881,7 @@ async fn unconfigured_database_denies_non_whitelisted_execute_query() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"queryText":"ВЫБРАТЬ 1"}),
         })
@@ -2943,7 +2961,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"ФИО": raw}]}),
@@ -2974,7 +2992,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"link": token}),
         })
@@ -2983,7 +3001,8 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
     assert_eq!(allowed.decision, "allow");
     assert_eq!(allowed.arguments["link"], json!(raw));
 
-    // Токен чужого чата — отказ, подстановки нет.
+    // Та же случайная часть под чужой категорией — отказ, подстановки нет.
+    let forged = token.replacen("[MASK:v1:FIO:", "[MASK:v1:ACCOUNT:", 1);
     let error = state
         .masking
         .preflight(PreflightRequest {
@@ -2991,9 +3010,9 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-b".to_owned(),
+            caller: Some("chat-b".to_owned()),
             tool_name: "execute_query".to_owned(),
-            arguments: json!({"link": token}),
+            arguments: json!({"link": forged}),
         })
         .await
         .unwrap_err();
@@ -3008,7 +3027,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "get_metadata".to_owned(),
             arguments: json!({"link": token}),
         })
@@ -3025,7 +3044,7 @@ async fn mask_tokens_resolve_only_for_data_mask_in_enabled_mode() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"link": token}),
         })
@@ -3058,7 +3077,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"ФИО": raw}]}),
@@ -3086,7 +3105,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": format!("ВЫБРАТЬ \"{token}\" КАК")}),
         })
@@ -3108,7 +3127,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -3141,7 +3160,7 @@ async fn parse_error_after_token_resolution_exposes_only_code_and_position() {
     // Durable-история хранит тот же зачищенный результат.
     let stored = state
         .storage
-        .load_history(database_id, "chat-a", call_id)
+        .load_history(database_id, call_id)
         .unwrap()
         .expect("запись истории должна существовать");
     let stored_text = serde_json::to_string(&stored.public_result).unwrap();
@@ -3165,7 +3184,7 @@ async fn parse_error_without_tokens_keeps_message() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: json!({"query": "ВЫБРАТЬ 1 КАК В"}),
         })
@@ -3180,7 +3199,7 @@ async fn parse_error_without_tokens_keeps_message() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -3221,7 +3240,7 @@ async fn parse_error_without_context_strips_text() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-noctx".to_owned(),
+            caller: Some("chat-noctx".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -3249,7 +3268,7 @@ async fn parse_error_without_context_strips_text() {
 
     let stored = state
         .storage
-        .load_history(database_id, "chat-noctx", call_id)
+        .load_history(database_id, call_id)
         .unwrap()
         .expect("запись истории должна существовать");
     let stored_text = serde_json::to_string(&stored.public_result).unwrap();
@@ -3317,7 +3336,7 @@ async fn keep_rule_leaves_dictionary_and_regex_active_inside_value() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-keep-b".to_owned(),
+            caller: Some("chat-keep-b".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"customer": raw}]}),
@@ -3371,7 +3390,7 @@ async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "get_metadata".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -3398,7 +3417,7 @@ async fn opaque_tool_result_is_finalized_and_is_error_preserved() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -3441,7 +3460,7 @@ async fn terminal_event_accepts_manager_valid_tool_names() {
                         database_id,
                         common::test_infobase_guid(database_id)
                     )),
-                    chat_id: Some("chat-a".to_owned()),
+                    caller: Some("chat-a".to_owned()),
                 },
             })
             .unwrap();
@@ -3472,7 +3491,7 @@ async fn terminal_event_accepts_service_warming_up() {
                     database_id,
                     common::test_infobase_guid(database_id)
                 )),
-                chat_id: Some("chat-a".to_owned()),
+                caller: Some("chat-a".to_owned()),
             },
         })
         .unwrap();
@@ -3522,7 +3541,7 @@ async fn sourceless_columns_with_primitive_values_pass_lineage_check() {
                 call_id: Uuid::new_v4(),
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-sourceless".to_owned(),
+                caller: Some("chat-sourceless".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({"success": true, "data": [{"Кол": value}]}),
@@ -3660,7 +3679,7 @@ async fn sourceless_columns_fail_closed_on_violations() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-sourceless".to_owned(),
+                caller: Some("chat-sourceless".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({"success": true, "data": [{"Кол": value}], "note": raw}),
@@ -3725,7 +3744,7 @@ async fn sourceless_column_values_are_masked_like_regular_columns() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-sourceless".to_owned(),
+            caller: Some("chat-sourceless".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"СекретныйЛитерал": raw}]}),
@@ -3769,7 +3788,7 @@ async fn string_business_result_goes_to_text_verbatim() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "validate_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!(business),
@@ -3812,7 +3831,7 @@ async fn opaque_tool_call_result_passes_through_without_rewrap() {
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-a".to_owned(),
+            caller: Some("chat-a".to_owned()),
             tool_name: "infobase_info".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: opaque.clone(),
@@ -3855,7 +3874,7 @@ async fn finalize_unverified(
             call_id,
             correlation_id,
             identity: common::test_identity(database_id),
-            chat_id: "chat-strict".to_owned(),
+            caller: Some("chat-strict".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": rows}),
@@ -4085,7 +4104,7 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-parse".to_owned(),
+                caller: Some("chat-parse".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 arguments: json!({"query": "ВЫБРАТЬ 1"}),
             })
@@ -4098,7 +4117,7 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
                 call_id,
                 correlation_id: Uuid::new_v4(),
                 identity: common::test_identity(database_id),
-                chat_id: "chat-parse".to_owned(),
+                caller: Some("chat-parse".to_owned()),
                 tool_name: "execute_query".to_owned(),
                 outcome: FinalizeOutcome::ToolResult {
                     result: json!({
@@ -4123,7 +4142,7 @@ async fn query_parse_error_envelope_survives_masking_with_text() {
         .with_connection(|connection| {
             connection.query_row(
                 "SELECT group_concat(public_result_json, ';') FROM history
-                 WHERE database_id=?1 AND chat_id='chat-parse'",
+                 WHERE database_id=?1 AND caller_label='chat-parse'",
                 [database_id.to_string()],
                 |row| row.get(0),
             )
@@ -4160,7 +4179,7 @@ async fn warming_up_while_pull_pending_reports_retry_after() {
                     call_id,
                     correlation_id: Uuid::new_v4(),
                     identity: common::test_identity(database_id),
-                    chat_id: "chat-warm".to_owned(),
+                    caller: Some("chat-warm".to_owned()),
                     tool_name: "execute_query".to_owned(),
                     arguments: json!({"query":"SELECT 1"}),
                 })
@@ -4188,7 +4207,7 @@ async fn warming_up_while_pull_pending_reports_retry_after() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-warm".to_owned(),
+            caller: Some("chat-warm".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success":true,"data":[]}),
@@ -4335,7 +4354,7 @@ async fn objectref_cell_in_fio_named_column_masks_instead_of_sanitized_failure()
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-u".to_owned(),
+            caller: Some("chat-u".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -4395,7 +4414,7 @@ async fn non_ref_object_in_fio_named_column_still_fails_closed() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-u".to_owned(),
+            caller: Some("chat-u".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({
@@ -4460,7 +4479,7 @@ async fn reveal_of_structural_token_returns_cell_without_nested_tokens() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-w".to_owned(),
+            caller: Some("chat-w".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"success": true, "data": [{"Наименование": raw}]}),
@@ -4493,7 +4512,7 @@ async fn reveal_of_structural_token_returns_cell_without_nested_tokens() {
         .unwrap();
     let revealed = state
         .masking
-        .reveal_history(history_id, database_id, "chat-w")
+        .reveal_history(history_id, database_id)
         .await
         .unwrap();
     let rendered = serde_json::to_string(&revealed).unwrap();

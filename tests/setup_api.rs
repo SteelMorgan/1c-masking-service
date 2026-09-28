@@ -559,7 +559,7 @@ async fn d3_dry_run_returns_masked_grid_without_values() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                         mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?4,'execute_query','tool_result',1,'[]',?3,'{}',
@@ -1106,7 +1106,7 @@ async fn history_reasons_returns_row_and_does_not_deadlock() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                         mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?3,'execute_query','tool_result',1,
@@ -1483,7 +1483,7 @@ async fn t6_dry_run_empty_history_reasons() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                         mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?4,'execute_query','tool_result',1,'[]','{}','{}',
@@ -1528,7 +1528,7 @@ async fn t6_dry_run_skips_expired_mapping_without_writes() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                         mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?4,'execute_query','tool_result',1,'[]',?3,'{}',
@@ -1612,7 +1612,7 @@ async fn t7_reasons_detailed_cells_and_rule_ids() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,mask_detail_json,public_result_json,report_json,
                         created_at,expires_at,mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?3,'execute_query','tool_result',1,'[]',?4,'{}',?5,
@@ -1780,7 +1780,7 @@ async fn t6_dry_run_bounded_keep_secret_and_no_writes() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat".to_owned(),
+            caller: Some("chat".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"data":[{"ИНН":"7707083893"}]}),
@@ -1802,7 +1802,7 @@ async fn t6_dry_run_bounded_keep_secret_and_no_writes() {
         .with_connection(|c| {
             for _ in 0..54 {
                 c.execute(
-                    "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                    "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                             mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                             mapping_batch_id,field_sources_json)
                      VALUES (?1,?2,'chat',?4,'execute_query','tool_result',1,'[]',?3,'{}',
@@ -1819,7 +1819,7 @@ async fn t6_dry_run_bounded_keep_secret_and_no_writes() {
                 )?;
             }
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,public_result_json,report_json,created_at,expires_at,
                         mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?4,'execute_query','tool_result',1,'[]',?3,'{}',
@@ -1951,7 +1951,7 @@ async fn t7_reasons_legacy_row_returns_legacy_reasons() {
     storage
         .with_connection(|c| {
             c.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
                         mask_reasons_json,mask_detail_json,public_result_json,report_json,
                         created_at,expires_at,mapping_batch_id,field_sources_json)
                  VALUES (?1,?2,'chat',?3,'execute_query','tool_result',1,?4,NULL,'{}','{}',
@@ -2176,7 +2176,7 @@ async fn d8_dictionary_reason_carries_source_path() {
             call_id,
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat".to_owned(),
+            caller: Some("chat".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"data":[{"ИНН":"7707083893"}]}),
@@ -3038,7 +3038,7 @@ fn seed_database_relations(storage: &SqliteStorage, database_id: Uuid) {
                 [&database_id],
             )?;
             connection.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,
                    policy_version,mask_reasons_json,public_result_json,report_json,
                    created_at,expires_at)
                  VALUES (?1,?2,'c',?3,'t','tool_result',1,'[]','{}','{}',
@@ -3050,7 +3050,7 @@ fn seed_database_relations(storage: &SqliteStorage, database_id: Uuid) {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO call_contexts(call_id,database_id,chat_id,tool_name,created_at,expires_at)
+                "INSERT INTO call_contexts(call_id,database_id,caller_label,tool_name,created_at,expires_at)
                  VALUES (?1,?2,'c','t','2026-01-01T00:00:00Z','2999-01-01T00:00:00Z')",
                 rusqlite::params![Uuid::new_v4().to_string(), database_id],
             )?;
@@ -3210,7 +3210,7 @@ async fn deleted_database_re_registers_as_unconfigured_on_next_call() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: identity.clone(),
-            chat_id: "chat-t".to_owned(),
+            caller: Some("chat-t".to_owned()),
             tool_name: "get_metadata".to_owned(),
             arguments: json!({}),
         })

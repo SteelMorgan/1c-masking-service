@@ -107,17 +107,11 @@ pub(crate) fn refresh_error_text(
 //++agent TASK-225
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ChatSummary {
-    pub chat_id: String,
-    pub message_count: u64,
-    pub last_message_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct HistoryItem {
     pub id: Uuid,
     pub database_id: Uuid,
-    pub chat_id: String,
+    /// Самоназвание клиента — только для отображения и аудита.
+    pub caller_label: Option<String>,
     pub tool_name: String,
     pub outcome: String,
     pub created_at: DateTime<Utc>,
@@ -391,11 +385,9 @@ pub trait HumanDataStore: Send + Sync {
         &self,
         scope: &DatabaseScope,
     ) -> Result<Vec<DatabaseSummary>, HumanDataError>;
-    fn list_chats(&self, database_id: Uuid) -> Result<Vec<ChatSummary>, HumanDataError>;
     fn list_history(
         &self,
         database_id: Uuid,
-        chat_id: &str,
         limit: u8,
     ) -> Result<Vec<HistoryItem>, HumanDataError>;
     /// `actor` живёт столько же, сколько future: scope-проверка внутри

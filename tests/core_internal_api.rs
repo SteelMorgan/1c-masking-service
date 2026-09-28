@@ -25,7 +25,7 @@ use common::{
 };
 
 #[test]
-fn existing_v1_database_is_migrated_without_losing_masked_history() {
+fn existing_v1_database_is_migrated_and_chat_bound_history_is_cleared() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("service.sqlite3");
     let database_id = Uuid::new_v4();
@@ -84,7 +84,8 @@ fn existing_v1_database_is_migrated_without_losing_masked_history() {
                 [],
                 |row| row.get(0),
             )?;
-            assert_eq!((migration_count, history_count, ledger_exists), (2, 1, 1));
+            // Миграция 0018: записи, привязанные к chat_id, не переносятся.
+            assert_eq!((migration_count, history_count, ledger_exists), (2, 0, 1));
             let dropped_feed_tables: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
                  ('feed_jobs','v2_call_receipts','v2_active_snapshots','v2_feed_leases')",
@@ -162,7 +163,7 @@ async fn internal_router_respects_configured_body_limit_before_handler() {
         "infobase_name":common::test_infobase_name(database_id),
         "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
 
-        "chat_id":"synthetic-chat",
+        "caller":"synthetic-chat",
         "tool_name":"execute_query",
         "arguments":{"query":"SELECT 1"}
     });
@@ -174,7 +175,7 @@ async fn internal_router_respects_configured_body_limit_before_handler() {
         "infobase_name":common::test_infobase_name(database_id),
         "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
 
-        "chat_id":"synthetic-chat",
+        "caller":"synthetic-chat",
         "tool_name":"execute_query",
         "outcome":{"kind":"transport_error","error":{"message":"synthetic-timeout"}}
     });
@@ -187,7 +188,7 @@ async fn internal_router_respects_configured_body_limit_before_handler() {
         }),
         ("/internal/v1/calls/finalize", finalize.clone(), {
             let mut payload = finalize;
-            payload["chat_id"] = json!(format!("{CANARY}{}", "x".repeat(1_500)));
+            payload["caller"] = json!(format!("{CANARY}{}", "x".repeat(1_500)));
             payload
         }),
     ] {
@@ -230,7 +231,7 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
         "call_id":call_id,
         "correlation_id":correlation_id,
         "tool_name":"execute_query",
-        "error_code":"CHAT_IDENTITY_REQUIRED",
+        "error_code":"SERVICE_NOT_READY",
         "scope":{"kind":"unverified"}
     });
 
@@ -252,8 +253,8 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
         "call_id":Uuid::new_v4(),
         "correlation_id":Uuid::new_v4(),
         "tool_name":"execute_query",
-        "error_code":"CHAT_IDENTITY_REQUIRED",
-        "scope":{"kind":"unverified","cluster_server":"test-srv","chat_id":"candidate"}
+        "error_code":"SERVICE_NOT_READY",
+        "scope":{"kind":"unverified","cluster_server":"test-srv","caller":"candidate"}
     });
     assert_eq!(
         app.clone()
@@ -321,7 +322,7 @@ async fn unverified_terminal_events_use_an_unscoped_idempotent_retained_ledger()
             call_id,
             correlation_id,
             identity: common::test_identity(candidate_database_id),
-            chat_id: "candidate-chat".to_owned(),
+            caller: Some("candidate-chat".to_owned()),
             tool_name: "execute_query".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({"content":[{"type":"text","text":"must-not-be-attributed"}],"is_error":false}),
@@ -374,7 +375,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(database_id),
                 "instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"execute_query",
                 "arguments":{"query":"SELECT 1"}
             }),
@@ -398,7 +399,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "correlation_id":correlation_id,
                 "tool_name":"execute_query",
                 "error_code":"SERVICE_NOT_READY",
-                "scope":{"kind":"verified","cluster_server":common::TEST_CLUSTER_SERVER,"infobase_name":common::test_infobase_name(database_id),"instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),"chat_id":"trusted-conversation"}
+                "scope":{"kind":"verified","cluster_server":common::TEST_CLUSTER_SERVER,"infobase_name":common::test_infobase_name(database_id),"instance_id":format!("ras:{}:{}",database_id,common::test_infobase_guid(database_id)),"caller":"trusted-conversation"}
             }),
         ))
         .await
@@ -459,7 +460,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(identity_seed),
                 "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"execute_query",
                 "arguments":{"query":"SELECT 1"}
             }),
@@ -494,7 +495,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(identity_seed),
                 "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"execute_query",
                 "outcome":{"kind":"tool_result","result":{
                     "content":[{"type":"text","text":"must-not-run-before-cache"}],
@@ -519,7 +520,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(identity_seed),
                 "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"get_metadata",
                 "outcome":{"kind":"tool_result","result":{
                     "content":[{"type":"json","json":{"password":"never-publish"}}],
@@ -565,7 +566,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(identity_seed),
                 "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"execute_query",
                 //++agent TASK-222: контракт Р2 — непрозрачный бизнес-result;
                 // маскированное значение уходит агенту в content[0].text.
@@ -622,7 +623,7 @@ async fn internal_http_contract_fails_closed_then_masks_all_result_copies() {
                 "infobase_name":common::test_infobase_name(identity_seed),
                 "instance_id":format!("ras:{}:{}",identity_seed,common::test_infobase_guid(identity_seed)),
 
-                "chat_id":"trusted-conversation",
+                "caller":"trusted-conversation",
                 "tool_name":"execute_query",
                 "outcome":{"kind":"tool_result","result":{
                     "content":[{"type":"json","json":{"html":malformed_raw}}],
@@ -731,7 +732,7 @@ async fn all_mode_cold_start_expands_wildcard_selectors_after_metadata_pull() {
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "chat-all-mode".to_owned(),
+            caller: Some("chat-all-mode".to_owned()),
             tool_name: "find_references_to_object".to_owned(),
             outcome: FinalizeOutcome::ToolResult {
                 result: json!({

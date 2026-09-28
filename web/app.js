@@ -750,7 +750,6 @@ async function viewerPage() {
   const viewer = {
     databases: [],
     database: null,
-    chat: null,
     record: null,
     revealed: null, // только в памяти; сбрасывается при уходе с записи
     //++agent TASK-224 [24.09.2026] итерация 3
@@ -780,14 +779,6 @@ async function viewerPage() {
       box.append(copyButton(viewer.database.id));
       //--agent TASK-224
     }
-    if (viewer.chat) {
-      //++agent TASK-224 [08.10.2026] имя чата обрезается с конца
-      // (CSS ellipsis), полное — в title.
-      const name = el('span', 'mono small clip', `чат ${viewer.chat.chat_id}`);
-      name.title = viewer.chat.chat_id;
-      box.append(document.createTextNode(' › '), name);
-      //--agent TASK-224
-    }
     if (viewer.record) box.append(document.createTextNode(` › ${fmtTime(viewer.record.created_at)}`));
   };
 
@@ -802,14 +793,11 @@ async function viewerPage() {
 
   const selectDatabase = db => {
     viewer.database = db;
-    viewer.chat = null;
     viewer.record = null;
     viewer.revealed = null;
     viewer.showMasked = false;
-    $('#chatsHead').hidden = !db;
-    $('#recordsHead').hidden = true;
+    $('#recordsHead').hidden = !db;
     $('#reportCard').hidden = true;
-    $('#chatList').replaceChildren();
     $('#recordList').replaceChildren();
     $$('#dbList > button').forEach(b => b.classList.toggle('on', b.dataset.id === (db && db.id)));
     //**agent TASK-225 [26.09.2026 04:30:00] кнопка в верхней панели: видна всегда, активна при выбранной базе
@@ -818,19 +806,7 @@ async function viewerPage() {
     $('#vExportBtn').title = db ? `Экспорт действующей настройки базы ${db.display_label || shortId(db.id)}` : 'Сначала выберите базу';
     //**agent TASK-225
     crumbs();
-    if (db) loadChats(db);
-  };
-
-  const selectChat = chat => {
-    viewer.chat = chat;
-    viewer.record = null;
-    viewer.revealed = null;
-    viewer.showMasked = false;
-    $('#recordsHead').hidden = false;
-    $('#reportCard').hidden = true;
-    $$('#chatList > button').forEach(b => b.classList.toggle('on', b.dataset.id === chat.chat_id));
-    crumbs();
-    loadHistory(chat);
+    if (db) loadHistory(db);
   };
 
   //++agent TASK-224 [24.09.2026] итерация 3
@@ -999,39 +975,14 @@ async function viewerPage() {
     }, 'Нет доступных баз');
   };
 
-  const loadChats = async db => {
-    const target = $('#chatList');
-    target.replaceChildren(el('p', 'empty', 'Загрузка…'));
-    try {
-      const chats = await api(`/api/v1/chats?database_id=${encodeURIComponent(db.id)}`);
-      listInto(target, chats, chat => {
-        const btn = el('button');
-        btn.type = 'button';
-        btn.dataset.id = chat.chat_id;
-        //++agent TASK-224 [08.10.2026] имя чата целиком; обрезка с конца
-        // через .clip (никаких middle-ellipsis от shortId), полное имя — title.
-        const name = el('span', 'mono small clip', chat.chat_id);
-        name.title = chat.chat_id;
-        btn.append(name, document.createElement('br'),
-          //--agent TASK-224
-          //**agent TASK-224 [25.09.2026 12:40:00] итерация 5: склонение
-          // el('span', 'small muted', `${chat.message_count} записей · ${fmtAgo(chat.last_message_at)}`));
-          el('span', 'small muted', `${chat.message_count} ${ruPlural(chat.message_count, 'запись', 'записи', 'записей')} · ${fmtAgo(chat.last_message_at)}`));
-          //**agent TASK-224
-        btn.addEventListener('click', () => selectChat(chat));
-        return btn;
-      }, 'В базе нет чатов');
-    } catch (error) {
-      if (error.status !== 401) target.replaceChildren(el('p', 'empty', error.message));
-    }
-  };
-
-  const loadHistory = async chat => {
+  // Лента истории базы: без разбивки по разговорам, вызывающий клиент —
+  // только подпись записи (самоназвание клиента, не идентичность).
+  const loadHistory = async db => {
     const target = $('#recordList');
     target.replaceChildren(el('p', 'empty', 'Загрузка…'));
     try {
       const items = await api(
-        `/api/v1/history?database_id=${encodeURIComponent(viewer.database.id)}&chat_id=${encodeURIComponent(chat.chat_id)}&limit=50`);
+        `/api/v1/history?database_id=${encodeURIComponent(db.id)}&limit=50`);
       listInto(target, items, item => {
         const btn = el('button');
         btn.type = 'button';
@@ -1046,10 +997,15 @@ async function viewerPage() {
         if (hit) tag.title = `${hit.title} (${hit.code})`;
         btn.append(el('b', '', fmtTime(item.created_at)), document.createTextNode(' '),
           el('span', 'mono small', item.tool_name), document.createElement('br'), tag);
+        if (item.caller_label) {
+          const client = el('span', 'small muted clip', ` ${item.caller_label}`);
+          client.title = `Клиент: ${item.caller_label}`;
+          btn.append(client);
+        }
         //**agent TASK-225
         btn.addEventListener('click', () => selectRecord(item));
         return btn;
-      }, 'В чате нет записей');
+      }, 'В базе нет записей');
     } catch (error) {
       if (error.status !== 401) target.replaceChildren(el('p', 'empty', error.message));
     }
@@ -1135,7 +1091,7 @@ async function viewerPage() {
     else if (record.database_id) lines.push(`- База: ${record.database_id}`);
     lines.push(`- Инструмент: ${record.tool_name}`);
     if (record.created_at) lines.push(`- Время: ${record.created_at}`);
-    if (record.chat_id) lines.push(`- Чат: ${record.chat_id}`);
+    if (record.caller_label) lines.push(`- Клиент: ${record.caller_label}`);
     let ids = `- id записи истории: ${record.id}`;
     const corr = /correlation_id\W{1,3}([0-9a-f-]{36})/i.exec((report.blocks || []).filter(b => b && b.kind === 'text').map(b => b.text).join('\n'));
     if (corr) ids += `; correlation_id: ${corr[1]}`;
@@ -4541,7 +4497,7 @@ async function adminPage() {
     const wrap = el('div', 'tablewrap');
     const table = el('table');
     const head = table.createTHead().insertRow();
-    ['Время', 'Инструмент', 'Чат', 'Изменения'].forEach(h => head.append(el('th', '', h)));
+    ['Время', 'Инструмент', 'Запрос / клиент', 'Изменения'].forEach(h => head.append(el('th', '', h)));
     const tb = table.createTBody();
     if (!visible.length) {
       const td = tb.insertRow().insertCell();
@@ -4553,9 +4509,9 @@ async function adminPage() {
       const tr = tb.insertRow();
       tr.className = `click${wiz.dryRec === rec.history_id ? ' on-row' : ''}`;
       tr.append(el('td', '', fmtTime(rec.created_at)), el('td', 'mono', rec.tool));
-      const chat = el('td', 'small clip', rec.title || rec.chat_id);
-      chat.title = rec.title || rec.chat_id;
-      tr.append(chat);
+      const caller = el('td', 'small clip', rec.title || rec.caller || '');
+      caller.title = rec.title || rec.caller || '';
+      tr.append(caller);
       const ch = el('td');
       if (rec.became_masked) ch.append(el('span', 'tag ok', `+${rec.became_masked}`), document.createTextNode(' '));
       if (rec.became_open) ch.append(el('span', 'tag err', `−${rec.became_open}`));

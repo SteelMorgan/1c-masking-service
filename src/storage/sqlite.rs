@@ -65,6 +65,10 @@ const DATABASE_IDENTITY_MIGRATION: &str =
 // применения — в initialize.
 const DATABASE_ACCESS_MIGRATION: &str =
     include_str!("../../migrations/0017_database_access.sql");
+/// Миграция 0018: вызовы без «разговора» — chat_id уходит из ключей,
+/// вызывающий хранится только как атрибут аудита caller_label.
+const CALLER_LABEL_MIGRATION: &str =
+    include_str!("../../migrations/0018_caller_instead_of_chat.sql");
 
 pub enum HistoryWrite {
     Inserted(Uuid),
@@ -96,7 +100,7 @@ pub struct DryRunRecord {
     pub id: Uuid,
     pub created_at: String,
     pub tool_name: String,
-    pub chat_id: String,
+    pub caller_label: Option<String>,
     pub call_id: Uuid,
     pub public_result: Value,
     pub mapping_batch_id: Option<Uuid>,
@@ -353,6 +357,15 @@ impl SqliteStorage {
         }
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (17, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        // Миграция 0018: guard каждой секции — фактическое наличие колонки
+        // chat_id, а не запись version=18, поэтому частично применённая
+        // схема достраивается по месту, а повторный старт — no-op. Записи,
+        // привязанные к chat_id, не переносятся (история очищается).
+        apply_caller_label_migration(&transaction)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (18, ?1)",
             [Utc::now().to_rfc3339()],
         )?;
         //++agent TASK-225
@@ -666,11 +679,10 @@ impl SqliteStorage {
     pub fn load_history(
         &self,
         database_id: Uuid,
-        chat_id: &str,
         call_id: Uuid,
     ) -> rusqlite::Result<Option<StoredHistory>> {
         self.with_connection(|connection| {
-            load_history_from(connection, database_id, chat_id, call_id)
+            load_history_from(connection, database_id, call_id)
         })
     }
 
@@ -678,7 +690,7 @@ impl SqliteStorage {
     pub fn write_history(
         &self,
         database_id: Uuid,
-        chat_id: &str,
+        caller_label: Option<&str>,
         call_id: Uuid,
         tool_name: &str,
         outcome: &str,
@@ -714,16 +726,16 @@ impl SqliteStorage {
                 return Ok(HistoryWrite::Conflict);
             }
             if matching_call_count == 1 {
-                let existing_scope: (String, String) = transaction.query_row(
-                    "SELECT database_id,chat_id FROM history WHERE call_id=?1",
+                let existing_database: String = transaction.query_row(
+                    "SELECT database_id FROM history WHERE call_id=?1",
                     [call_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )?;
-                if existing_scope != (database_id.to_string(), chat_id.to_owned()) {
+                if existing_database != database_id.to_string() {
                     transaction.commit()?;
                     return Ok(HistoryWrite::Conflict);
                 }
-                let existing = load_history_from(&transaction, database_id, chat_id, call_id)?
+                let existing = load_history_from(&transaction, database_id, call_id)?
                     .ok_or(rusqlite::Error::InvalidQuery)?;
                 transaction.commit()?;
                 return Ok(HistoryWrite::Existing(existing));
@@ -732,9 +744,9 @@ impl SqliteStorage {
             let created_at = Utc::now();
             let expires_at = created_at + Duration::seconds(history_ttl_seconds.min(i64::MAX as u64) as i64);
             transaction.execute(
-                "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id,mask_detail_json,field_sources_json,policy_id)
+                "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id,mask_detail_json,field_sources_json,policy_id)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                params![id.to_string(), database_id.to_string(), chat_id, call_id.to_string(), tool_name, outcome,
+                params![id.to_string(), database_id.to_string(), caller_label, call_id.to_string(), tool_name, outcome,
                     policy_version,
                     serde_json::to_string(mask_reasons).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     serde_json::to_string(public_result).map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -747,9 +759,9 @@ impl SqliteStorage {
                 //++agent TASK-225
             )?;
             transaction.execute(
-                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,caller_label,history_id,outcome,code,correlation_id,created_at)
                  VALUES ('service',NULL,'call.finalize',?1,?2,?3,'success',NULL,?4,?5)",
-                params![database_id.to_string(), chat_id, id.to_string(), correlation_id.to_string(), created_at.to_rfc3339()],
+                params![database_id.to_string(), caller_label, id.to_string(), correlation_id.to_string(), created_at.to_rfc3339()],
             )?;
             transaction.commit()?;
             Ok(HistoryWrite::Inserted(id))
@@ -760,7 +772,7 @@ impl SqliteStorage {
     pub fn write_scoped_terminal(
         &self,
         database_id: Uuid,
-        chat_id: &str,
+        caller_label: Option<&str>,
         call_id: Uuid,
         tool_name: &str,
         error_code: &str,
@@ -780,7 +792,7 @@ impl SqliteStorage {
             let write = write_scoped_terminal_tx(
                 &transaction,
                 database_id,
-                chat_id,
+                caller_label,
                 call_id,
                 tool_name,
                 error_code,
@@ -805,7 +817,7 @@ impl SqliteStorage {
     pub fn write_tool_pending_review(
         &self,
         database_id: Uuid,
-        chat_id: &str,
+        caller_label: Option<&str>,
         call_id: Uuid,
         tool_name: &str,
         public_result: &Value,
@@ -819,7 +831,7 @@ impl SqliteStorage {
             let write = write_scoped_terminal_tx(
                 &transaction,
                 database_id,
-                chat_id,
+                caller_label,
                 call_id,
                 tool_name,
                 "TOOL_PENDING_REVIEW",
@@ -831,7 +843,7 @@ impl SqliteStorage {
             if let Err(error) = account_pending_review_denial(
                 &transaction,
                 database_id,
-                chat_id,
+                caller_label,
                 tool_name,
                 correlation_id,
                 write,
@@ -910,7 +922,7 @@ impl SqliteStorage {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,caller_label,history_id,outcome,code,correlation_id,created_at)
                  VALUES ('service',NULL,'call.terminal.unscoped',NULL,NULL,NULL,'denied',?1,?2,?3)",
                 params![error_code, correlation_id.to_string(), created_at.to_rfc3339()],
             )?;
@@ -922,15 +934,15 @@ impl SqliteStorage {
     pub fn audit_denial(
         &self,
         database_id: Uuid,
-        chat_id: &str,
+        caller_label: Option<&str>,
         correlation_id: Uuid,
         code: &str,
     ) -> rusqlite::Result<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO audit_events(actor_kind,action,database_id,chat_id,outcome,code,correlation_id,created_at)
+                "INSERT INTO audit_events(actor_kind,action,database_id,caller_label,outcome,code,correlation_id,created_at)
                  VALUES ('service','call.denied',?1,?2,'denied',?3,?4,?5)",
-                params![database_id.to_string(), chat_id, code, correlation_id.to_string(), Utc::now().to_rfc3339()],
+                params![database_id.to_string(), caller_label, code, correlation_id.to_string(), Utc::now().to_rfc3339()],
             )?;
             Ok(())
         })
@@ -962,7 +974,7 @@ impl SqliteStorage {
         &self,
         call_id: Uuid,
         database_id: Uuid,
-        chat_id: &str,
+        caller_label: Option<&str>,
         tool_name: &str,
         title: Option<&str>,
         ttl_seconds: u64,
@@ -970,13 +982,13 @@ impl SqliteStorage {
         self.with_connection(|connection| {
             let now = Utc::now();
             connection.execute(
-                "INSERT INTO call_contexts(call_id,database_id,chat_id,tool_name,title,created_at,expires_at)
+                "INSERT INTO call_contexts(call_id,database_id,caller_label,tool_name,title,created_at,expires_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)
                  ON CONFLICT(call_id) DO NOTHING",
                 params![
                     call_id.to_string(),
                     database_id.to_string(),
-                    chat_id,
+                    caller_label,
                     tool_name,
                     title,
                     now.to_rfc3339(),
@@ -1083,7 +1095,7 @@ impl SqliteStorage {
     ) -> rusqlite::Result<Vec<DryRunRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id,created_at,tool_name,chat_id,call_id,public_result_json,
+                "SELECT id,created_at,tool_name,caller_label,call_id,public_result_json,
                         mapping_batch_id,field_sources_json,mask_detail_json
                  FROM history
                  WHERE database_id=?1 AND outcome='tool_result'
@@ -1098,7 +1110,7 @@ impl SqliteStorage {
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         created_at: row.get(1)?,
                         tool_name: row.get(2)?,
-                        chat_id: row.get(3)?,
+                        caller_label: row.get(3)?,
                         call_id: Uuid::parse_str(&row.get::<_, String>(4)?)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         public_result: serde_json::from_str(&public)
@@ -1130,7 +1142,7 @@ impl SqliteStorage {
     //++agent TASK-225
 
     /// B9/§6.3: запись истории для отчёта причин — без фильтра срока
-    /// (истёкшая отличается кодом HISTORY_EXPIRED), без chat-scope
+    /// (истёкшая отличается кодом HISTORY_EXPIRED)
     /// (role-based доступ на уровне API — как reveal).
     pub fn history_reasons_record(
         &self,
@@ -1169,17 +1181,15 @@ impl SqliteStorage {
         &self,
         history_id: Uuid,
         database_id: Uuid,
-        chat_id: &str,
     ) -> rusqlite::Result<Option<HistoryForReveal>> {
         self.with_connection(|connection| {
             connection
                 .query_row(
                     "SELECT report_json,mapping_batch_id FROM history
-                 WHERE id=?1 AND database_id=?2 AND chat_id=?3 AND expires_at>?4",
+                 WHERE id=?1 AND database_id=?2 AND expires_at>?3",
                     params![
                         history_id.to_string(),
                         database_id.to_string(),
-                        chat_id,
                         Utc::now().to_rfc3339()
                     ],
                     |row| {
@@ -1315,16 +1325,14 @@ fn find_database(
 fn load_history_from(
     connection: &Connection,
     database_id: Uuid,
-    chat_id: &str,
     call_id: Uuid,
 ) -> rusqlite::Result<Option<StoredHistory>> {
     connection
         .query_row(
             "SELECT id,public_result_json FROM history
-         WHERE database_id=?1 AND chat_id=?2 AND call_id=?3 AND expires_at>?4",
+         WHERE database_id=?1 AND call_id=?2 AND expires_at>?3",
             params![
                 database_id.to_string(),
-                chat_id,
                 call_id.to_string(),
                 Utc::now().to_rfc3339()
             ],
@@ -1492,7 +1500,7 @@ fn valid_filter_operand(value: &Value) -> bool {
 fn write_scoped_terminal_tx(
     transaction: &rusqlite::Transaction<'_>,
     database_id: Uuid,
-    chat_id: &str,
+    caller_label: Option<&str>,
     call_id: Uuid,
     tool_name: &str,
     error_code: &str,
@@ -1511,7 +1519,7 @@ fn write_scoped_terminal_tx(
     }
     let existing = transaction
         .query_row(
-            "SELECT h.database_id,h.chat_id,h.tool_name,h.outcome,
+            "SELECT h.database_id,h.tool_name,h.outcome,
                     h.public_result_json,h.report_json,a.code,a.correlation_id
              FROM history h
              LEFT JOIN audit_events a ON a.history_id=h.id AND a.action='call.denied'
@@ -1524,9 +1532,8 @@ fn write_scoped_terminal_tx(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -1544,7 +1551,6 @@ fn write_scoped_terminal_tx(
     let report_json = serde_json::to_string(report).map_err(|_| rusqlite::Error::InvalidQuery)?;
     if let Some((
         stored_db,
-        stored_chat,
         stored_tool,
         outcome,
         stored_public,
@@ -1556,7 +1562,6 @@ fn write_scoped_terminal_tx(
         let expected_correlation = correlation_id.to_string();
         return Ok(
             if stored_db == database_id.to_string()
-                && stored_chat == chat_id
                 && stored_tool == tool_name
                 && outcome == "terminal_denial"
                 && stored_public == public_json
@@ -1577,12 +1582,12 @@ fn write_scoped_terminal_tx(
     let reasons = serde_json::to_string(&[format!("service:terminal:{error_code}")])
         .map_err(|_| rusqlite::Error::InvalidQuery)?;
     transaction.execute(
-        "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id)
+        "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,mask_reasons_json,public_result_json,report_json,created_at,expires_at,mapping_batch_id)
          VALUES (?1,?2,?3,?4,?5,'terminal_denial',0,?6,?7,?8,?9,?10,NULL)",
         params![
             id.to_string(),
             database_id.to_string(),
-            chat_id,
+            caller_label,
             call_id.to_string(),
             tool_name,
             reasons,
@@ -1593,11 +1598,11 @@ fn write_scoped_terminal_tx(
         ],
     )?;
     transaction.execute(
-        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,caller_label,history_id,outcome,code,correlation_id,created_at)
          VALUES ('service',NULL,'call.denied',?1,?2,?3,'denied',?4,?5,?6)",
         params![
             database_id.to_string(),
-            chat_id,
+            caller_label,
             id.to_string(),
             error_code,
             correlation_id.to_string(),
@@ -1617,7 +1622,7 @@ fn write_scoped_terminal_tx(
 fn account_pending_review_denial(
     transaction: &rusqlite::Transaction<'_>,
     database_id: Uuid,
-    chat_id: &str,
+    caller_label: Option<&str>,
     tool_name: &str,
     correlation_id: Uuid,
     counted: TerminalWrite,
@@ -1629,7 +1634,7 @@ fn account_pending_review_denial(
             audit_call_denied(
                 transaction,
                 database_id,
-                chat_id,
+                caller_label,
                 "TOOL_NAME_INVALID",
                 correlation_id,
             )?;
@@ -1664,7 +1669,7 @@ fn account_pending_review_denial(
                     audit_call_denied(
                         transaction,
                         database_id,
-                        chat_id,
+                        caller_label,
                         "TOOL_AUTOADD_LIMIT",
                         correlation_id,
                     )?;
@@ -1699,16 +1704,16 @@ fn valid_auto_tool_name(tool_name: &str) -> bool {
 fn audit_call_denied(
     transaction: &rusqlite::Transaction<'_>,
     database_id: Uuid,
-    chat_id: &str,
+    caller_label: Option<&str>,
     code: &str,
     correlation_id: Uuid,
 ) -> rusqlite::Result<()> {
     transaction.execute(
-        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,chat_id,history_id,outcome,code,correlation_id,created_at)
+        "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,caller_label,history_id,outcome,code,correlation_id,created_at)
          VALUES ('service',NULL,'call.denied',?1,?2,NULL,'denied',?3,?4,?5)",
         params![
             database_id.to_string(),
-            chat_id,
+            caller_label,
             code,
             correlation_id.to_string(),
             Utc::now().to_rfc3339()
@@ -1819,6 +1824,39 @@ fn apply_add_column_migration_set(
 /// Вырезает секцию `-- == NAME ==` из файла миграции, размеченного
 /// такими маркерами (многофазные миграции вроде 0017). Отсутствие метки —
 /// ошибка файла, а не пустая миграция.
+fn table_has_column(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        params![table, column],
+        |row| row.get(0),
+    )
+}
+
+/// Миграция 0018 по секциям с guard по фактической схеме.
+fn apply_caller_label_migration(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let history_legacy = table_has_column(transaction, "history", "chat_id")?;
+    let receipts_legacy = table_has_column(transaction, "v2_call_receipts", "chat_id")?;
+    if history_legacy || receipts_legacy {
+        transaction.execute_batch(migration_section(CALLER_LABEL_MIGRATION, "RECEIPTS-DROP")?)?;
+    }
+    if history_legacy {
+        transaction
+            .execute_batch(migration_section(CALLER_LABEL_MIGRATION, "HISTORY-RECREATE")?)?;
+    }
+    if table_has_column(transaction, "call_contexts", "chat_id")? {
+        transaction
+            .execute_batch(migration_section(CALLER_LABEL_MIGRATION, "CONTEXTS-RECREATE")?)?;
+    }
+    if table_has_column(transaction, "audit_events", "chat_id")? {
+        transaction.execute_batch(migration_section(CALLER_LABEL_MIGRATION, "AUDIT-RENAME")?)?;
+    }
+    Ok(())
+}
+
 fn migration_section<'a>(ddl: &'a str, name: &str) -> rusqlite::Result<&'a str> {
     let marker = format!("-- == {name} ==");
     let Some(start) = ddl.find(&marker) else {

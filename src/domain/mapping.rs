@@ -16,7 +16,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct MappingLimits {
     pub service_entries: usize,
     pub database_entries: usize,
-    pub chat_entries: usize,
     pub candidates_per_call: usize,
 }
 
@@ -25,7 +24,6 @@ impl Default for MappingLimits {
         Self {
             service_entries: 100_000,
             database_entries: 20_000,
-            chat_entries: 10_000,
             candidates_per_call: 10_000,
         }
     }
@@ -36,7 +34,6 @@ pub struct MappingCandidate {
     pub token: String,
     pub original: String,
     pub database_id: Uuid,
-    pub chat_id: String,
     pub category: String,
     pub batch_id: Uuid,
     pub created_at: DateTime<Utc>,
@@ -48,7 +45,6 @@ pub struct MappingCandidate {
 struct MappingEntry {
     original: String,
     database_id: Uuid,
-    chat_id: String,
     category: String,
     batch_ids: HashSet<Uuid>,
     created_at: DateTime<Utc>,
@@ -84,18 +80,20 @@ impl MappingStore {
         self.by_token.is_empty()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Токен для значения в пределах базы. Ключ поиска — (база,
+    /// категория, значение): любой вызывающий той же базы получает тот же
+    /// токен, пока запись жива в памяти процесса. Сам токен случайный и
+    /// из значения не выводим; после рестарта сервиса выдаются новые.
     pub fn plan_token(
         &self,
         candidates: &mut Vec<MappingCandidate>,
         database_id: Uuid,
-        chat_id: &str,
         category: &str,
         original: &str,
         batch_id: Uuid,
         ttl_seconds: u64,
     ) -> Result<String, ProcessingError> {
-        let reverse_key = self.reverse_key(database_id, chat_id, category, original);
+        let reverse_key = self.reverse_key(database_id, category, original);
         if let Some(existing) = candidates
             .iter()
             .find(|entry| entry.reverse_key == reverse_key)
@@ -116,11 +114,10 @@ impl MappingStore {
                     token: token.clone(),
                     original: original.to_owned(),
                     database_id,
-                    chat_id: chat_id.to_owned(),
                     category: category.to_owned(),
                     batch_id,
                     created_at: entry.created_at,
-                    expires_at: entry.expires_at,
+                    expires_at: ttl_deadline(Utc::now(), ttl_seconds).max(entry.expires_at),
                     reverse_key,
                 });
                 return Ok(token.clone());
@@ -138,11 +135,10 @@ impl MappingStore {
             token: token.clone(),
             original: original.to_owned(),
             database_id,
-            chat_id: chat_id.to_owned(),
             category,
             batch_id,
             created_at,
-            expires_at: created_at + Duration::seconds(ttl_seconds.min(i64::MAX as u64) as i64),
+            expires_at: ttl_deadline(created_at, ttl_seconds),
             reverse_key,
         });
         Ok(token)
@@ -151,10 +147,16 @@ impl MappingStore {
     pub fn publish(&mut self, candidates: Vec<MappingCandidate>) -> Result<(), ProcessingError> {
         self.cleanup(2_000);
         self.can_publish(&candidates)?;
+        self.evict_for(&candidates);
+        let now = Utc::now();
         for candidate in candidates {
             if let Some(token) = self.by_reverse.get(&candidate.reverse_key) {
                 if let Some(entry) = self.by_token.get_mut(token) {
                     entry.batch_ids.insert(candidate.batch_id);
+                    // Повторная выдача значения — использование записи:
+                    // продлевает срок и защищает от LRU-вытеснения.
+                    entry.last_read_at = Some(now);
+                    entry.expires_at = entry.expires_at.max(candidate.expires_at);
                 }
                 continue;
             }
@@ -165,7 +167,6 @@ impl MappingStore {
                 MappingEntry {
                     original: candidate.original,
                     database_id: candidate.database_id,
-                    chat_id: candidate.chat_id,
                     category: candidate.category,
                     batch_ids: HashSet::from([candidate.batch_id]),
                     created_at: candidate.created_at,
@@ -178,25 +179,53 @@ impl MappingStore {
         Ok(())
     }
 
+    /// Отказ только когда батч сам не помещается в лимиты: переполнение
+    /// общей таблицы базы не отклоняет вызов, а вытесняет самые давно
+    /// использованные записи вне текущего батча (см. `evict_for`).
     pub fn can_publish(&self, candidates: &[MappingCandidate]) -> Result<(), ProcessingError> {
-        let new_count = candidates
+        let new_candidates: Vec<&MappingCandidate> = candidates
             .iter()
             .filter(|candidate| !self.by_reverse.contains_key(&candidate.reverse_key))
-            .count();
-        if self.by_token.len().saturating_add(new_count) > self.limits.service_entries {
+            .collect();
+        if new_candidates.len() > self.limits.service_entries {
             return Err(ProcessingError);
         }
         let mut additions_by_database: HashMap<Uuid, usize> = HashMap::new();
-        let mut additions_by_chat: HashMap<(Uuid, &str), usize> = HashMap::new();
-        for candidate in candidates
-            .iter()
-            .filter(|item| !self.by_reverse.contains_key(&item.reverse_key))
-        {
+        for candidate in &new_candidates {
             *additions_by_database
                 .entry(candidate.database_id)
                 .or_default() += 1;
-            *additions_by_chat
-                .entry((candidate.database_id, candidate.chat_id.as_str()))
+        }
+        if additions_by_database
+            .values()
+            .any(|additions| *additions > self.limits.database_entries)
+        {
+            return Err(ProcessingError);
+        }
+        Ok(())
+    }
+
+    /// LRU-вытеснение перед публикацией: освобождает место под новые
+    /// записи батча по лимиту базы и общему лимиту сервиса. Записи,
+    /// которые батч переиспользует, не трогаются. Порядок — по
+    /// max(last_read_at, created_at), самые старые первыми.
+    fn evict_for(&mut self, candidates: &[MappingCandidate]) {
+        let protected: HashSet<[u8; 32]> = candidates
+            .iter()
+            .map(|candidate| candidate.reverse_key)
+            .collect();
+        let mut additions_by_database: HashMap<Uuid, usize> = HashMap::new();
+        let mut new_total = 0_usize;
+        let mut seen = HashSet::new();
+        for candidate in candidates {
+            if self.by_reverse.contains_key(&candidate.reverse_key)
+                || !seen.insert(candidate.reverse_key)
+            {
+                continue;
+            }
+            new_total += 1;
+            *additions_by_database
+                .entry(candidate.database_id)
                 .or_default() += 1;
         }
         for (database_id, additions) in additions_by_database {
@@ -205,32 +234,53 @@ impl MappingStore {
                 .values()
                 .filter(|entry| entry.database_id == database_id)
                 .count();
-            if current.saturating_add(additions) > self.limits.database_entries {
-                return Err(ProcessingError);
-            }
+            let overflow = (current + additions).saturating_sub(self.limits.database_entries);
+            self.evict_oldest(overflow, Some(database_id), &protected);
         }
-        for ((database_id, chat_id), additions) in additions_by_chat {
-            let current = self
-                .by_token
-                .values()
-                .filter(|entry| entry.database_id == database_id && entry.chat_id == chat_id)
-                .count();
-            if current.saturating_add(additions) > self.limits.chat_entries {
-                return Err(ProcessingError);
-            }
-        }
-        Ok(())
+        let overflow =
+            (self.by_token.len() + new_total).saturating_sub(self.limits.service_entries);
+        self.evict_oldest(overflow, None, &protected);
     }
 
-    pub fn resolve(&mut self, database_id: Uuid, chat_id: &str, token: &str) -> Option<String> {
+    fn evict_oldest(
+        &mut self,
+        count: usize,
+        database_id: Option<Uuid>,
+        protected: &HashSet<[u8; 32]>,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut victims: Vec<(DateTime<Utc>, String)> = self
+            .by_token
+            .iter()
+            .filter(|(_, entry)| {
+                database_id.is_none_or(|id| entry.database_id == id)
+                    && !protected.contains(&entry.reverse_key)
+            })
+            .map(|(token, entry)| {
+                let used = entry
+                    .last_read_at
+                    .map_or(entry.created_at, |read| read.max(entry.created_at));
+                (used, token.clone())
+            })
+            .collect();
+        victims.sort();
+        for (_, token) in victims.into_iter().take(count) {
+            if let Some(entry) = self.by_token.remove(&token) {
+                self.by_reverse.remove(&entry.reverse_key);
+            }
+        }
+    }
+
+    pub fn resolve(&mut self, database_id: Uuid, token: &str) -> Option<String> {
         let now = Utc::now();
         let entry = self.by_token.get_mut(token)?;
         if !token.starts_with(&format!("[MASK:v1:{}:", entry.category)) {
             return None;
         }
         let same_database = bool::from(entry.database_id.as_bytes().ct_eq(database_id.as_bytes()));
-        let same_chat = bool::from(entry.chat_id.as_bytes().ct_eq(chat_id.as_bytes()));
-        if !same_database || !same_chat || entry.expires_at <= now {
+        if !same_database || entry.expires_at <= now {
             return None;
         }
         entry.last_read_at = Some(now);
@@ -240,7 +290,6 @@ impl MappingStore {
     pub fn resolve_for_batch(
         &mut self,
         database_id: Uuid,
-        chat_id: &str,
         batch_id: Uuid,
         token: &str,
     ) -> Option<String> {
@@ -250,12 +299,7 @@ impl MappingStore {
             return None;
         }
         let same_database = bool::from(entry.database_id.as_bytes().ct_eq(database_id.as_bytes()));
-        let same_chat = bool::from(entry.chat_id.as_bytes().ct_eq(chat_id.as_bytes()));
-        if !same_database
-            || !same_chat
-            || !entry.batch_ids.contains(&batch_id)
-            || entry.expires_at <= now
-        {
+        if !same_database || !entry.batch_ids.contains(&batch_id) || entry.expires_at <= now {
             return None;
         }
         entry.last_read_at = Some(now);
@@ -289,24 +333,20 @@ impl MappingStore {
         expired.len()
     }
 
-    fn reverse_key(
-        &self,
-        database_id: Uuid,
-        chat_id: &str,
-        category: &str,
-        original: &str,
-    ) -> [u8; 32] {
+    fn reverse_key(&self, database_id: Uuid, category: &str, original: &str) -> [u8; 32] {
         let mut mac =
             HmacSha256::new_from_slice(&self.hmac_key).expect("HMAC accepts a 32 byte key");
         mac.update(database_id.as_bytes());
-        mac.update(&[0]);
-        mac.update(chat_id.as_bytes());
         mac.update(&[0]);
         mac.update(category.as_bytes());
         mac.update(&[0]);
         mac.update(original.as_bytes());
         mac.finalize().into_bytes().into()
     }
+}
+
+fn ttl_deadline(from: DateTime<Utc>, ttl_seconds: u64) -> DateTime<Utc> {
+    from + Duration::seconds(ttl_seconds.min(i64::MAX as u64) as i64)
 }
 
 fn sanitize_category(category: &str) -> String {

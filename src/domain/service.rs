@@ -24,7 +24,7 @@ use super::{
     TerminalScopeKind, ToolClass, SCHEMA_VERSION,
 };
 
-type CallKey = (Uuid, String, Uuid);
+type CallKey = (Uuid, Uuid);
 
 const VERIFIED_TERMINAL_CODES: &[&str] = &[
     "ACTION_REQUIRED",
@@ -43,11 +43,7 @@ const VERIFIED_TERMINAL_CODES: &[&str] = &[
     "HISTORY_UNAVAILABLE",
 ];
 
-const UNVERIFIED_TERMINAL_CODES: &[&str] = &[
-    "CHAT_IDENTITY_REQUIRED",
-    "DATABASE_IDENTITY_UNVERIFIED",
-    "SERVICE_NOT_READY",
-];
+const UNVERIFIED_TERMINAL_CODES: &[&str] = &["DATABASE_IDENTITY_UNVERIFIED", "SERVICE_NOT_READY"];
 
 //++agent TASK-225 [27.09.2026 00:00:00] S: белый список инструментов
 // ненастроенной базы — только чтение метаданных (данных в ответе нет);
@@ -386,11 +382,10 @@ impl MaskingService {
         &self,
         history_id: Uuid,
         database_id: Uuid,
-        chat_id: &str,
     ) -> Result<Value, ServiceError> {
         let history = self
             .storage
-            .history_for_reveal(history_id, database_id, chat_id)
+            .history_for_reveal(history_id, database_id)
             .map_err(|_| ServiceError::new(ErrorCode::HistoryUnavailable, Uuid::nil()))?
             .ok_or_else(|| ServiceError::new(ErrorCode::HistoryUnavailable, Uuid::nil()))?;
         let Some(batch_id) = history.mapping_batch_id else {
@@ -398,13 +393,7 @@ impl MaskingService {
         };
         let mut mappings = self.mappings.write().await;
         self.engine
-            .resolve_tokens_for_batch(
-                &history.report,
-                database_id,
-                chat_id,
-                batch_id,
-                &mut mappings,
-            )
+            .resolve_tokens_for_batch(&history.report, database_id, batch_id, &mut mappings)
             .map_err(|_| ServiceError::new(ErrorCode::MappingUnavailable, Uuid::nil()))
     }
 
@@ -414,7 +403,7 @@ impl MaskingService {
     ) -> Result<PreflightResponse, ServiceError> {
         validate_common(
             request.schema_version,
-            &request.chat_id,
+            request.caller.as_deref(),
             &request.tool_name,
             request.correlation_id,
         )?;
@@ -445,7 +434,7 @@ impl MaskingService {
         let _ = self.storage.write_call_context(
             request.call_id,
             database_id,
-            &request.chat_id,
+            request.caller.as_deref(),
             &request.tool_name,
             call_title.as_deref(),
             effective_history_ttl(&settings),
@@ -536,12 +525,10 @@ impl MaskingService {
         let can_resolve = class == ToolClass::DataMask && settings.mode == DatabaseMode::Enabled;
         let arguments = if can_resolve {
             let mut mappings = self.mappings.write().await;
-            match self.engine.resolve_tokens(
-                &request.arguments,
-                database_id,
-                &request.chat_id,
-                &mut mappings,
-            ) {
+            match self
+                .engine
+                .resolve_tokens(&request.arguments, database_id, &mut mappings)
+            {
                 Ok(arguments) => {
                     //++agent TASK-225 [26.09.2026] ревью-2 N-1
                     // Факт резолва хотя бы одного токена — durable-флаг
@@ -612,10 +599,7 @@ impl MaskingService {
             TerminalScopeKind::Verified => {
                 //++agent TASK-225 [26.09.2026] O2: verified-scope несёт
                 // точный ключ instance_id (+Srvr/Ref для отображения).
-                let (Some(instance_id), Some(chat_id)) = (
-                    request.scope.instance_id.as_deref(),
-                    request.scope.chat_id.as_deref(),
-                ) else {
+                let Some(instance_id) = request.scope.instance_id.as_deref() else {
                     return Err(ServiceError::new(
                         ErrorCode::PolicyInvalid,
                         request.correlation_id,
@@ -627,8 +611,7 @@ impl MaskingService {
                     infobase_name: request.scope.infobase_name.clone().unwrap_or_default(),
                 };
                 //++agent TASK-225
-                if chat_id.is_empty()
-                    || chat_id.len() > 512
+                if !valid_caller(request.scope.caller.as_deref())
                     || !VERIFIED_TERMINAL_CODES.contains(&request.error_code.as_str())
                 {
                     return Err(ServiceError::new(
@@ -659,7 +642,7 @@ impl MaskingService {
                 );
                 self.storage.write_scoped_terminal(
                     database_id,
-                    chat_id,
+                    request.scope.caller.as_deref(),
                     request.call_id,
                     &request.tool_name,
                     &request.error_code,
@@ -674,7 +657,7 @@ impl MaskingService {
                 if request.scope.instance_id.is_some()
                     || request.scope.cluster_server.is_some()
                     || request.scope.infobase_name.is_some()
-                    || request.scope.chat_id.is_some()
+                    || !valid_caller(request.scope.caller.as_deref())
                     || !UNVERIFIED_TERMINAL_CODES.contains(&request.error_code.as_str())
                 {
                     return Err(ServiceError::new(
@@ -710,7 +693,7 @@ impl MaskingService {
     ) -> Result<FinalizeResponse, ServiceError> {
         validate_common(
             request.schema_version,
-            &request.chat_id,
+            request.caller.as_deref(),
             &request.tool_name,
             request.correlation_id,
         )?;
@@ -724,7 +707,7 @@ impl MaskingService {
             .admission_for(database_id, request.correlation_id)?
             .lock_owned()
             .await;
-        let key = (database_id, request.chat_id.clone(), request.call_id);
+        let key = (database_id, request.call_id);
         let cached = self.completed_responses.lock().ok().and_then(|mut cache| {
             if cache
                 .get(&key)
@@ -742,7 +725,7 @@ impl MaskingService {
         }
         if let Some(history) = self
             .storage
-            .load_history(database_id, &request.chat_id, request.call_id)
+            .load_history(database_id, request.call_id)
             .map_err(|_| ServiceError::new(ErrorCode::HistoryUnavailable, request.correlation_id))?
         {
             return Ok(FinalizeResponse {
@@ -918,7 +901,6 @@ impl MaskingService {
         let masked = match self.engine.mask(
             &cut_result,
             database_id,
-            &request.chat_id,
             batch_id,
             settings.mapping_ttl_seconds,
             &policy,
@@ -1013,7 +995,7 @@ impl MaskingService {
             .storage
             .write_history(
                 database_id,
-                &request.chat_id,
+                request.caller.as_deref(),
                 request.call_id,
                 &request.tool_name,
                 outcome_name,
@@ -1202,7 +1184,6 @@ impl MaskingService {
                         .resolve_tokens_for_batch(
                             &masked_value,
                             database_id,
-                            &record.chat_id,
                             batch_id,
                             &mut mappings,
                         )
@@ -1227,7 +1208,6 @@ impl MaskingService {
             let _after_active = self.engine.mask(
                 &resolved,
                 database_id,
-                &record.chat_id,
                 Uuid::nil(),
                 settings.mapping_ttl_seconds,
                 &active,
@@ -1239,7 +1219,6 @@ impl MaskingService {
             let after_draft = self.engine.mask(
                 &resolved,
                 database_id,
-                &record.chat_id,
                 Uuid::nil(),
                 settings.mapping_ttl_seconds,
                 to,
@@ -1345,7 +1324,7 @@ impl MaskingService {
                 "history_id": record.id,
                 "created_at": record.created_at,
                 "tool": record.tool_name,
-                "chat_id": record.chat_id,
+                "caller": record.caller_label,
                 "title": title,
                 "became_masked": masked_count,
                 "became_open": open_count,
@@ -1587,7 +1566,7 @@ impl MaskingService {
             .storage
             .write_history(
                 database_id,
-                &request.chat_id,
+                request.caller.as_deref(),
                 request.call_id,
                 &request.tool_name,
                 outcome,
@@ -1616,7 +1595,7 @@ impl MaskingService {
             }
         };
         self.cache_response(
-            (database_id, request.chat_id.clone(), request.call_id),
+            (database_id, request.call_id),
             public_result.clone(),
             effective_history_ttl(settings),
         );
@@ -1655,7 +1634,7 @@ impl MaskingService {
             .storage
             .write_scoped_terminal(
                 database_id,
-                &request.chat_id,
+                request.caller.as_deref(),
                 request.call_id,
                 &request.tool_name,
                 code.as_str(),
@@ -1709,7 +1688,7 @@ impl MaskingService {
             .storage
             .write_tool_pending_review(
                 database_id,
-                &request.chat_id,
+                request.caller.as_deref(),
                 request.call_id,
                 &request.tool_name,
                 &public_result,
@@ -1742,15 +1721,21 @@ fn bounded_env_usize(name: &str, default: usize, minimum: usize, maximum: usize)
         .unwrap_or(default)
 }
 
+/// Метка вызывающего — только атрибут аудита: клиент называет себя сам,
+/// поэтому ни одно решение доступа от неё не зависит. Проверяется лишь
+/// форма: не длиннее 256 символов и без управляющих символов.
+fn valid_caller(caller: Option<&str>) -> bool {
+    caller.is_none_or(|value| value.chars().count() <= 256 && !value.chars().any(char::is_control))
+}
+
 fn validate_common(
     schema_version: u32,
-    chat_id: &str,
+    caller: Option<&str>,
     tool_name: &str,
     correlation_id: Uuid,
 ) -> Result<(), ServiceError> {
     if schema_version != SCHEMA_VERSION
-        || chat_id.is_empty()
-        || chat_id.len() > 512
+        || !valid_caller(caller)
         || tool_name.is_empty()
         || tool_name.len() > 128
     {
@@ -2096,7 +2081,6 @@ fn safe_terminal_error(code: &str, correlation_id: Uuid) -> Value {
         "ACTION_REQUIRED" => "База требует настройки пользователем",
         "TOOL_PENDING_REVIEW" => "Инструмент ожидает проверки",
         "MASK_TOKEN_INVALID" => "Значение недоступно",
-        "CHAT_IDENTITY_REQUIRED" => "Требуется подтверждённый контекст диалога",
         "DATABASE_IDENTITY_UNVERIFIED" => "Идентичность базы не подтверждена",
         //++agent TASK-225 [26.09.2026] фаза-2 C: терминальная запись
         // прогрева — без N (оценка живёт в ответе вызова, не в истории).
@@ -2765,10 +2749,10 @@ mod tests {
                     rusqlite::params![database_id.to_string(), Uuid::new_v4().to_string()],
                 )?;
                 connection.execute(
-                    "INSERT INTO history(id,database_id,chat_id,call_id,tool_name,outcome,
+                    "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,
                             policy_version,mask_reasons_json,public_result_json,report_json,
                             created_at,expires_at,mapping_batch_id,field_sources_json)
-                     VALUES (?1,?2,'chat',?3,'execute_query','tool_result',1,'[]',
+                     VALUES (?1,?2,'test-client',?3,'execute_query','tool_result',1,'[]',
                             '{\"content\":[]}','{}','2026-01-02T00:00:00Z',
                             '2999-01-01T00:00:00Z',?4,'{}')",
                     rusqlite::params![
@@ -2904,7 +2888,6 @@ mod tests {
             .mask(
                 &json!({"columns": ["префикс СекретноеЗначение суффикс"]}),
                 database_id,
-                "chat",
                 Uuid::new_v4(),
                 3600,
                 &merged,

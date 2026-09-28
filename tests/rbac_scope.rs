@@ -383,7 +383,7 @@ async fn t4_history_of_foreign_database_is_not_found() {
         let inserted = storage
             .write_history(
                 database_id,
-                "chat",
+                Some("chat"),
                 Uuid::new_v4(),
                 "execute_query",
                 "tool_result",
@@ -575,8 +575,8 @@ async fn t7_revoke_takes_effect_on_next_request() {
         .unwrap()
         .user_id;
 
-    // Пока доступ есть — чат-лист базы отдаёт 200.
-    let uri = format!("/api/v1/chats?database_id={a}");
+    // Пока доступ есть — лента истории базы отдаёт 200.
+    let uri = format!("/api/v1/history?database_id={a}");
     assert_eq!(
         app.clone()
             .oneshot(get(&uri, &viewer))
@@ -584,6 +584,17 @@ async fn t7_revoke_takes_effect_on_next_request() {
             .unwrap()
             .status(),
         StatusCode::OK
+    );
+    // Лента чужой базы (доступ не выдан) — 404, как промах.
+    let foreign = Uuid::new_v4();
+    seed_db(&storage, foreign);
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/history?database_id={foreign}"), &viewer))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
     );
 
     // Отзыв (полная замена набора пустым) — той же сессией админа.

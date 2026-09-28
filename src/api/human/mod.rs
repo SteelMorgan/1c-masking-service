@@ -13,7 +13,7 @@ use axum::{
 };
 
 pub use model::{
-    AdminDatabasePatch, ChatSummary, CreatePolicyRequest, DatabaseSummary, DictionaryConfig,
+    AdminDatabasePatch, CreatePolicyRequest, DatabaseSummary, DictionaryConfig,
     DictionaryConfigView, DictionarySelectorConfig, DictionarySelectorView, HistoryItem,
     HumanDataError, HumanDataStore, MetadataNode, MetadataNodesPage, NeutralBlock, NeutralColumn,
     NeutralReport, PolicyRuleInput, PolicySummary, ToolClassification, ToolClassificationPatch,
@@ -54,7 +54,6 @@ pub fn router(state: Arc<HumanState>) -> Router {
         .route("/api/v1/session", get(handlers::current_session))
         .route("/api/v1/session/password", post(handlers::change_password))
         .route("/api/v1/databases", get(handlers::databases))
-        .route("/api/v1/chats", get(handlers::chats))
         .route("/api/v1/history", get(handlers::history))
         .route("/api/v1/history/{id}/reveal", post(handlers::reveal))
         .route(

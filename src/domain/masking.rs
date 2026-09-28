@@ -448,7 +448,6 @@ pub struct MaskEngine {
 
 struct WalkContext<'a> {
     database_id: Uuid,
-    chat_id: &'a str,
     batch_id: Uuid,
     ttl_seconds: u64,
     policy: &'a PolicySnapshot,
@@ -540,7 +539,6 @@ impl MaskEngine {
         &self,
         input: &Value,
         database_id: Uuid,
-        chat_id: &str,
         batch_id: Uuid,
         ttl_seconds: u64,
         policy: &PolicySnapshot,
@@ -568,7 +566,6 @@ impl MaskEngine {
         fio_literals.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let mut context = WalkContext {
             database_id,
-            chat_id,
             batch_id,
             ttl_seconds,
             policy,
@@ -695,7 +692,6 @@ impl MaskEngine {
         &self,
         value: &Value,
         database_id: Uuid,
-        chat_id: &str,
         mappings: &mut MappingStore,
     ) -> Result<Value, ProcessingError> {
         validate_value_bounds(
@@ -714,7 +710,7 @@ impl MaskEngine {
         let mut resolved = HashMap::new();
         for token in unique {
             let original = mappings
-                .resolve(database_id, chat_id, &token)
+                .resolve(database_id, &token)
                 .ok_or(ProcessingError)?;
             resolved.insert(token, original);
         }
@@ -746,7 +742,6 @@ impl MaskEngine {
         &self,
         value: &Value,
         database_id: Uuid,
-        chat_id: &str,
         batch_id: Uuid,
         mappings: &mut MappingStore,
     ) -> Result<Value, ProcessingError> {
@@ -766,7 +761,7 @@ impl MaskEngine {
         let mut resolved = HashMap::new();
         for token in unique {
             let original = mappings
-                .resolve_for_batch(database_id, chat_id, batch_id, &token)
+                .resolve_for_batch(database_id, batch_id, &token)
                 .ok_or(ProcessingError)?;
             resolved.insert(token, original);
         }
@@ -784,9 +779,7 @@ impl MaskEngine {
             }
             let mut resolved = HashMap::new();
             for token in nested {
-                if let Some(original) =
-                    mappings.resolve_for_batch(database_id, chat_id, batch_id, &token)
-                {
+                if let Some(original) = mappings.resolve_for_batch(database_id, batch_id, &token) {
                     resolved.insert(token, original);
                 }
             }
@@ -1434,7 +1427,6 @@ fn plan(context: &mut WalkContext<'_>, category: &str, original: &str) -> Result
         .plan_token(
             &mut context.candidates,
             context.database_id,
-            context.chat_id,
             category,
             &original,
             context.batch_id,

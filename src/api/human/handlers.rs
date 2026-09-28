@@ -83,14 +83,8 @@ fn session_database_ids(scope: &DatabaseScope) -> DatabaseIds {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DatabaseQuery {
-    database_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct HistoryQuery {
     database_id: Uuid,
-    chat_id: String,
     limit: Option<u8>,
 }
 
@@ -448,22 +442,6 @@ pub async fn admin_databases(State(state): State<Arc<HumanState>>, headers: Head
     }
 }
 
-pub async fn chats(
-    State(state): State<Arc<HumanState>>,
-    headers: HeaderMap,
-    Query(query): Query<DatabaseQuery>,
-) -> Response {
-    if let Err(error) =
-        authorize_database(&state, &headers, Need::Viewer, false, query.database_id)
-    {
-        return error.into_response();
-    }
-    match state.data.list_chats(query.database_id) {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => data_error(error).into_response(),
-    }
-}
-
 pub async fn history(
     State(state): State<Arc<HumanState>>,
     headers: HeaderMap,
@@ -480,7 +458,7 @@ pub async fn history(
     }
     match state
         .data
-        .list_history(query.database_id, &query.chat_id, limit)
+        .list_history(query.database_id, limit)
     {
         Ok(value) if value.iter().all(|item| item.report.is_safe()) => Json(value).into_response(),
         Ok(_) => ApiError::unavailable().into_response(),

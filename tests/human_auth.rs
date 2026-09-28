@@ -699,7 +699,7 @@ async fn activating_policy_before_first_pull_does_not_make_enabled_database_read
             call_id: Uuid::new_v4(),
             correlation_id: Uuid::new_v4(),
             identity: common::test_identity(database_id),
-            chat_id: "policy-before-pull".to_owned(),
+            caller: Some("policy-before-pull".to_owned()),
             tool_name: "execute_query".to_owned(),
             arguments: serde_json::json!({"query":"SELECT 1"}),
         })
@@ -1440,7 +1440,7 @@ async fn reveal_returns_report_and_writes_no_audit_event() {
     let inserted = storage
         .write_history(
             database_id,
-            "chat-r",
+            Some("chat-r"),
             Uuid::new_v4(),
             "execute_query",
             "tool_result",

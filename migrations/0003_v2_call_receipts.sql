@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS v2_call_receipts (
     database_instance_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     connection_generation TEXT NOT NULL,
-    chat_id TEXT NOT NULL,
+    caller_label TEXT,
     tool_name TEXT NOT NULL,
     correlation_id TEXT NOT NULL,
     service_epoch TEXT NOT NULL,

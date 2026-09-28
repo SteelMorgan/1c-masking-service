@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    AdminDatabasePatch, ChatSummary, CreatePolicyRequest, DatabaseSummary, DictionaryConfig,
+    AdminDatabasePatch, CreatePolicyRequest, DatabaseSummary, DictionaryConfig,
     DictionaryConfigView, DictionarySelectorConfig, DictionarySelectorView, HistoryItem,
     HumanDataError, HumanDataStore, MetadataNode, MetadataNodesPage, NeutralReport,
     PolicyRuleInput, PolicySummary, ToolClassification, ToolClassificationPatch,
@@ -166,27 +166,9 @@ impl HumanDataStore for SqliteHumanDataStore {
         }).map_err(|_| HumanDataError::Unavailable)
     }
 
-    fn list_chats(&self, database_id: Uuid) -> Result<Vec<ChatSummary>, HumanDataError> {
-        self.storage.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT chat_id,COUNT(*),MAX(created_at) FROM history
-                 WHERE database_id=?1 AND expires_at>?2 GROUP BY chat_id ORDER BY MAX(created_at) DESC",
-            )?;
-            let rows = statement.query_map(params![database_id.to_string(), Utc::now().to_rfc3339()], |row| {
-                Ok(ChatSummary {
-                    chat_id: row.get(0)?,
-                    message_count: row.get::<_, i64>(1)?.max(0) as u64,
-                    last_message_at: parse_time(row.get(2)?)?,
-                })
-            })?.collect();
-            rows
-        }).map_err(|_| HumanDataError::Unavailable)
-    }
-
     fn list_history(
         &self,
         database_id: Uuid,
-        chat_id: &str,
         limit: u8,
     ) -> Result<Vec<HistoryItem>, HumanDataError> {
         if !(30..=50).contains(&limit) {
@@ -194,17 +176,17 @@ impl HumanDataStore for SqliteHumanDataStore {
         }
         self.storage.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id,database_id,chat_id,tool_name,outcome,created_at,report_json FROM history
-                 WHERE database_id=?1 AND chat_id=?2 AND expires_at>?3 ORDER BY created_at DESC LIMIT ?4",
+                "SELECT id,database_id,caller_label,tool_name,outcome,created_at,report_json FROM history
+                 WHERE database_id=?1 AND expires_at>?2 ORDER BY created_at DESC LIMIT ?3",
             )?;
             let rows = statement.query_map(
-                params![database_id.to_string(), chat_id, Utc::now().to_rfc3339(), limit as i64],
+                params![database_id.to_string(), Utc::now().to_rfc3339(), limit as i64],
                 |row| {
                     let report_json: String = row.get(6)?;
                     Ok(HistoryItem {
                         id: parse_uuid(row.get(0)?)?,
                         database_id: parse_uuid(row.get(1)?)?,
-                        chat_id: row.get(2)?,
+                        caller_label: row.get(2)?,
                         tool_name: row.get(3)?,
                         outcome: row.get(4)?,
                         created_at: parse_time(row.get(5)?)?,
@@ -227,17 +209,19 @@ impl HumanDataStore for SqliteHumanDataStore {
         history_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<NeutralReport, HumanDataError>> + Send + 'a>> {
         Box::pin(async move {
-            let record =
-                self.storage
-                    .with_connection(|connection| {
-                        connection.query_row(
-                    "SELECT database_id,chat_id FROM history WHERE id=?1 AND expires_at>?2",
-                    params![history_id.to_string(), Utc::now().to_rfc3339()],
-                    |row| Ok((parse_uuid(row.get(0)?)?, row.get::<_, String>(1)?)),
-                ).optional()
-                    })
-                    .map_err(|_| HumanDataError::Unavailable)?
-                    .ok_or(HumanDataError::NotFound)?;
+            let record = self
+                .storage
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT database_id FROM history WHERE id=?1 AND expires_at>?2",
+                            params![history_id.to_string(), Utc::now().to_rfc3339()],
+                            |row| parse_uuid(row.get(0)?),
+                        )
+                        .optional()
+                })
+                .map_err(|_| HumanDataError::Unavailable)?
+                .ok_or(HumanDataError::NotFound)?;
 
             // Scope-проверка внутри store до расшифровки: снаружи её делать
             // нельзя — осталось бы окно TOCTOU и путь обхода через чужой
@@ -246,14 +230,14 @@ impl HumanDataStore for SqliteHumanDataStore {
                 .storage
                 .accessible_databases(actor)
                 .map_err(|_| HumanDataError::Unavailable)?
-                .contains(record.0);
+                .contains(record);
             if !allowed {
                 return Err(HumanDataError::NotFound);
             }
 
             let value = self
                 .masking
-                .reveal_history(history_id, record.0, &record.1)
+                .reveal_history(history_id, record)
                 .await
                 .map_err(|error| match error.code {
                     ErrorCode::MaskTokenInvalid
