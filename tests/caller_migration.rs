@@ -1,5 +1,6 @@
 //! Миграция 0018: chat_id уходит из схемы, вызывающий — только атрибут
-//! аудита caller_label. Guard фаз — фактическая схема, а не номер версии.
+//! аудита caller_label. Таблицы вызовов пересоздаются пустыми, настройки
+//! сохраняются; guard — запись version=18 (повторный старт — no-op).
 
 use onec_masking_service::storage::SqliteStorage;
 use rusqlite::Connection;
@@ -38,6 +39,24 @@ fn legacy_database(path: &std::path::Path, database_id: Uuid) {
              VALUES (?1,?1,'enabled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             [database_id.to_string()],
         )
+        .unwrap();
+    // Настройки: политика с правилом, классификация инструмента,
+    // пользователь, словарь — миграция обязана их сохранить.
+    let policy_id = Uuid::new_v4();
+    let rule_id = Uuid::new_v4();
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO policies(id,database_id,version,status,created_at)
+               VALUES ('{policy_id}','{database_id}',1,'active','2026-01-01T00:00:00Z');
+             INSERT INTO policy_rules(id,policy_id,selector_kind,selector_value,action,category,created_at)
+               VALUES ('{rule_id}','{policy_id}','name','ФИО','mask','FIO','2026-01-01T00:00:00Z');
+             INSERT INTO tool_classifications(database_id,tool_name,class,updated_at)
+               VALUES ('{database_id}','execute_query','data-mask','2026-01-01T00:00:00Z');
+             INSERT INTO dictionary_configs(id,database_id,mode,updated_at)
+               VALUES ('d1','{database_id}','all','2026-01-01T00:00:00Z');
+             INSERT INTO users(id,normalized_login,display_login,role,status,created_at,updated_at)
+               VALUES ('u1','admin','admin','Admin','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');"
+        ))
         .unwrap();
     let history_id = Uuid::new_v4().to_string();
     connection
@@ -140,15 +159,24 @@ fn legacy_schema_is_migrated_and_chat_bound_records_are_cleared() {
                     "{table} must be cleared"
                 );
             }
-            // Аудит сохраняется, но прежний chat_id в метку не переносится.
-            assert_eq!(count(connection, "SELECT COUNT(*) FROM audit_events"), 1);
-            assert_eq!(
-                count(
-                    connection,
-                    "SELECT COUNT(*) FROM audit_events WHERE caller_label IS NOT NULL"
-                ),
-                0
-            );
+            // Аудит вызовов тоже пересоздан пустым.
+            assert_eq!(count(connection, "SELECT COUNT(*) FROM audit_events"), 0);
+            assert!(columns(connection, "audit_events").contains(&"target_user_id".to_owned()));
+            // Настройки целы.
+            for (table, expected) in [
+                ("databases", 1),
+                ("policies", 1),
+                ("policy_rules", 1),
+                ("tool_classifications", 1),
+                ("dictionary_configs", 1),
+                ("users", 1),
+            ] {
+                assert_eq!(
+                    count(connection, &format!("SELECT COUNT(*) FROM {table}")),
+                    expected,
+                    "{table} must be preserved"
+                );
+            }
             // Уникальность истории — (database_id, call_id) без разговора.
             let sql: String = connection.query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='history'",
@@ -195,57 +223,6 @@ fn repeated_start_on_migrated_schema_is_a_no_op() {
     storage
         .with_connection(|connection| {
             assert_migrated(connection);
-            assert_eq!(count(connection, "SELECT COUNT(*) FROM history"), 1);
-            Ok(())
-        })
-        .unwrap();
-}
-
-#[test]
-fn partially_migrated_schema_is_completed_in_place() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("service.sqlite3");
-    let database_id = Uuid::new_v4();
-    {
-        let storage = SqliteStorage::open(&path).unwrap();
-        storage
-            .with_connection(|connection| {
-                connection.execute(
-                    "INSERT INTO databases(id,instance_id,mode,created_at,updated_at)
-                     VALUES (?1,?1,'enabled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-                    [database_id.to_string()],
-                )?;
-                connection.execute(
-                    "INSERT INTO history(id,database_id,caller_label,call_id,tool_name,outcome,policy_version,
-                         mask_reasons_json,public_result_json,report_json,created_at,expires_at)
-                     VALUES (?1,?2,NULL,?3,'execute_query','tool_result',1,'[]','{}','{}',
-                             '2026-01-01T00:00:00Z','2099-01-01T00:00:00Z')",
-                    rusqlite::params![
-                        Uuid::new_v4().to_string(),
-                        database_id.to_string(),
-                        Uuid::new_v4().to_string()
-                    ],
-                )?;
-                // Остаток прерванной миграции: call_contexts и аудит
-                // ещё в прежней форме, а version=18 уже записана.
-                connection.execute_batch(
-                    "DROP TABLE call_contexts;
-                     CREATE TABLE call_contexts (
-                         call_id TEXT PRIMARY KEY, database_id TEXT NOT NULL,
-                         chat_id TEXT NOT NULL, tool_name TEXT NOT NULL, title TEXT,
-                         created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-                         had_mask_tokens INTEGER NOT NULL DEFAULT 0);
-                     ALTER TABLE audit_events RENAME COLUMN caller_label TO chat_id;",
-                )?;
-                Ok(())
-            })
-            .unwrap();
-    }
-    let storage = SqliteStorage::open(&path).unwrap();
-    storage
-        .with_connection(|connection| {
-            assert_migrated(connection);
-            // История уже в новой форме — её фаза не запускалась повторно.
             assert_eq!(count(connection, "SELECT COUNT(*) FROM history"), 1);
             Ok(())
         })

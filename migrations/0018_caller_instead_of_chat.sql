@@ -5,25 +5,22 @@
 -- хранится только как атрибут аудита caller_label (самоназвание клиента,
 -- не механизм доступа).
 --
--- Прежние записи, привязанные к chat_id, не переносятся: history,
--- call_contexts и unscoped_terminal_events очищаются полностью,
--- выведенная из употребления v2_call_receipts (см. 0008) удаляется,
--- у audit_events колонка переименовывается и обнуляется.
--- Таблица соответствий токенов живёт только в памяти процесса, поэтому
--- после рестарта старые записи истории всё равно нераскрываемы.
+-- Данные вызовов не переносятся: таблица соответствий токенов живёт
+-- только в памяти процесса, поэтому прежняя история всё равно
+-- нераскрываема. Миграция безусловно пересоздаёт пустыми все таблицы
+-- вызовов: history, call_contexts, unscoped_terminal_events,
+-- audit_events; выведенная из употребления v2_call_receipts (см. 0008)
+-- удаляется. Сохраняются только настройки: базы, политики и правила,
+-- словари, классификации инструментов, пользователи и доступы, журнал
+-- импорта настроек, кэш поколений, сессии входа.
 --
--- Файл разбит на секции `-- == NAME ==`. Каждая секция применяется
--- в SqliteStorage::initialize только если в таблице фактически есть
--- колонка chat_id (pragma_table_info), а не по записи version=18:
--- частично мигрированная схема достраивается по месту, повторный старт
--- на мигрированной схеме — no-op. Порядок: receipts до history (ссылка
--- history_id), затем пересоздание history.
---
--- == RECEIPTS-DROP ==
+-- Применяется целиком одной транзакцией вместе с записью version=18
+-- (guard — запись version=18): промежуточного состояния не бывает,
+-- повторный старт — no-op.
+
 DROP TABLE IF EXISTS v2_call_receipts;
 
--- == HISTORY-RECREATE ==
-DROP TABLE history;
+DROP TABLE IF EXISTS history;
 CREATE TABLE history (
     id TEXT PRIMARY KEY,
     database_id TEXT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
@@ -46,8 +43,7 @@ CREATE TABLE history (
 CREATE INDEX IF NOT EXISTS history_expires_idx ON history(expires_at);
 CREATE INDEX IF NOT EXISTS history_db_created_idx ON history(database_id, created_at DESC);
 
--- == CONTEXTS-RECREATE ==
-DROP TABLE call_contexts;
+DROP TABLE IF EXISTS call_contexts;
 CREATE TABLE call_contexts (
     call_id TEXT PRIMARY KEY,
     database_id TEXT NOT NULL,
@@ -60,7 +56,32 @@ CREATE TABLE call_contexts (
 );
 CREATE INDEX IF NOT EXISTS call_contexts_expires_idx ON call_contexts(expires_at);
 
--- == AUDIT-RENAME ==
-ALTER TABLE audit_events RENAME COLUMN chat_id TO caller_label;
-UPDATE audit_events SET caller_label = NULL;
-DELETE FROM unscoped_terminal_events;
+DROP TABLE IF EXISTS unscoped_terminal_events;
+CREATE TABLE unscoped_terminal_events (
+    id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL UNIQUE,
+    correlation_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    error_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS unscoped_terminal_expires_idx
+    ON unscoped_terminal_events(expires_at);
+
+DROP TABLE IF EXISTS audit_events;
+CREATE TABLE audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_kind TEXT NOT NULL,
+    actor_id TEXT,
+    action TEXT NOT NULL,
+    database_id TEXT,
+    caller_label TEXT,
+    history_id TEXT,
+    outcome TEXT NOT NULL,
+    code TEXT,
+    correlation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    target_user_id TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_events(created_at);

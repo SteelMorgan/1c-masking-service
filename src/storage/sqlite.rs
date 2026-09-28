@@ -359,15 +359,21 @@ impl SqliteStorage {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (17, ?1)",
             [Utc::now().to_rfc3339()],
         )?;
-        // Миграция 0018: guard каждой секции — фактическое наличие колонки
-        // chat_id, а не запись version=18, поэтому частично применённая
-        // схема достраивается по месту, а повторный старт — no-op. Записи,
-        // привязанные к chat_id, не переносятся (история очищается).
-        apply_caller_label_migration(&transaction)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (18, ?1)",
-            [Utc::now().to_rfc3339()],
+        // Миграция 0018: таблицы вызовов пересоздаются пустыми, настройки
+        // не трогаются. Guard — запись version=18 в той же транзакции:
+        // применение атомарно, повторный старт — no-op.
+        let has_caller_label: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=18)",
+            [],
+            |row| row.get(0),
         )?;
+        if !has_caller_label {
+            transaction.execute_batch(CALLER_LABEL_MIGRATION)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
         //++agent TASK-225
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
@@ -1824,39 +1830,6 @@ fn apply_add_column_migration_set(
 /// Вырезает секцию `-- == NAME ==` из файла миграции, размеченного
 /// такими маркерами (многофазные миграции вроде 0017). Отсутствие метки —
 /// ошибка файла, а не пустая миграция.
-fn table_has_column(
-    transaction: &rusqlite::Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> rusqlite::Result<bool> {
-    transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
-        params![table, column],
-        |row| row.get(0),
-    )
-}
-
-/// Миграция 0018 по секциям с guard по фактической схеме.
-fn apply_caller_label_migration(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let history_legacy = table_has_column(transaction, "history", "chat_id")?;
-    let receipts_legacy = table_has_column(transaction, "v2_call_receipts", "chat_id")?;
-    if history_legacy || receipts_legacy {
-        transaction.execute_batch(migration_section(CALLER_LABEL_MIGRATION, "RECEIPTS-DROP")?)?;
-    }
-    if history_legacy {
-        transaction
-            .execute_batch(migration_section(CALLER_LABEL_MIGRATION, "HISTORY-RECREATE")?)?;
-    }
-    if table_has_column(transaction, "call_contexts", "chat_id")? {
-        transaction
-            .execute_batch(migration_section(CALLER_LABEL_MIGRATION, "CONTEXTS-RECREATE")?)?;
-    }
-    if table_has_column(transaction, "audit_events", "chat_id")? {
-        transaction.execute_batch(migration_section(CALLER_LABEL_MIGRATION, "AUDIT-RENAME")?)?;
-    }
-    Ok(())
-}
-
 fn migration_section<'a>(ddl: &'a str, name: &str) -> rusqlite::Result<&'a str> {
     let marker = format!("-- == {name} ==");
     let Some(start) = ddl.find(&marker) else {

@@ -278,3 +278,36 @@ fn resolve_for_batch_expands_nested_tokens_recursively() {
     assert!(!rendered.contains("[MASK:"), "{rendered}");
 }
 //++agent TASK-225
+
+/// Просроченных записей больше, чем чистит одна публикация: новый токен,
+/// выданный вместо просроченного, обязан разрешаться, даже если старая
+/// запись к моменту публикации ещё не вычищена.
+#[test]
+fn reissued_token_resolves_when_expired_entries_exceed_cleanup_batch() {
+    let database_id = Uuid::new_v4();
+    let mut store = MappingStore::new(MappingLimits::default());
+    let values: Vec<String> = (0..3_000).map(|index| format!("value-{index}")).collect();
+    let mut expired = Vec::new();
+    for value in &values {
+        store
+            .plan_token(&mut expired, database_id, "FIO", value, Uuid::new_v4(), 0)
+            .unwrap();
+    }
+    store.publish(expired).unwrap();
+
+    let mut fresh = Vec::new();
+    let tokens: Vec<String> = values
+        .iter()
+        .map(|value| {
+            store
+                .plan_token(&mut fresh, database_id, "FIO", value, Uuid::new_v4(), 3600)
+                .unwrap()
+        })
+        .collect();
+    store.publish(fresh).unwrap();
+
+    for (value, token) in values.iter().zip(&tokens) {
+        assert_eq!(store.resolve(database_id, token).as_deref(), Some(value.as_str()));
+    }
+    assert_eq!(store.len(), values.len());
+}

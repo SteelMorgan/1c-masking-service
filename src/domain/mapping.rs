@@ -150,18 +150,37 @@ impl MappingStore {
         self.evict_for(&candidates);
         let now = Utc::now();
         for candidate in candidates {
-            if let Some(token) = self.by_reverse.get(&candidate.reverse_key) {
-                if let Some(entry) = self.by_token.get_mut(token) {
-                    entry.batch_ids.insert(candidate.batch_id);
-                    // Повторная выдача значения — использование записи:
-                    // продлевает срок и защищает от LRU-вытеснения.
-                    entry.last_read_at = Some(now);
-                    entry.expires_at = entry.expires_at.max(candidate.expires_at);
+            // Кандидат уже выдан вызывающему, поэтому его токен обязан
+            // разрешаться. Существующую запись переиспользуем, только если
+            // это тот же токен; просроченная (не вычищенная cleanup) или
+            // пропавшая запись заменяется кандидатом, а живая запись с
+            // другим токеном (параллельная публикация) остаётся в обратном
+            // индексе, кандидат добавляется рядом.
+            let mut index_reverse = true;
+            if let Some(token) = self.by_reverse.get(&candidate.reverse_key).cloned() {
+                if token == candidate.token {
+                    if let Some(entry) = self.by_token.get_mut(&token) {
+                        entry.batch_ids.insert(candidate.batch_id);
+                        // Повторная выдача значения — использование записи:
+                        // продлевает срок и защищает от LRU-вытеснения.
+                        entry.last_read_at = Some(now);
+                        entry.expires_at = entry.expires_at.max(candidate.expires_at);
+                        continue;
+                    }
+                } else if self
+                    .by_token
+                    .get(&token)
+                    .is_some_and(|entry| entry.expires_at > now)
+                {
+                    index_reverse = false;
+                } else {
+                    self.by_token.remove(&token);
                 }
-                continue;
             }
-            self.by_reverse
-                .insert(candidate.reverse_key, candidate.token.clone());
+            if index_reverse {
+                self.by_reverse
+                    .insert(candidate.reverse_key, candidate.token.clone());
+            }
             self.by_token.insert(
                 candidate.token,
                 MappingEntry {
@@ -268,7 +287,7 @@ impl MappingStore {
         victims.sort();
         for (_, token) in victims.into_iter().take(count) {
             if let Some(entry) = self.by_token.remove(&token) {
-                self.by_reverse.remove(&entry.reverse_key);
+                self.unindex_reverse(&entry.reverse_key, &token);
             }
         }
     }
@@ -327,10 +346,22 @@ impl MappingStore {
             .collect();
         for token in &expired {
             if let Some(entry) = self.by_token.remove(token) {
-                self.by_reverse.remove(&entry.reverse_key);
+                self.unindex_reverse(&entry.reverse_key, token);
             }
         }
         expired.len()
+    }
+
+    /// Снимает обратный ключ, только если он указывает на удаляемый токен:
+    /// рядом может жить другая запись того же значения.
+    fn unindex_reverse(&mut self, reverse_key: &[u8; 32], token: &str) {
+        if self
+            .by_reverse
+            .get(reverse_key)
+            .is_some_and(|indexed| indexed == token)
+        {
+            self.by_reverse.remove(reverse_key);
+        }
     }
 
     fn reverse_key(&self, database_id: Uuid, category: &str, original: &str) -> [u8; 32] {
