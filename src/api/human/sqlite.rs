@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     api::human::model::{refresh_error_text, RefreshStatus},
-    auth::Principal,
+    auth::{AuthStore, DatabaseScope, Principal},
     domain::{
         DatabaseIdentity, DatabaseMode, ErrorCode, MaskingService, PolicyRule, PolicySnapshot,
         RuleAction, RuleSelector, ToolClass,
@@ -47,7 +47,16 @@ impl SqliteHumanDataStore {
 }
 
 impl HumanDataStore for SqliteHumanDataStore {
-    fn list_databases(&self) -> Result<Vec<DatabaseSummary>, HumanDataError> {
+    fn list_databases(
+        &self,
+        scope: &DatabaseScope,
+    ) -> Result<Vec<DatabaseSummary>, HumanDataError> {
+        // Пустой набор — пустая выдача без запроса: IN () невалиден в SQL.
+        if let DatabaseScope::Only(ids) = scope {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
         self.storage.with_connection(|connection| {
             //++agent TASK-222 [05.10.2026]
             // refresh_stage: живой durable intent ('full') — pull в работе;
@@ -57,7 +66,19 @@ impl HumanDataStore for SqliteHumanDataStore {
             // new_tools_count (B2): сколько инструментов базы авто-
             // добавлены как deny-pending-review и ждут классификации.
             //++agent TASK-225
-            let mut statement = connection.prepare(
+            // Scope-фильтр — серверная граница: для Only набор подставляется
+            // параметрами (UUID-строки), инъекция исключена.
+            let (scope_filter, ids): (String, Vec<String>) = match scope {
+                DatabaseScope::All => (String::new(), Vec::new()),
+                DatabaseScope::Only(ids) => (
+                    format!(
+                        " WHERE d.id IN ({})",
+                        ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                    ),
+                    ids.iter().map(Uuid::to_string).collect(),
+                ),
+            };
+            let mut statement = connection.prepare(&format!(
                 "SELECT d.id,COALESCE(d.display_label,d.id),d.display_label,d.mode,d.mapping_ttl_seconds,d.history_ttl_seconds,
                         COALESCE(i.phase,CASE WHEN a.database_id IS NOT NULL THEN 'active' END),
                         (SELECT COUNT(*) FROM tool_classifications t WHERE t.database_id=d.id AND t.auto_added=1),
@@ -71,9 +92,10 @@ impl HumanDataStore for SqliteHumanDataStore {
                  LEFT JOIN v2_refresh_intents i ON i.database_id=d.id
                  LEFT JOIN (SELECT database_id FROM cache_generations WHERE status='active') a
                         ON a.database_id=d.id
+                 {scope_filter}
                  ORDER BY COALESCE(d.display_label,d.id)",
-            )?;
-            let rows = statement.query_map([], |row| {
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(ids), |row| {
                 //++agent TASK-225 [25.09.2026]
                 // §8.4: свод состояния refresh. Приоритет intent-строки
                 // (needs_attention/retrying/running); при отсутствии
@@ -201,11 +223,11 @@ impl HumanDataStore for SqliteHumanDataStore {
     //--agent TASK-224
     fn reveal_history<'a>(
         &'a self,
-        _actor: &Principal,
+        actor: &'a Principal,
         history_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<NeutralReport, HumanDataError>> + Send + 'a>> {
         Box::pin(async move {
-            let scope =
+            let record =
                 self.storage
                     .with_connection(|connection| {
                         connection.query_row(
@@ -217,9 +239,21 @@ impl HumanDataStore for SqliteHumanDataStore {
                     .map_err(|_| HumanDataError::Unavailable)?
                     .ok_or(HumanDataError::NotFound)?;
 
+            // Scope-проверка внутри store до расшифровки: снаружи её делать
+            // нельзя — осталось бы окно TOCTOU и путь обхода через чужой
+            // history id. Чужая база — тот же NotFound, что и промах.
+            let allowed = self
+                .storage
+                .accessible_databases(actor)
+                .map_err(|_| HumanDataError::Unavailable)?
+                .contains(record.0);
+            if !allowed {
+                return Err(HumanDataError::NotFound);
+            }
+
             let value = self
                 .masking
-                .reveal_history(history_id, scope.0, &scope.1)
+                .reveal_history(history_id, record.0, &record.1)
                 .await
                 .map_err(|error| match error.code {
                     ErrorCode::MaskTokenInvalid
@@ -368,6 +402,32 @@ impl HumanDataStore for SqliteHumanDataStore {
                         "UPDATE databases SET active_policy_id=NULL WHERE id=?1",
                         [database_id.to_string()],
                     )?;
+                    let now = Utc::now().to_rfc3339();
+                    // Снятие доступов при удалении базы аудируется явно:
+                    // строки уходят каскадом, без revoke-событий след
+                    // «кому был доступ» теряется.
+                    {
+                        let mut statement = tx.prepare(
+                            "SELECT user_id FROM user_database_access WHERE database_id=?1 ORDER BY user_id",
+                        )?;
+                        let holders: Vec<String> = statement
+                            .query_map([database_id.to_string()], |row| row.get(0))?
+                            .collect::<rusqlite::Result<_>>()?;
+                        drop(statement);
+                        for holder in holders {
+                            tx.execute(
+                                "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,outcome,target_user_id,correlation_id,created_at)
+                                 VALUES ('human',?1,'access.revoke',?2,'success',?3,?4,?5)",
+                                params![
+                                    actor.user_id.to_string(),
+                                    database_id.to_string(),
+                                    holder,
+                                    correlation_id.to_string(),
+                                    now
+                                ],
+                            )?;
+                        }
+                    }
                     for statement in [
                         "DELETE FROM call_contexts WHERE database_id=?1",
                         "DELETE FROM policy_rules WHERE policy_id IN \
@@ -380,10 +440,13 @@ impl HumanDataStore for SqliteHumanDataStore {
                         "DELETE FROM setup_imports WHERE database_id=?1",
                         "DELETE FROM setup_journal WHERE database_id=?1",
                         "DELETE FROM history WHERE database_id=?1",
+                        // Явное удаление выданных доступов: FK CASCADE это
+                        // покрывает, но явный DELETE самодокументируем и не
+                        // зависит от состояния PRAGMA foreign_keys.
+                        "DELETE FROM user_database_access WHERE database_id=?1",
                     ] {
                         tx.execute(statement, [database_id.to_string()])?;
                     }
-                    let now = Utc::now().to_rfc3339();
                     tx.execute(
                         "INSERT INTO audit_events(actor_kind,actor_id,action,database_id,code,outcome,correlation_id,created_at)
                          VALUES ('human',?1,'database.delete',?2,?3,'success',?4,?5)",

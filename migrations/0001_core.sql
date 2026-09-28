@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS users (
     normalized_login TEXT NOT NULL UNIQUE,
     display_login TEXT NOT NULL,
     password_hash TEXT,
-    role TEXT NOT NULL CHECK (role IN ('Admin', 'Viewer')),
+    role TEXT NOT NULL CHECK (role IN ('SuperAdmin', 'Admin', 'Viewer')),
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     auth_epoch INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,

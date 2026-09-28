@@ -59,6 +59,12 @@ const NO_MASK_RENAME_MIGRATION: &str = include_str!("../../migrations/0015_no_ma
 const DATABASE_IDENTITY_MIGRATION: &str =
     include_str!("../../migrations/0016_database_identity.sql");
 //++agent TASK-225
+// Миграция 0017 (per-database RBAC): колонка audit_events.target_user_id
+// (поколоночно), таблица user_database_access, пересоздание users с
+// расширенным CHECK роли. Файл разбит на секции `-- == NAME ==`, фазы
+// применения — в initialize.
+const DATABASE_ACCESS_MIGRATION: &str =
+    include_str!("../../migrations/0017_database_access.sql");
 
 pub enum HistoryWrite {
     Inserted(Uuid),
@@ -134,6 +140,12 @@ impl SqliteStorage {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Миграция 0017, фаза 1: пересоздание users со старым CHECK ролей
+        // нельзя выполнить внутри транзакции — foreign_keys переключается
+        // только вне её, а DROP родителя sessions/capabilities требует
+        // выключенных FK. Guard по тексту DDL: свежая БД (users ещё нет)
+        // и уже мигрированная (CHECK содержит 'SuperAdmin') пропускаются.
+        migrate_users_role_check(&mut connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(MIGRATION)?;
         transaction.execute_batch(TERMINAL_HISTORY_MIGRATION)?;
@@ -307,6 +319,42 @@ impl SqliteStorage {
                 [Utc::now().to_rfc3339()],
             )?;
         }
+        // Миграция 0017, фаза 2 (в основной транзакции): колонка аудита и
+        // таблица доступов. Гард — фактическое состояние схемы, а не запись
+        // schema_migrations: база с чужой записью version=17 от ранней
+        // сборки (таблицы нет) достраивается, а не застревает наполовину.
+        // Колонка аудита применяется поколоночно и идемпотентна —
+        // вызывается всегда; таблица и миграционная выдача — только при её
+        // отсутствии. Действующие Viewer получают все существующие базы —
+        // иначе обновление молча отняло бы им выдачу; доступ новых баз
+        // дальше выдаётся только явно. granted_by=NULL — выдала миграция,
+        // а не администратор.
+        apply_add_column_migration(
+            &transaction,
+            "audit_events",
+            migration_section(DATABASE_ACCESS_MIGRATION, "AUDIT-COLUMN")?,
+        )?;
+        let has_database_access: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='user_database_access')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_database_access {
+            transaction.execute_batch(migration_section(
+                DATABASE_ACCESS_MIGRATION,
+                "ACCESS-TABLE",
+            )?)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO user_database_access(user_id, database_id, granted_by, granted_at)
+                 SELECT u.id, d.id, NULL, ?1 FROM users u CROSS JOIN databases d WHERE u.role='Viewer'",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (17, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
         //++agent TASK-225
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
@@ -335,7 +383,7 @@ impl SqliteStorage {
             let now = Utc::now().to_rfc3339();
             transaction.execute(
                 "INSERT INTO users(id, normalized_login, display_login, password_hash, role, status, auth_epoch, created_at, updated_at)
-                 VALUES (?1, 'admin', 'Admin', NULL, 'Admin', 'active', 0, ?2, ?2)",
+                 VALUES (?1, 'admin', 'Admin', NULL, 'SuperAdmin', 'active', 0, ?2, ?2)",
                 params![Uuid::new_v4().to_string(), now],
             )?;
         }
@@ -1764,6 +1812,69 @@ fn apply_add_column_migration_set(
     }
     for (table, statements) in grouped {
         apply_add_column_migration(transaction, &table, &statements.join(";\n"))?;
+    }
+    Ok(())
+}
+
+/// Вырезает секцию `-- == NAME ==` из файла миграции, размеченного
+/// такими маркерами (многофазные миграции вроде 0017). Отсутствие метки —
+/// ошибка файла, а не пустая миграция.
+fn migration_section<'a>(ddl: &'a str, name: &str) -> rusqlite::Result<&'a str> {
+    let marker = format!("-- == {name} ==");
+    let Some(start) = ddl.find(&marker) else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    let rest = &ddl[start + marker.len()..];
+    let end = rest.find("-- ==").unwrap_or(rest.len());
+    Ok(rest[..end].trim())
+}
+
+/// Миграция 0017, фаза 1: пересоздание `users`, когда её CHECK не знает
+/// ступень SuperAdmin (БД, созданные до 0017). Свежая схема 0001 уже
+/// содержит новый CHECK, таблица может ещё не существовать — обе ситуации
+/// пропускаются по тексту sqlite_master. `foreign_keys` выключается вне
+/// транзакции (SQLite игнорирует переключение внутри), после коммита
+/// сверяется `pragma_foreign_key_check`: сиротские ссылки — ошибка старта.
+fn migrate_users_role_check(connection: &mut Connection) -> rusqlite::Result<()> {
+    let legacy: bool = connection
+        .query_row(
+            "SELECT sql NOT LIKE '%SuperAdmin%' FROM sqlite_master
+             WHERE type='table' AND name='users'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !legacy {
+        return Ok(());
+    }
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let outcome = (|| {
+        let transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(migration_section(
+            DATABASE_ACCESS_MIGRATION,
+            "USERS-RECREATE",
+        )?)?;
+        transaction.commit()
+    })();
+    // Реальная ошибка миграции важнее сбоя восстановления pragma —
+    // возвращаем её первой. Но если миграция прошла, а FK включить
+    // не удалось — это ошибка старта: работать с молча отключёнными
+    // каскадами недопустимо.
+    if let Err(pragma_error) = connection.pragma_update(None, "foreign_keys", "ON") {
+        if outcome.is_ok() {
+            return Err(pragma_error);
+        }
+        tracing::warn!(event = "foreign_keys_restore_failed", error = %pragma_error);
+    }
+    outcome?;
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations > 0 {
+        return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
 }

@@ -923,7 +923,7 @@ async fn t4_10_viewer_forbidden_on_setup_mutations() {
                 .authenticate("mk-viewer", "admin", ADMIN_PASSWORD)
                 .unwrap(),
             "viewer-d2",
-            Role::Viewer,
+            Role::Viewer, &[],
             Uuid::new_v4(),
         )
         .unwrap();
@@ -1094,7 +1094,7 @@ async fn history_reasons_returns_row_and_does_not_deadlock() {
         .authenticate("setup-api", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin, "viewer", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin, "viewer", Role::Viewer, &[database_id], Uuid::new_v4())
         .unwrap();
     auth.activate("test", &activation, "viewer passphrase t225")
         .unwrap();
@@ -1594,7 +1594,7 @@ async fn t7_reasons_detailed_cells_and_rule_ids() {
         .authenticate("setup-api", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin_principal, "viewer-t7", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin_principal, "viewer-t7", Role::Viewer, &[database_id], Uuid::new_v4())
         .unwrap();
     auth.activate("viewer-t7", &activation, "viewer passphrase t7")
         .unwrap();
@@ -1933,7 +1933,7 @@ async fn t7_reasons_legacy_row_returns_legacy_reasons() {
         .authenticate("setup-api", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin_principal, "viewer-t7l", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin_principal, "viewer-t7l", Role::Viewer, &[database_id], Uuid::new_v4())
         .unwrap();
     auth.activate("viewer-t7l", &activation, "viewer passphrase t7l")
         .unwrap();
@@ -2202,7 +2202,7 @@ async fn d8_dictionary_reason_carries_source_path() {
         .authenticate("setup-api", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin_principal, "viewer-d8", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin_principal, "viewer-d8", Role::Viewer, &[database_id], Uuid::new_v4())
         .unwrap();
     auth.activate("viewer-d8", &activation, "viewer passphrase d8")
         .unwrap();
@@ -2311,7 +2311,7 @@ async fn delete_tool_classification_requires_admin_csrf_and_origin() {
         .authenticate("setup-api-h", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin_principal, "viewer-h", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin_principal, "viewer-h", Role::Viewer, &[], Uuid::new_v4())
         .unwrap();
     auth.activate("viewer-h", &activation, "viewer passphrase h")
         .unwrap();
@@ -3144,7 +3144,7 @@ async fn delete_database_requires_admin_csrf_and_origin() {
         .authenticate("setup-api-t", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin_principal, "viewer-t", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin_principal, "viewer-t", Role::Viewer, &[], Uuid::new_v4())
         .unwrap();
     auth.activate("viewer-t", &activation, "viewer passphrase t")
         .unwrap();

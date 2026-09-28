@@ -44,7 +44,7 @@ fn initial_admin_cannot_login_until_one_time_bootstrap() {
     let (storage, auth, _) = auth_fixture();
     let admin = auth.initialize().unwrap();
     assert_eq!(admin.display_login, "Admin");
-    assert_eq!(admin.role, Role::Admin);
+    assert_eq!(admin.role, Role::SuperAdmin);
     assert!(admin.password_hash.is_none());
     assert!(matches!(
         auth.authenticate("test", "Admin", ""),
@@ -58,7 +58,7 @@ fn initial_admin_cannot_login_until_one_time_bootstrap() {
     let principal = auth
         .authenticate("new-source", "admin", ADMIN_PASSWORD)
         .unwrap();
-    assert_eq!(principal.role, Role::Admin);
+    assert_eq!(principal.role, Role::SuperAdmin);
 
     let (phc, bootstrap_completed): (String, Option<String>) = storage
         .with_connection(|connection| {
@@ -89,7 +89,7 @@ fn activation_is_hashed_single_use_and_user_sets_own_password() {
         .authenticate("activation-admin", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (viewer, token) = auth
-        .create_user(&admin, "Viewer One", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin, "Viewer One", Role::Viewer, &[], Uuid::new_v4())
         .unwrap();
     assert!(matches!(
         auth.authenticate("before-activation", "viewer one", VIEWER_PASSWORD),
@@ -196,7 +196,7 @@ async fn roles_are_checked_server_side_for_reveal_and_admin_routes() {
     let admin_session = sessions.issue(admin.clone(), Utc::now()).unwrap();
 
     let (_, activation) = auth
-        .create_user(&admin, "viewer", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin, "viewer", Role::Viewer, &[], Uuid::new_v4())
         .unwrap();
     auth.activate("test", &activation, VIEWER_PASSWORD).unwrap();
     let viewer = auth
@@ -359,7 +359,7 @@ async fn admin_and_viewer_can_change_own_password_and_rotate_all_sessions() {
         .authenticate("password-setup-admin", "admin", ADMIN_PASSWORD)
         .unwrap();
     let (_, activation) = auth
-        .create_user(&admin, "viewer", Role::Viewer, Uuid::new_v4())
+        .create_user(&admin, "viewer", Role::Viewer, &[], Uuid::new_v4())
         .unwrap();
     auth.activate("test", &activation, VIEWER_PASSWORD).unwrap();
 
@@ -1342,7 +1342,7 @@ async fn pages_are_session_guarded_and_static_served() {
         .create_user(
             &admin.principal,
             "page-viewer",
-            Role::Viewer,
+            Role::Viewer, &[],
             Uuid::new_v4(),
         )
         .unwrap();
@@ -1423,7 +1423,7 @@ async fn reveal_returns_report_and_writes_no_audit_event() {
     storage
         .insert_database(database_id, &common::test_identity(database_id))
         .unwrap();
-    let viewer = viewer_session_for(&auth, &sessions, &admin.principal, "reveal-viewer");
+    let viewer = viewer_session_for(&auth, &sessions, &admin.principal, "reveal-viewer", &[database_id]);
 
     //++agent TASK-224 [08.10.2026] итерация 4: канонический формат отчёта —
     // title (текст запроса) + masked-флаг колонки.
@@ -1505,9 +1505,10 @@ fn viewer_session_for(
     sessions: &Arc<SessionService>,
     admin: &onec_masking_service::auth::Principal,
     login: &str,
+    database_ids: &[Uuid],
 ) -> onec_masking_service::auth::IssuedSession {
     let (_, activation) = auth
-        .create_user(admin, login, Role::Viewer, Uuid::new_v4())
+        .create_user(admin, login, Role::Viewer, database_ids, Uuid::new_v4())
         .unwrap();
     auth.activate("test", &activation, VIEWER_PASSWORD).unwrap();
     let viewer = auth.authenticate("test", login, VIEWER_PASSWORD).unwrap();
@@ -1628,7 +1629,7 @@ async fn metadata_route_requires_admin_and_db() {
     let admin_principal = auth
         .authenticate("meta-check", "admin", ADMIN_PASSWORD)
         .unwrap();
-    let viewer = viewer_session_for(&auth, &sessions, &admin_principal, "meta-viewer");
+    let viewer = viewer_session_for(&auth, &sessions, &admin_principal, "meta-viewer", &[]);
 
     let uri = format!("/api/v1/admin/databases/{database_id}/metadata");
     // Viewer → 403, аноним → 401.

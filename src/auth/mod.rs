@@ -9,8 +9,8 @@ pub use local::{
     ActivationError, AuthProvider, ChangePasswordError, LocalAuthProvider, LoginError,
 };
 pub use model::{
-    ActivationCapability, AuthError, AuthStore, NewSession, PendingActivation, Principal, Role,
-    SessionRecord, UserAccount, UserListEntry, UserStatus,
+    ActivationCapability, AuthError, AuthStore, DatabaseScope, NewSession, PendingActivation,
+    Principal, Role, SessionRecord, UserAccount, UserListEntry, UserStatus,
 };
 pub use password::{PasswordError, PasswordService};
 pub use rate_limit::{LoginRateLimiter, RateLimitConfig};

@@ -69,6 +69,10 @@ pub fn router(state: Arc<HumanState>) -> Router {
             patch(handlers::update_user).delete(handlers::delete_user),
         )
         .route(
+            "/api/v1/admin/users/{id}/databases",
+            get(handlers::list_user_databases).put(handlers::set_user_databases),
+        )
+        .route(
             "/api/v1/admin/users/{id}/invitation",
             post(handlers::reissue_invitation),
         )

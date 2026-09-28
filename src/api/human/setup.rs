@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::handlers::{authorize, same_origin, ApiError};
+use super::handlers::{admin_mutation_db, authorize_database, ApiError, Need};
 use super::sqlite::audit;
 use super::HumanState;
 use crate::domain::setup::{
@@ -334,13 +334,13 @@ pub(crate) async fn export_setup(
     Query(query): Query<ExportQuery>,
     viewer_only: bool,
 ) -> Response {
-    let role = if viewer_only {
-        crate::auth::Role::Viewer
+    let need = if viewer_only {
+        Need::Viewer
     } else {
-        crate::auth::Role::Admin
+        Need::Admin
     };
-    let actor = match authorize(&state, &headers, Some(role), false) {
-        Ok(value) => value,
+    let actor = match authorize_database(&state, &headers, need, false, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     if viewer_only && query.version.is_some() {
@@ -467,7 +467,7 @@ pub(crate) async fn version_list(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Admin), false) {
+    if let Err(error) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return error.into_response();
     }
     if let Some(response) = database_guard(&state.setup, id, "version_list") {
@@ -506,7 +506,7 @@ pub(crate) async fn version_get(
     Path((id, number)): Path<(Uuid, i64)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Admin), false) {
+    if let Err(error) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return error.into_response();
     }
     if let Some(response) = database_guard(&state.setup, id, "version_get") {
@@ -576,7 +576,7 @@ pub(crate) async fn setup_journal(
     headers: HeaderMap,
     Query(query): Query<JournalQuery>,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Admin), false) {
+    if let Err(error) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return error.into_response();
     }
     let limit = query.limit.unwrap_or(100).min(200);
@@ -705,7 +705,7 @@ pub(crate) async fn diff_setup(
     headers: HeaderMap,
     Query(query): Query<DiffQuery>,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Admin), false) {
+    if let Err(error) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return error.into_response();
     }
     if let Some(response) = database_guard(&state.setup, id, "diff_setup") {
@@ -753,11 +753,8 @@ pub(crate) async fn import_setup(
     Query(query): Query<ImportQuery>,
     body: axum::body::Bytes,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     if let Some(response) = database_guard(&state.setup, id, "import_setup") {
@@ -1029,11 +1026,8 @@ pub(crate) async fn draft_create(
     headers: HeaderMap,
     Json(request): Json<DraftCreateRequest>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     if let Some(response) = database_guard(&state.setup, id, "draft_create") {
@@ -1181,7 +1175,7 @@ pub(crate) async fn draft_get(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Admin), false) {
+    if let Err(error) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return error.into_response();
     }
     if let Some(response) = database_guard(&state.setup, id, "draft_get") {
@@ -1265,11 +1259,8 @@ pub(crate) async fn draft_put_area(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     if !matches!(area.as_str(), "dictionary" | "rules" | "tools") {
@@ -1366,11 +1357,8 @@ pub(crate) async fn draft_revert(
     headers: HeaderMap,
     Json(request): Json<DraftRevertRequest>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     let expected_hash = match if_match_hash(&headers) {
@@ -1486,11 +1474,8 @@ pub(crate) async fn draft_delete(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     let expected_hash = match if_match_hash(&headers) {
@@ -1545,11 +1530,8 @@ pub(crate) async fn activate_setup(
     headers: HeaderMap,
     Json(request): Json<ActivateRequest>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     //++agent TASK-225 [26.09.2026] review MINOR-12: comment пишется
@@ -1867,11 +1849,8 @@ pub(crate) async fn rollback_setup(
     headers: HeaderMap,
     Json(request): Json<RollbackRequest>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     let now = Utc::now().to_rfc3339();
@@ -2012,9 +1991,10 @@ pub(crate) async fn history_reasons(
     headers: HeaderMap,
 ) -> Response {
     // Viewer — как reveal: роль + сессия, без Origin/CSRF (GET).
-    if let Err(error) = authorize(&state, &headers, Some(crate::auth::Role::Viewer), false) {
-        return error.into_response();
-    }
+    let actor = match super::handlers::authorize_global(&state, &headers, Need::Viewer, false) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     //++agent TASK-225 [26.09.2026] review: чтение записи ВНЕ with_connection —
     // history_reasons_record сам берёт тот же мьютекс, вложенный вызов
     // дедлочил бы единственное соединение (любой Viewer мог повесить сервис).
@@ -2028,6 +2008,12 @@ pub(crate) async fn history_reasons(
             return setup_storage_error("history_reasons", &error);
         }
     };
+    // Косвенная привязка: база берётся из записи, чужая — тот же
+    // HISTORY_NOT_FOUND, что и для отсутствующей записи.
+    if !actor.scope.contains(row.database_id) {
+        return ApiError::not_found_code("HISTORY_NOT_FOUND", "запись истории не найдена")
+            .into_response();
+    }
     let outcome = state.setup.storage.with_connection(|connection| {
         let expired = row.expires_at <= Utc::now().to_rfc3339();
         if expired {
@@ -2211,11 +2197,8 @@ pub(crate) async fn dry_run_setup(
     headers: HeaderMap,
     Json(request): Json<DryRunRequest>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let actor = match authorize(&state, &headers, Some(crate::auth::Role::Admin), true) {
-        Ok(value) => value,
+    let actor = match admin_mutation_db(&state, &headers, id) {
+        Ok(value) => value.principal,
         Err(error) => return error.into_response(),
     };
     let limit = request.limit.unwrap_or(50).clamp(1, 50);
