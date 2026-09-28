@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use chrono::{DateTime, Utc};
+use onec_masking_service::auth::DatabaseScope;
 use onec_masking_service::{
     api::human::{HumanDataStore, SqliteHumanDataStore},
     auth::{Principal, Role},
@@ -297,7 +298,7 @@ async fn b2_reports_refresh_state_and_error_text() {
         })
         .unwrap();
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -309,7 +310,7 @@ async fn b2_reports_refresh_state_and_error_text() {
     // running: intent поставлен и ждёт ближайший тик.
     enqueue_refresh_intent(&storage, database_id);
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -324,7 +325,7 @@ async fn b2_reports_refresh_state_and_error_text() {
         .await
         .unwrap();
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -353,7 +354,7 @@ async fn b2_reports_refresh_state_and_error_text() {
         })
         .unwrap();
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -377,7 +378,7 @@ async fn b2_reports_refresh_state_and_error_text() {
         })
         .unwrap();
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -432,7 +433,7 @@ async fn legacy_database_without_coordinates_retries_pull() {
 
     let data = SqliteHumanDataStore::new(storage.clone(), state.masking.clone());
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)
@@ -471,7 +472,7 @@ async fn no_target_retries_with_database_not_connected_code() {
     assert!(next_at.is_some(), "повтор отложен по backoff");
     let data = SqliteHumanDataStore::new(storage.clone(), state.masking.clone());
     let refresh = data
-        .list_databases()
+        .list_databases(&DatabaseScope::All)
         .unwrap()
         .into_iter()
         .find(|db| db.id == database_id)

@@ -5,8 +5,33 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
+    /// Полные права, включая пользователей и назначение доступа к базам;
+    /// набор баз всегда «все» (включая будущие) и не хранится.
+    SuperAdmin,
+    /// Управление только явно назначенными базами.
     Admin,
+    /// Просмотр истории только назначенных баз. Ступень точная:
+    /// просмотр осознанно не наследуется администраторами — разделение
+    /// обязанностей между Admin и Viewer сделано намеренно.
     Viewer,
+}
+
+/// Область видимости баз для principal: `All` — все базы без перечисления
+/// (только SuperAdmin), `Only` — явный набор из `user_database_access`.
+/// Пустой `Only` допустим и ничего не открывает (fail-closed).
+#[derive(Debug, Clone)]
+pub enum DatabaseScope {
+    All,
+    Only(std::collections::HashSet<Uuid>),
+}
+
+impl DatabaseScope {
+    pub fn contains(&self, database_id: Uuid) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(ids) => ids.contains(&database_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +84,9 @@ pub struct UserListEntry {
     pub account: UserAccount,
     pub invitation_expires_at: Option<DateTime<Utc>>,
     pub last_login_at: Option<DateTime<Utc>>,
+    /// Явно выданные базы из `user_database_access`; у SuperAdmin пусто —
+    /// его набор не хранится (всегда «все»).
+    pub database_ids: Vec<Uuid>,
 }
 //--agent TASK-224
 
@@ -102,6 +130,13 @@ pub enum AuthError {
     #[error("target user is disabled")]
     UserDisabled,
     //--agent TASK-224
+    /// Цель назначения доступа — SuperAdmin: его набор баз всегда «все»
+    /// и явно не задаётся (на API — 409 SUPERADMIN_HAS_ALL).
+    #[error("super admin database scope is implicit")]
+    SuperAdminScope,
+    /// В назначаемом наборе указан несуществующий database_id.
+    #[error("unknown database id in access set")]
+    UnknownDatabase,
 }
 
 /// Persistence boundary for local human identities. Implementations must make
@@ -117,12 +152,17 @@ pub trait AuthStore: Send + Sync {
     /// only for login `Admin`, and only while its password hash is NULL.
     fn complete_initial_admin_bootstrap(&self, password_hash: &str) -> Result<(), AuthError>;
 
-    /// Creates a user with a NULL password and stores only the activation-token hash.
+    /// Creates a user with a NULL password and stores only the activation-token
+    /// hash. `database_ids` — начальный набор доступа (Admin/Viewer); вставка
+    /// и аудит выдачи идут в той же транзакции, чтобы не существовало
+    /// промежуточного состояния. Несуществующий id → `UnknownDatabase`.
+    #[allow(clippy::too_many_arguments)]
     fn create_user_with_activation(
         &self,
         display_login: &str,
         normalized_login: &str,
         role: Role,
+        database_ids: &[Uuid],
         capability: ActivationCapability,
         actor_id: Uuid,
         correlation_id: Uuid,
@@ -171,8 +211,8 @@ pub trait AuthStore: Send + Sync {
     ) -> Result<UserAccount, AuthError>;
 
     /// Удаление пользователя (Б6), который ни разу не входил (пароль NULL и
-    /// ни одной сессии). Последний активный Admin не удаляется — защита от
-    /// полной потери административного доступа.
+    /// ни одной сессии). Последний активный SuperAdmin не удаляется — защита
+    /// от полной потери административного доступа.
     fn delete_user(
         &self,
         user_id: Uuid,
@@ -183,6 +223,30 @@ pub trait AuthStore: Send + Sync {
     /// Б9: true, пока bootstrap первого администратора не завершён.
     fn bootstrap_pending(&self) -> Result<bool, AuthError>;
     //--agent TASK-224
+
+    /// Явно выданные базы пользователя (Admin/Viewer). У SuperAdmin
+    /// строк нет — возвращается пустой список, доступ «все» неявный.
+    fn list_database_access(&self, user_id: Uuid) -> Result<Vec<Uuid>, AuthError>;
+
+    /// Полная замена набора доступа в одной транзакции: diff с текущим
+    /// набором пишет по событию аудита `access.grant`/`access.revoke` на
+    /// каждую пару (user, database) — `database_id` и `target_user_id`
+    /// заполняются отдельными полями. `auth_epoch` НЕ инкрементируется:
+    /// scope считывается на каждый запрос, сессии инвалидировать не нужно.
+    /// Ошибки: цель-SuperAdmin → `SuperAdminScope`; несуществующий
+    /// database_id → `UnknownDatabase`; нет пользователя → `NotFound`.
+    fn set_database_access(
+        &self,
+        user_id: Uuid,
+        database_ids: &[Uuid],
+        actor_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Result<(), AuthError>;
+
+    /// Область видимости баз вызывающего: SuperAdmin → `All` (включая
+    /// будущие базы авторегистрации), остальные — `Only` явного набора.
+    /// Выполняется на каждый запрос — отзыв действует немедленно.
+    fn accessible_databases(&self, principal: &Principal) -> Result<DatabaseScope, AuthError>;
 
     /// Updates role/status, increments auth_epoch, and revokes all sessions atomically.
     fn update_user_access(

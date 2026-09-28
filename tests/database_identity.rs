@@ -9,6 +9,7 @@ mod common;
 
 use std::sync::Arc;
 
+use onec_masking_service::auth::DatabaseScope;
 use onec_masking_service::{
     domain::{DatabaseIdentity, DatabaseMode},
     AppState, SqliteStorage,
@@ -198,7 +199,7 @@ async fn admin_listing_reports_identity_source() {
 
     let state = AppState::new(storage.clone(), "https://masking.test");
     let data = SqliteHumanDataStore::new(storage.clone(), state.masking.clone());
-    let rows = data.list_databases().unwrap();
+    let rows = data.list_databases(&DatabaseScope::All).unwrap();
     let ras = rows.iter().find(|row| row.id == ras_id).unwrap();
     assert_eq!(ras.guid_source.as_deref(), Some("ras"));
     assert_eq!(ras.cluster_server.as_deref(), Some("onec-infra"));

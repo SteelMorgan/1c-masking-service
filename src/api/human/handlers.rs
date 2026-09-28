@@ -12,8 +12,8 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::auth::{
-    ActivationError, AuthError, AuthProvider, ChangePasswordError, IssuedSession, LoginError,
-    Principal, Role, UserStatus,
+    ActivationError, AuthError, AuthProvider, ChangePasswordError, DatabaseScope, IssuedSession,
+    LoginError, Principal, Role, UserStatus,
 };
 
 use super::{
@@ -49,6 +49,37 @@ pub struct ChangePasswordRequest {
 pub struct CreateUserRequest {
     login: String,
     role: Role,
+    /// Начальный набор доступа к базам (Admin/Viewer). У SuperAdmin
+    /// набора нет — непустой список отклоняется 409 SUPERADMIN_HAS_ALL.
+    #[serde(default)]
+    database_ids: Option<Vec<Uuid>>,
+}
+
+/// Тело PUT /admin/users/{id}/databases — полная замена набора доступа.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseAccessPatch {
+    database_ids: Vec<Uuid>,
+}
+
+/// JSON-форма набора баз в ответах session/users: `"all"` у SuperAdmin
+/// (набор не хранится и не ограничивается), иначе массив UUID.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DatabaseIds {
+    All(&'static str),
+    Ids(Vec<Uuid>),
+}
+
+fn session_database_ids(scope: &DatabaseScope) -> DatabaseIds {
+    match scope {
+        DatabaseScope::All => DatabaseIds::All("all"),
+        DatabaseScope::Only(ids) => {
+            let mut ids: Vec<Uuid> = ids.iter().copied().collect();
+            ids.sort();
+            DatabaseIds::Ids(ids)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +112,8 @@ pub struct MetadataQuery {
 struct SessionResponse {
     user_id: Uuid,
     role: Role,
+    /// Видимые базы: `"all"` или массив — UI скрывает недоступные.
+    database_ids: DatabaseIds,
     //++agent TASK-224 [24.09.2026]
     // login — для подписи меню профиля; csrf_token выдаётся и существующей
     // сессии (Б11) — клиент больше не держит его в web storage.
@@ -110,6 +143,8 @@ struct UserResponse {
     role: Role,
     status: UserStatus,
     activated: bool,
+    /// Выданные базы: `"all"` для SuperAdmin, иначе массив id.
+    database_ids: DatabaseIds,
     //++agent TASK-224 [24.09.2026] Б7
     invitation_expires_at: Option<DateTime<Utc>>,
     last_login_at: Option<DateTime<Utc>>,
@@ -171,9 +206,19 @@ fn session_response(state: &HumanState, issued: IssuedSession) -> Response {
         .flatten()
         .unwrap_or_default();
     //--agent TASK-224
+    let scope = state
+        .auth
+        .accessible_databases(&issued.principal)
+        // Fail-closed без молчания: пустой scope при сбое хранилища не должен
+        // выглядеть в диагностике как «баз не назначено».
+        .unwrap_or_else(|error| {
+            tracing::warn!(event = "scope_load_failed", error = %error);
+            DatabaseScope::Only(Default::default())
+        });
     let mut response = Json(SessionResponse {
         user_id: issued.principal.user_id,
         role: issued.principal.role,
+        database_ids: session_database_ids(&scope),
         login,
         csrf_token: issued.csrf_token,
     })
@@ -198,7 +243,7 @@ pub async fn logout(State(state): State<Arc<HumanState>>, headers: HeaderMap) ->
     let Some(token) = session_cookie(&headers) else {
         return ApiError::unauthorized().into_response();
     };
-    if authorize(&state, &headers, None, true).is_err() {
+    if authorize_global(&state, &headers, Need::Any, true).is_err() {
         return ApiError::unauthorized().into_response();
     }
     if state.sessions.revoke(token, Utc::now()).is_err() {
@@ -307,17 +352,18 @@ pub async fn current_session(State(state): State<Arc<HumanState>>, headers: Head
     let Some(token) = session_cookie(&headers) else {
         return ApiError::unauthorized().into_response();
     };
-    match authorize(&state, &headers, None, false) {
-        Ok(principal) => {
+    match authorize_global(&state, &headers, Need::Any, false) {
+        Ok(actor) => {
             let login = state
                 .auth
-                .display_login(principal.user_id)
+                .display_login(actor.principal.user_id)
                 .ok()
                 .flatten()
                 .unwrap_or_default();
             let mut response = Json(SessionResponse {
-                user_id: principal.user_id,
-                role: principal.role,
+                user_id: actor.principal.user_id,
+                role: actor.principal.role,
+                database_ids: session_database_ids(&actor.scope),
                 login,
                 csrf_token: state.sessions.csrf_for_session_token(token),
             })
@@ -340,10 +386,11 @@ pub async fn change_password(
     if !same_origin(&headers, &state.expected_origin) {
         return ApiError::forbidden().into_response();
     }
-    let principal = match authorize(&state, &headers, None, true) {
-        Ok(principal) => principal,
+    let actor = match authorize_global(&state, &headers, Need::Any, true) {
+        Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
+    let principal = actor.principal;
     let provider = state.auth.clone();
     let correlation_id = Uuid::new_v4();
     let changed = tokio::task::spawn_blocking(move || {
@@ -380,20 +427,22 @@ pub async fn change_password(
 }
 
 pub async fn databases(State(state): State<Arc<HumanState>>, headers: HeaderMap) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(Role::Viewer), false) {
-        return error.into_response();
-    }
-    match state.data.list_databases() {
+    let actor = match authorize_global(&state, &headers, Need::Viewer, false) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    match state.data.list_databases(&actor.scope) {
         Ok(value) => Json(value).into_response(),
         Err(error) => data_error(error).into_response(),
     }
 }
 
 pub async fn admin_databases(State(state): State<Arc<HumanState>>, headers: HeaderMap) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(Role::Admin), false) {
-        return error.into_response();
-    }
-    match state.data.list_databases() {
+    let actor = match authorize_global(&state, &headers, Need::Admin, false) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    match state.data.list_databases(&actor.scope) {
         Ok(value) => Json(value).into_response(),
         Err(error) => data_error(error).into_response(),
     }
@@ -404,7 +453,9 @@ pub async fn chats(
     headers: HeaderMap,
     Query(query): Query<DatabaseQuery>,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(Role::Viewer), false) {
+    if let Err(error) =
+        authorize_database(&state, &headers, Need::Viewer, false, query.database_id)
+    {
         return error.into_response();
     }
     match state.data.list_chats(query.database_id) {
@@ -418,7 +469,9 @@ pub async fn history(
     headers: HeaderMap,
     Query(query): Query<HistoryQuery>,
 ) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(Role::Viewer), false) {
+    if let Err(error) =
+        authorize_database(&state, &headers, Need::Viewer, false, query.database_id)
+    {
         return error.into_response();
     }
     let limit = query.limit.unwrap_or(50);
@@ -443,13 +496,13 @@ pub async fn reveal(
     if !same_origin(&headers, &state.expected_origin) {
         return ApiError::forbidden().into_response();
     }
-    let principal = match authorize(&state, &headers, Some(Role::Viewer), true) {
+    let actor = match authorize_global(&state, &headers, Need::Viewer, true) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
     //++agent TASK-224 [24.09.2026] итерация 3: reveal без audit-события
     // (автоматический при открытии записи) — correlation_id не нужен.
-    match state.data.reveal_history(&principal, id).await {
+    match state.data.reveal_history(&actor.principal, id).await {
         Ok(report) if report.is_safe() => {
             let mut response = Json(report).into_response();
             response
@@ -463,10 +516,11 @@ pub async fn reveal(
 }
 
 pub async fn users(State(state): State<Arc<HumanState>>, headers: HeaderMap) -> Response {
-    if let Err(error) = authorize(&state, &headers, Some(Role::Admin), false) {
-        return error.into_response();
-    }
-    match state.auth.list_users() {
+    let actor = match authorize_global(&state, &headers, Need::SuperAdmin, false) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    match state.auth.list_users(&actor.principal) {
         //++agent TASK-224 [24.09.2026] Б7: агрегаты приглашения и входа.
         Ok(users) => Json(
             users
@@ -477,6 +531,11 @@ pub async fn users(State(state): State<Arc<HumanState>>, headers: HeaderMap) -> 
                     role: entry.account.role,
                     status: entry.account.status,
                     activated: entry.account.password_hash.is_some(),
+                    database_ids: if entry.account.role == Role::SuperAdmin {
+                        DatabaseIds::All("all")
+                    } else {
+                        DatabaseIds::Ids(entry.database_ids)
+                    },
                     invitation_expires_at: entry.invitation_expires_at,
                     last_login_at: entry.last_login_at,
                 })
@@ -496,14 +555,17 @@ pub async fn create_user(
     if !same_origin(&headers, &state.expected_origin) {
         return ApiError::forbidden().into_response();
     }
-    let actor = match authorize(&state, &headers, Some(Role::Admin), true) {
+    let actor = match authorize_global(&state, &headers, Need::SuperAdmin, true) {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match state
-        .auth
-        .create_user(&actor, &request.login, request.role, Uuid::new_v4())
-    {
+    match state.auth.create_user(
+        &actor.principal,
+        &request.login,
+        request.role,
+        request.database_ids.as_deref().unwrap_or(&[]),
+        Uuid::new_v4(),
+    ) {
         //++agent TASK-224 [24.09.2026] Б4: ссылка собирается на сервере.
         Ok((user, activation_token)) => (
             StatusCode::CREATED,
@@ -518,6 +580,78 @@ pub async fn create_user(
         )
             .into_response(),
         //--agent TASK-224
+        Err(AuthError::SuperAdminScope) => ApiError::conflict_code(
+            "SUPERADMIN_HAS_ALL",
+            "У супер-администратора доступны все базы — набор не задаётся",
+        )
+        .into_response(),
+        Err(AuthError::UnknownDatabase) => {
+            ApiError::bad_request("database_ids содержит несуществующую базу").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
+        Err(_) => ApiError::conflict().into_response(),
+    }
+}
+
+/// GET /admin/users/{id}/databases — набор баз пользователя (SuperAdmin).
+pub async fn list_user_databases(
+    State(state): State<Arc<HumanState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_global(&state, &headers, Need::SuperAdmin, false) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    let target = match state.auth.find_user(id) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден")
+                .into_response()
+        }
+        Err(_) => return ApiError::unavailable().into_response(),
+    };
+    // Набор SuperAdmin не хранится — отвечаем «все базы».
+    if target.role == Role::SuperAdmin {
+        return Json(serde_json::json!({"database_ids": "all"})).into_response();
+    }
+    match state.auth.list_database_access(&actor.principal, id) {
+        Ok(ids) => Json(serde_json::json!({"database_ids": ids})).into_response(),
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(_) => ApiError::unavailable().into_response(),
+    }
+}
+
+/// PUT /admin/users/{id}/databases — полная замена набора (SuperAdmin).
+pub async fn set_user_databases(
+    State(state): State<Arc<HumanState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(patch): Json<DatabaseAccessPatch>,
+) -> Response {
+    let actor = match superadmin_mutation(&state, &headers) {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .auth
+        .set_database_access(&actor.principal, id, &patch.database_ids, Uuid::new_v4())
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(AuthError::SuperAdminScope) => ApiError::conflict_code(
+            "SUPERADMIN_HAS_ALL",
+            "У супер-администратора доступны все базы — набор не задаётся",
+        )
+        .into_response(),
+        Err(AuthError::UnknownDatabase) => {
+            ApiError::bad_request("database_ids содержит несуществующую базу").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
         Err(_) => ApiError::conflict().into_response(),
     }
 }
@@ -530,11 +664,11 @@ pub async fn reissue_invitation(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match superadmin_mutation(&state, &headers) {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match state.auth.reissue_invitation(&actor, id, Uuid::new_v4()) {
+    match state.auth.reissue_invitation(&actor.principal, id, Uuid::new_v4()) {
         Ok((user, token)) => (
             StatusCode::CREATED,
             Json(CreatedUserResponse {
@@ -556,6 +690,10 @@ pub async fn reissue_invitation(
         )
         .into_response(),
         //--agent TASK-224
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
         Err(_) => ApiError::conflict().into_response(),
     }
 }
@@ -567,11 +705,14 @@ pub async fn reset_user_password(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match superadmin_mutation(&state, &headers) {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match state.auth.reset_user_password(&actor, id, Uuid::new_v4()) {
+    match state
+        .auth
+        .reset_user_password(&actor.principal, id, Uuid::new_v4())
+    {
         Ok((user, token)) => (
             StatusCode::CREATED,
             Json(CreatedUserResponse {
@@ -589,6 +730,10 @@ pub async fn reset_user_password(
             "Пользователь отключён — сначала включите его и сохраните",
         )
         .into_response(),
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
         Err(_) => ApiError::conflict().into_response(),
     }
 }
@@ -599,12 +744,16 @@ pub async fn delete_user(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match superadmin_mutation(&state, &headers) {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match state.auth.delete_user(&actor, id, Uuid::new_v4()) {
+    match state.auth.delete_user(&actor.principal, id, Uuid::new_v4()) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
         Err(_) => ApiError::conflict().into_response(),
     }
 }
@@ -623,15 +772,23 @@ pub async fn update_user(
     if !same_origin(&headers, &state.expected_origin) {
         return ApiError::forbidden().into_response();
     }
-    let actor = match authorize(&state, &headers, Some(Role::Admin), true) {
+    // Назначение роли SuperAdmin тоже здесь — эндпоинт сам SuperAdmin-only.
+    let actor = match authorize_global(&state, &headers, Need::SuperAdmin, true) {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match state
-        .auth
-        .update_user_access(&actor, id, request.role, request.status, Uuid::new_v4())
-    {
+    match state.auth.update_user_access(
+        &actor.principal,
+        id,
+        request.role,
+        request.status,
+        Uuid::new_v4(),
+    ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AuthError::NotFound) => {
+            ApiError::not_found_code("USER_NOT_FOUND", "пользователь не найден").into_response()
+        }
+        Err(AuthError::Unavailable) => ApiError::unavailable().into_response(),
         Err(_) => ApiError::conflict().into_response(),
     }
 }
@@ -642,10 +799,7 @@ pub async fn update_database(
     headers: HeaderMap,
     Json(patch): Json<AdminDatabasePatch>,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let principal = match authorize(&state, &headers, Some(Role::Admin), true) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -654,7 +808,7 @@ pub async fn update_database(
     }
     match state
         .data
-        .update_database(&principal, id, patch, Uuid::new_v4())
+        .update_database(&actor.principal, id, patch, Uuid::new_v4())
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => data_error(error).into_response(),
@@ -666,14 +820,14 @@ pub async fn refresh_database(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if !same_origin(&headers, &state.expected_origin) {
-        return ApiError::forbidden().into_response();
-    }
-    let principal = match authorize(&state, &headers, Some(Role::Admin), true) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    match state.data.refresh_database(&principal, id, Uuid::new_v4()) {
+    match state
+        .data
+        .refresh_database(&actor.principal, id, Uuid::new_v4())
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(error) => data_error(error).into_response(),
     }
@@ -690,11 +844,17 @@ pub async fn delete_database(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    // Удаление записи базы необратимо и снимает весь контур доступа —
+    // только SuperAdmin (ограниченный Admin получает 403 по ступени).
+    let actor = match superadmin_mutation(&state, &headers) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-    match state.data.delete_database(&actor, id, Uuid::new_v4()).await {
+    match state
+        .data
+        .delete_database(&actor.principal, id, Uuid::new_v4())
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => data_error(error).into_response(),
     }
@@ -710,7 +870,7 @@ pub async fn database_metadata(
     headers: HeaderMap,
     Query(query): Query<MetadataQuery>,
 ) -> Response {
-    if let Err(e) = authorize(&state, &headers, Some(Role::Admin), false) {
+    if let Err(e) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return e.into_response();
     }
     let path = query.path.unwrap_or_default();
@@ -741,7 +901,7 @@ pub async fn tool_classifications(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = authorize(&state, &headers, Some(Role::Admin), false) {
+    if let Err(e) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return e.into_response();
     }
     match state.data.list_tool_classifications(id) {
@@ -756,13 +916,13 @@ pub async fn update_tool_classification(
     headers: HeaderMap,
     Json(patch): Json<ToolClassificationPatch>,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
     match state
         .data
-        .update_tool_classification(&actor, id, &tool, patch, Uuid::new_v4())
+        .update_tool_classification(&actor.principal, id, &tool, patch, Uuid::new_v4())
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => data_error(e).into_response(),
@@ -779,13 +939,13 @@ pub async fn delete_tool_classification(
     Path((id, tool)): Path<(Uuid, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
     match state
         .data
-        .delete_tool_classification(&actor, id, &tool, Uuid::new_v4())
+        .delete_tool_classification(&actor.principal, id, &tool, Uuid::new_v4())
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => data_error(e).into_response(),
@@ -797,7 +957,7 @@ pub async fn dictionary_configs(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = authorize(&state, &headers, Some(Role::Admin), false) {
+    if let Err(e) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return e.into_response();
     }
     match state.data.list_dictionary_configs(id) {
@@ -812,7 +972,7 @@ pub async fn put_dictionary_config(
     headers: HeaderMap,
     Json(mut config): Json<DictionaryConfig>,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
@@ -821,7 +981,7 @@ pub async fn put_dictionary_config(
     // ответ прежний по коду, плюс номер версии черновика (spec §4).
     match state
         .data
-        .put_dictionary_config(&actor, id, config, Uuid::new_v4())
+        .put_dictionary_config(&actor.principal, id, config, Uuid::new_v4())
     {
         Ok(draft_version) => Json(serde_json::json!({
             "draft_version": draft_version,
@@ -837,7 +997,7 @@ pub async fn policies(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = authorize(&state, &headers, Some(Role::Admin), false) {
+    if let Err(e) = authorize_database(&state, &headers, Need::Admin, false, id) {
         return e.into_response();
     }
     match state.data.list_policies(id) {
@@ -852,13 +1012,13 @@ pub async fn create_policy(
     headers: HeaderMap,
     Json(request): Json<CreatePolicyRequest>,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
     match state
         .data
-        .create_policy(&actor, id, request, Uuid::new_v4())
+        .create_policy(&actor.principal, id, request, Uuid::new_v4())
     {
         Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
         Err(e) => data_error(e).into_response(),
@@ -870,13 +1030,13 @@ pub async fn activate_policy(
     Path((id, policy_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match admin_mutation(&state, &headers) {
+    let actor = match admin_mutation_db(&state, &headers, id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
     match state
         .data
-        .activate_policy(&actor, id, policy_id, Uuid::new_v4())
+        .activate_policy(&actor.principal, id, policy_id, Uuid::new_v4())
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -884,22 +1044,44 @@ pub async fn activate_policy(
     }
 }
 
-pub(crate) fn admin_mutation(
-    state: &HumanState,
-    headers: &HeaderMap,
-) -> Result<Principal, ApiError> {
-    if !same_origin(headers, &state.expected_origin) {
-        return Err(ApiError::forbidden());
-    }
-    authorize(state, headers, Some(Role::Admin), true)
+/// Требуемая ступень доступа. Viewer — точное совпадение роли (просмотр
+/// осознанно не наследуется администраторами); Admin — Admin|SuperAdmin;
+/// SuperAdmin — точное совпадение; Any — любая живая сессия.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Need {
+    Any,
+    Viewer,
+    Admin,
+    SuperAdmin,
 }
 
-pub(crate) fn authorize(
+impl Need {
+    fn allows(&self, role: Role) -> bool {
+        match self {
+            Need::Any => true,
+            Need::Viewer => role == Role::Viewer,
+            Need::Admin => matches!(role, Role::Admin | Role::SuperAdmin),
+            Need::SuperAdmin => role == Role::SuperAdmin,
+        }
+    }
+}
+
+/// Проверенный вызывающий: principal сессии + область видимых баз,
+/// считанная на этом запросе (отзыв доступа действует немедленно).
+pub(crate) struct Actor {
+    pub(crate) principal: Principal,
+    pub(crate) scope: DatabaseScope,
+}
+
+/// Глобальная проверка: сессия → CSRF → ступень → scope. Порядок важен:
+/// 401 до CSRF не нужен (токена нет — валидировать нечего), scope грузится
+/// только для уже авторизованного вызывающего.
+pub(crate) fn authorize_global(
     state: &HumanState,
     headers: &HeaderMap,
-    required_role: Option<Role>,
+    need: Need,
     require_csrf: bool,
-) -> Result<Principal, ApiError> {
+) -> Result<Actor, ApiError> {
     let token = session_cookie(headers).ok_or_else(ApiError::unauthorized)?;
     let csrf = if require_csrf {
         Some(
@@ -915,10 +1097,61 @@ pub(crate) fn authorize(
         .sessions
         .validate(token, csrf, Utc::now())
         .map_err(|_| ApiError::unauthorized())?;
-    if required_role.is_some_and(|role| principal.role != role) {
+    if !need.allows(principal.role) {
         return Err(ApiError::forbidden());
     }
-    Ok(principal)
+    let scope = state
+        .auth
+        .accessible_databases(&principal)
+        .map_err(|error| {
+            tracing::warn!(event = "scope_load_failed", error = %error);
+            ApiError::unavailable()
+        })?;
+    Ok(Actor { principal, scope })
+}
+
+/// Привязка к базе: глобальные проверки, затем scope. Чужая база
+/// отвечает тем же 404 DATABASE_NOT_FOUND, что и несуществующая —
+/// существование базы не проверяется до scope и не раскрывается ответом.
+pub(crate) fn authorize_database(
+    state: &HumanState,
+    headers: &HeaderMap,
+    need: Need,
+    require_csrf: bool,
+    database_id: Uuid,
+) -> Result<Actor, ApiError> {
+    let actor = authorize_global(state, headers, need, require_csrf)?;
+    if !actor.scope.contains(database_id) {
+        return Err(ApiError::not_found_code(
+            "DATABASE_NOT_FOUND",
+            "база не найдена",
+        ));
+    }
+    Ok(actor)
+}
+
+/// Мутация над базой: same-origin + CSRF + ступень Admin + scope.
+pub(crate) fn admin_mutation_db(
+    state: &HumanState,
+    headers: &HeaderMap,
+    database_id: Uuid,
+) -> Result<Actor, ApiError> {
+    if !same_origin(headers, &state.expected_origin) {
+        return Err(ApiError::forbidden());
+    }
+    authorize_database(state, headers, Need::Admin, true, database_id)
+}
+
+/// Глобальная мутация уровня SuperAdmin (пользователи, доступы,
+/// удаление базы): same-origin + CSRF + точная ступень.
+pub(crate) fn superadmin_mutation(
+    state: &HumanState,
+    headers: &HeaderMap,
+) -> Result<Actor, ApiError> {
+    if !same_origin(headers, &state.expected_origin) {
+        return Err(ApiError::forbidden());
+    }
+    authorize_global(state, headers, Need::SuperAdmin, true)
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -1157,7 +1390,7 @@ fn session_principal(state: &HumanState, headers: &HeaderMap) -> Option<Principa
 fn role_home(role: Role) -> &'static str {
     match role {
         Role::Viewer => "/viewer",
-        Role::Admin => "/admin",
+        Role::Admin | Role::SuperAdmin => "/admin",
     }
 }
 
@@ -1184,10 +1417,12 @@ pub async fn viewer_page(State(state): State<Arc<HumanState>>, headers: HeaderMa
 
 pub async fn admin_page(State(state): State<Arc<HumanState>>, headers: HeaderMap) -> Response {
     match session_principal(&state, &headers) {
-        Some(principal) if principal.role == Role::Admin => static_response(
-            "text/html; charset=utf-8",
-            include_str!("../../../web/admin.html"),
-        ),
+        Some(principal) if matches!(principal.role, Role::Admin | Role::SuperAdmin) => {
+            static_response(
+                "text/html; charset=utf-8",
+                include_str!("../../../web/admin.html"),
+            )
+        }
         Some(principal) => Redirect::to(role_home(principal.role)).into_response(),
         None => Redirect::to("/").into_response(),
     }

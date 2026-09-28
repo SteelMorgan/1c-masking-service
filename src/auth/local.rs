@@ -119,10 +119,18 @@ impl LocalAuthProvider {
         actor: &Principal,
         display_login: &str,
         role: Role,
+        database_ids: &[Uuid],
         correlation_id: Uuid,
     ) -> Result<(UserAccount, String), AuthError> {
-        if actor.role != Role::Admin {
+        // Управление пользователями — только SuperAdmin: ограниченный
+        // Admin не должен ни создавать пользователей, ни назначать доступ.
+        if actor.role != Role::SuperAdmin {
             return Err(AuthError::Conflict);
+        }
+        if role == Role::SuperAdmin && !database_ids.is_empty() {
+            // Явный набор баз у SuperAdmin бессмысленен — доступ «все»
+            // неявный; принять его значило бы создать ложное ограничение.
+            return Err(AuthError::SuperAdminScope);
         }
         let normalized = normalize_login(display_login).ok_or(AuthError::Conflict)?;
         let token = random_token();
@@ -136,6 +144,7 @@ impl LocalAuthProvider {
             display_login,
             &normalized,
             role,
+            database_ids,
             capability,
             actor.user_id,
             correlation_id,
@@ -186,7 +195,11 @@ impl LocalAuthProvider {
                 //++agent TASK-224 [08.10.2026] UserDisabled здесь недостижим:
                 // pending-capability фильтрует status='active' — недостижимый
                 // вариант сводится к Invalid, не открывая нового пути.
-                AuthError::Conflict | AuthError::NotFound | AuthError::UserDisabled => {
+                AuthError::Conflict
+                | AuthError::NotFound
+                | AuthError::UserDisabled
+                | AuthError::SuperAdminScope
+                | AuthError::UnknownDatabase => {
                     ActivationError::Invalid
                 } //--agent TASK-224
             })
@@ -205,7 +218,7 @@ impl LocalAuthProvider {
         user_id: Uuid,
         correlation_id: Uuid,
     ) -> Result<(UserAccount, String), AuthError> {
-        if actor.role != Role::Admin {
+        if actor.role != Role::SuperAdmin {
             return Err(AuthError::Conflict);
         }
         let token = random_token();
@@ -229,7 +242,7 @@ impl LocalAuthProvider {
         user_id: Uuid,
         correlation_id: Uuid,
     ) -> Result<(UserAccount, String), AuthError> {
-        if actor.role != Role::Admin {
+        if actor.role != Role::SuperAdmin {
             return Err(AuthError::Conflict);
         }
         let token = random_token();
@@ -252,7 +265,7 @@ impl LocalAuthProvider {
         user_id: Uuid,
         correlation_id: Uuid,
     ) -> Result<(), AuthError> {
-        if actor.role != Role::Admin {
+        if actor.role != Role::SuperAdmin {
             return Err(AuthError::Conflict);
         }
         self.store
@@ -274,7 +287,12 @@ impl LocalAuthProvider {
     }
     //--agent TASK-224
 
-    pub fn list_users(&self) -> Result<Vec<UserListEntry>, AuthError> {
+    /// Список пользователей — только SuperAdmin (как и остальные
+    /// user-операции: проверка роли не остаётся на HTTP-слое одним).
+    pub fn list_users(&self, actor: &Principal) -> Result<Vec<UserListEntry>, AuthError> {
+        if actor.role != Role::SuperAdmin {
+            return Err(AuthError::Conflict);
+        }
         self.store.list_users()
     }
 
@@ -286,11 +304,54 @@ impl LocalAuthProvider {
         status: UserStatus,
         correlation_id: Uuid,
     ) -> Result<(), AuthError> {
-        if actor.role != Role::Admin {
+        if actor.role != Role::SuperAdmin {
             return Err(AuthError::Conflict);
         }
         self.store
             .update_user_access(user_id, role, status, actor.user_id, correlation_id)
+    }
+
+    /// Карточка пользователя по id — для доступа-эндпоинтов (GET набор
+    /// баз должен отличать «нет пользователя» от пустого набора).
+    pub fn find_user(&self, user_id: Uuid) -> Result<Option<UserAccount>, AuthError> {
+        self.store.find_user_by_id(user_id)
+    }
+
+    /// Набор явно выданных баз пользователя — только SuperAdmin.
+    pub fn list_database_access(
+        &self,
+        actor: &Principal,
+        user_id: Uuid,
+    ) -> Result<Vec<Uuid>, AuthError> {
+        if actor.role != Role::SuperAdmin {
+            return Err(AuthError::Conflict);
+        }
+        self.store.list_database_access(user_id)
+    }
+
+    /// Полная замена набора доступа — только SuperAdmin; audit
+    /// grant/revoke внутри store-транзакции.
+    pub fn set_database_access(
+        &self,
+        actor: &Principal,
+        user_id: Uuid,
+        database_ids: &[Uuid],
+        correlation_id: Uuid,
+    ) -> Result<(), AuthError> {
+        if actor.role != Role::SuperAdmin {
+            return Err(AuthError::Conflict);
+        }
+        self.store
+            .set_database_access(user_id, database_ids, actor.user_id, correlation_id)
+    }
+
+    /// Область видимости баз вызывающего — читается на каждый запрос,
+    /// чтобы отзыв доступа действовал без перелогина.
+    pub fn accessible_databases(
+        &self,
+        principal: &Principal,
+    ) -> Result<super::DatabaseScope, AuthError> {
+        self.store.accessible_databases(principal)
     }
 
     pub fn change_password(
@@ -341,9 +402,11 @@ impl LocalAuthProvider {
                 correlation_id,
             )
             .map_err(|error| match error {
-                AuthError::Conflict | AuthError::NotFound | AuthError::UserDisabled => {
-                    ChangePasswordError::Rejected
-                }
+                AuthError::Conflict
+                | AuthError::NotFound
+                | AuthError::UserDisabled
+                | AuthError::SuperAdminScope
+                | AuthError::UnknownDatabase => ChangePasswordError::Rejected,
                 AuthError::Unavailable => ChangePasswordError::Unavailable,
             })?;
         Ok(Principal {

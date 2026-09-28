@@ -108,6 +108,13 @@ function showError(node, error) {
 /*++agent TASK-224 [24.09.2026] итерация 2 — короткий GUID для fallback-имён баз. */
 const shortId = value => (value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : value);
 
+// RBAC: три роли без иерархии наследования —
+// Admin администрирует только назначенные базы, SuperAdmin — все базы и
+// пользователей. Просмотр истории остаётся точным Viewer.
+const isAdminLike = role => role === 'Admin' || role === 'SuperAdmin';
+const isSuper = role => role === 'SuperAdmin';
+const ROLE_LABEL = { SuperAdmin: 'Супер-администратор', Admin: 'Администратор баз', Viewer: 'Просмотр истории' };
+
 /* Кнопка «скопировать» с визуальным подтверждением; без clipboard API — noop. */
 const copyButton = (value, label) => {
   const btn = el('button', 'copy-link', label || 'скопировать ID');
@@ -282,7 +289,7 @@ async function startPage() {
   // Живая сессия → сразу в раздел (сервер тоже редиректит, это страховка).
   try {
     const session = await api('/api/v1/session');
-    location.assign(session.role === 'Admin' ? '/admin' : '/viewer');
+    location.assign(isAdminLike(session.role) ? '/admin' : '/viewer');
     return;
   } catch (_) { /* сессии нет — форма входа */ }
 
@@ -315,7 +322,7 @@ async function startPage() {
         body: JSON.stringify({ login: $('#loginName').value, password: $('#loginPassword').value }),
       });
       state.session = session;
-      location.assign(session.role === 'Admin' ? '/admin' : '/viewer');
+      location.assign(isAdminLike(session.role) ? '/admin' : '/viewer');
     } catch (error) {
       if (error.status === 429) {
         lockLogin();
@@ -398,7 +405,7 @@ async function activatePage() {
       });
       state.session = session;
       showScreen('s-done');
-      location.assign(session.role === 'Admin' ? '/admin' : '/viewer');
+      location.assign(isAdminLike(session.role) ? '/admin' : '/viewer');
     } catch (error) {
       $('#actSubmit').disabled = false;
       if (error.status === 429) {
@@ -1243,7 +1250,7 @@ async function viewerPage() {
       if (subj) card.append(el('div', 'mono small brk', subj));
       if (rs.kind === 'builtin') card.append(el('div', 'small muted', 'Нельзя отключить'));
       if (rs.link && rs.link.admin_path) {
-        const isAdmin = state.session && state.session.role === 'Admin';
+        const isAdmin = state.session && isAdminLike(state.session.role);
         const a = el('button', 'btn link small', isAdmin ? (rs.rule_id ? 'Открыть правило' : 'Открыть источник') : 'Скопировать ссылку для администратора');
         a.type = 'button';
         a.addEventListener('click', event => {
@@ -1295,7 +1302,6 @@ async function viewerPage() {
   $('#vExportBtn').addEventListener('click', () => {
     if (!viewer.database) return;
     $('#vExErr').hidden = true;
-    $('#vExTools').checked = false;
     $('#vExText').textContent = `Будет выгружена действующая версия настройки маскирования базы ${viewer.database.display_label || shortId(viewer.database.id)}.`;
     openOverlay('dlgVExport');
   });
@@ -1305,7 +1311,8 @@ async function viewerPage() {
     if (!db) return;
     const label = (db.display_label || db.id).replace(/[^\p{L}\p{N}_.-]+/gu, '_');
     try {
-      await downloadFile(`/api/v1/databases/${encodeURIComponent(db.id)}/setup/export?include_tools=${$('#vExTools').checked ? 1 : 0}`,
+      // include_tools для Viewer сервер отклоняет — параметр не передаём.
+      await downloadFile(`/api/v1/databases/${encodeURIComponent(db.id)}/setup/export`,
         `masking-setup-${label}-${new Date().toISOString().slice(0, 10)}.json`);
       closeOverlays();
     } catch (error) {
@@ -1343,7 +1350,19 @@ async function adminPage() {
   state.session = session;
   wireProfile(session);
 
-  $('#navUsers').addEventListener('click', () => switchSection('users'));
+  // RBAC: раздел «Пользователи» — только
+  // SuperAdmin; ограниченный Admin сразу получает «Базы» (switchSection
+  // здесь не вызываем — dbs ещё не инициализирован, переключаем классы).
+  const canManageUsers = isSuper(session.role);
+  $('#navUsers').hidden = !canManageUsers;
+  $('#s-users').hidden = !canManageUsers;
+  if (!canManageUsers) {
+    $('#navUsers').classList.remove('on');
+    $('#s-users').classList.remove('on');
+    $('#navDbs').classList.add('on');
+    $('#s-dbs').classList.add('on');
+  }
+  $('#navUsers').addEventListener('click', () => { if (canManageUsers) switchSection('users'); });
   $('#navDbs').addEventListener('click', () => switchSection('dbs'));
   function switchSection(name) {
     $('#navUsers').classList.toggle('on', name === 'users');
@@ -1395,14 +1414,20 @@ async function adminPage() {
     const body = $('#usersBody');
     body.replaceChildren();
     if (!users.length) {
-      body.insertRow().insertCell().outerHTML = '<td colspan="5" class="empty">Нет пользователей</td>';
+      body.insertRow().insertCell().outerHTML = '<td colspan="6" class="empty">Нет пользователей</td>';
       return;
     }
     for (const user of users) {
       const tr = body.insertRow();
       tr.className = 'click';
       tr.append(el('td', 'mono', user.login));
-      tr.append(el('td', '', user.role === 'Admin' ? 'Администратор' : 'Просмотр'));
+      // три роли + колонка выданных баз.
+      tr.append(el('td', '', ROLE_LABEL[user.role] || user.role));
+      const scopeCell = el('td', 'muted');
+      scopeCell.textContent = user.database_ids === 'all'
+        ? 'Все базы'
+        : `${(user.database_ids || []).length}`;
+      tr.append(scopeCell);
       const [cls, label] = userStatusTag(user);
       const statusCell = el('td');
       statusCell.append(el('span', `tag ${cls}`, label));
@@ -1477,10 +1502,20 @@ async function adminPage() {
     await reissueInvitation(known || { user_id: inviteContext.userId, login: inviteContext.login });
   });
 
-  $('#newUserBtn').addEventListener('click', () => {
+  // набор баз при создании — для SuperAdmin
+  // выбор отключён (у него «все базы» и хранимого набора нет).
+  const syncNewDbsState = () => {
+    const role = ($('#newForm').querySelector('input[name="newRole"]:checked') || {}).value;
+    $$('#newDbs input[type="checkbox"]').forEach(box => { box.disabled = role === 'SuperAdmin'; });
+  };
+  $$('#newForm input[name="newRole"]').forEach(r => r.addEventListener('change', syncNewDbsState));
+  $('#newUserBtn').addEventListener('click', async () => {
     $('#newErr').hidden = true;
     $('#newForm').reset();
     $('#newLoginHint').textContent = '';
+    await ensureDbCatalog().catch(error => showError($('#newErr'), error));
+    renderDbChecks($('#newDbs'), new Set());
+    syncNewDbsState();
     openOverlay('dlgNew');
   });
   $('#newCancel').addEventListener('click', closeOverlays);
@@ -1495,7 +1530,13 @@ async function adminPage() {
     try {
       const payload = await api('/api/v1/admin/users', {
         method: 'POST',
-        body: JSON.stringify({ login: $('#newLogin').value.trim(), role }),
+        // начальный набор баз — только у
+        // Admin/Viewer; у SuperAdmin пустой (иначе 409 SUPERADMIN_HAS_ALL).
+        body: JSON.stringify({
+          login: $('#newLogin').value.trim(),
+          role,
+          database_ids: role === 'SuperAdmin' ? [] : checkedDbIds($('#newDbs')),
+        }),
       });
       closeOverlays();
       showInvite(payload.login, payload, payload.user_id);
@@ -1511,8 +1552,14 @@ async function adminPage() {
   let cardUser = null;
   let cardRole = 'Viewer';
   let cardStatus = 'active';
+  // выданные базы карточки: 'all' у
+  // SuperAdmin (не хранится), иначе Set выбранных id + исходный снимок.
+  let cardDbs = new Set();
+  let cardDbsSaved = new Set();
 
-  const cardDirty = () => cardUser && (cardRole !== cardUser.role || cardStatus !== cardUser.status);
+  const setsEqual = (a, b) => a.size === b.size && [...a].every(v => b.has(v));
+  const cardDirty = () => cardUser && (cardRole !== cardUser.role || cardStatus !== cardUser.status
+    || (cardRole !== 'SuperAdmin' && cardUser.database_ids !== 'all' && !setsEqual(cardDbs, cardDbsSaved)));
   //++agent TASK-224 [08.10.2026] итерация 4: приглашение/сброс не должны
   // уходить от устаревшего состояния карточки — при несохранённых
   // изменениях или отключённом статусе действия блокируются с причиной
@@ -1532,13 +1579,25 @@ async function adminPage() {
   };
   //--agent TASK-224
 
-  const openUserCard = user => {
+  const openUserCard = async user => {
     cardUser = user;
     cardRole = user.role;
     cardStatus = user.status;
     $('#userErr').hidden = true;
     $('#userLogin').textContent = user.login;
     $$('#userRoleSeg button').forEach(b => b.classList.toggle('on', b.dataset.role === cardRole));
+    // блок доступа к базам: у SuperAdmin
+    // выбор отключён («все базы»), иначе чекбоксы по каталогу.
+    try {
+      await ensureDbCatalog();
+    } catch (error) {
+      showError($('#userErr'), error);
+    }
+    cardDbs = user.database_ids === 'all' ? new Set(dbs.list.map(d => d.id))
+      : new Set(user.database_ids || []);
+    cardDbsSaved = user.database_ids === 'all' ? 'all' : new Set(user.database_ids || []);
+    renderDbChecks($('#userDbs'), user.database_ids === 'all' ? 'all' : cardDbs);
+    syncUserDbsState();
     const [cls, label] = userStatusTag(user);
     const tag = $('#userStatusTag');
     tag.className = `tag ${cls}`;
@@ -1553,9 +1612,29 @@ async function adminPage() {
     openOverlay('dlgUser');
   };
 
+  // переключение роли ↔ доступность набора баз.
+  const syncUserDbsState = () => {
+    const isSuperRole = cardRole === 'SuperAdmin';
+    $('#userDbsHint').hidden = !isSuperRole;
+    $$('#userDbs input[type="checkbox"]').forEach(box => { box.disabled = isSuperRole; });
+  };
+  $('#userDbs').addEventListener('change', () => {
+    cardDbs = new Set(checkedDbIds($('#userDbs')));
+    refreshCardButtons();
+  });
   $$('#userRoleSeg button').forEach(btn => btn.addEventListener('click', () => {
+    // уход с SuperAdmin на явный набор:
+    // «все базы» молча не наследуются — старт с пустого, выдача только
+    // явным выбором (fail-closed); возврат на SuperAdmin показывает «все».
+    if (cardRole === 'SuperAdmin' && btn.dataset.role !== 'SuperAdmin' && cardDbsSaved === 'all') {
+      cardDbs = new Set();
+      renderDbChecks($('#userDbs'), cardDbs);
+    } else if (cardRole !== 'SuperAdmin' && btn.dataset.role === 'SuperAdmin' && cardDbsSaved === 'all') {
+      renderDbChecks($('#userDbs'), 'all');
+    }
     cardRole = btn.dataset.role;
     $$('#userRoleSeg button').forEach(b => b.classList.toggle('on', b === btn));
+    syncUserDbsState();
     refreshCardButtons();
   }));
   $('#userToggle').addEventListener('click', () => {
@@ -1572,13 +1651,23 @@ async function adminPage() {
           method: 'PATCH',
           body: JSON.stringify({ role: cardRole, status: cardStatus }),
         });
+        // набор баз — отдельной PUT-заменой;
+        // у SuperAdmin набора нет (PATCH роли уже снял хранимые строки).
+        if (cardRole !== 'SuperAdmin') {
+          await api(`/api/v1/admin/users/${encodeURIComponent(cardUser.user_id)}/databases`, {
+            method: 'PUT',
+            body: JSON.stringify({ database_ids: [...cardDbs] }),
+          });
+        }
         cardUser = null;
         closeOverlays();
         loadUsers();
       } catch (error) {
-        showError($('#userErr'), error.status === 409
-          ? { message: 'Нельзя отключить или понизить последнего активного администратора.' }
-          : error);
+        showError($('#userErr'), error.code === 'SUPERADMIN_HAS_ALL'
+          ? { message: 'У супер-администратора — все базы, набор не задаётся.' }
+          : error.status === 409
+            ? { message: 'Нельзя отключить или понизить последнего активного супер-администратора.' }
+            : error);
       }
     };
     if (cardStatus === 'disabled' && cardUser.status !== 'disabled') {
@@ -1643,7 +1732,11 @@ async function adminPage() {
     const list = $('#dbList');
     list.replaceChildren();
     if (!dbs.list.length) {
-      list.append(el('p', 'empty', 'Нет настроенных баз'));
+      // RBAC: у ограниченного Admin пустой
+      // список — это «нет доступа», а не «нет баз».
+      list.append(el('p', 'empty', isSuper(state.session && state.session.role)
+        ? 'Нет настроенных баз'
+        : 'Нет доступных баз — набор назначает супер-администратор'));
       return;
     }
     for (const db of dbs.list) {
@@ -1674,9 +1767,42 @@ async function adminPage() {
         renderDbHead(fresh, true); // TASK-224: не закрывать открытую правку имени
         renderRefreshState(fresh);
         renderRefreshProblem(fresh); // TASK-225
+      } else {
+        // RBAC: доступ отозван/база удалена —
+        // карточка и опрос останавливаются, а не бьют по чужому id.
+        dbs.current = null;
+        if (dbs.refreshTimer) { clearInterval(dbs.refreshTimer); dbs.refreshTimer = null; }
+        $('#dbCard').hidden = true;
       }
     }
   };
+
+  // RBAC: каталог баз для чекбоксов доступа
+  // в диалогах пользователей (раздел «Пользователи» — только SuperAdmin,
+  // поэтому /admin/databases отдаёт полный список).
+  const ensureDbCatalog = async () => {
+    if (!dbs.loaded) await loadDatabases();
+    return dbs.list;
+  };
+  const renderDbChecks = (container, selected) => {
+    container.replaceChildren();
+    if (!dbs.list.length) {
+      container.append(el('p', 'empty', 'Баз пока нет'));
+      return;
+    }
+    for (const db of dbs.list) {
+      const label = el('label', 'row');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.value = db.id;
+      box.checked = selected === 'all' || (selected && selected.has(db.id));
+      box.disabled = selected === 'all';
+      label.append(box, document.createTextNode(` ${db.display_label || db.id}`));
+      container.append(label);
+    }
+  };
+  const checkedDbIds = container =>
+    $$('input[type="checkbox"]:checked', container).map(box => box.value);
 
   //++agent TASK-224 [24.09.2026] шапка базы: display_label крупно; без имени —
   // короткий GUID + метка «без названия»; полный GUID мелко + копирование.
@@ -1732,8 +1858,8 @@ async function adminPage() {
 
   //++agent TASK-225 [27.09.2026 08:30:42] удаление базы (DELETE /admin/databases/{id}).
   // Необратимо и стирает всю настройку, поэтому подтверждение вводом имени, а не
-  // одним кликом; кнопка только у Admin (защита на сервере, здесь - не соблазнять).
-  $('#dbDelete').hidden = !(state.session && state.session.role === 'Admin');
+  // одним кликом; кнопка только у SuperAdmin (защита на сервере, здесь - не соблазнять).
+  $('#dbDelete').hidden = !(state.session && isSuper(state.session.role));
   const dbDel = { target: null, expect: '' };
   const dbDelMatch = () => $('#dbDelInput').value.trim() === dbDel.expect;
   const dbDelNotify = text => {
@@ -4879,7 +5005,11 @@ async function adminPage() {
     return { db: h.get('db'), tab: h.get('tab'), rule: h.get('rule'), source: h.get('source'), version: h.get('version') };
   };
   //++agent TASK-225
-  await loadUsers();
+  // RBAC: список пользователей грузится
+  // только у SuperAdmin (ограниченному Admin вернулось бы 403), а ему —
+  // сразу базы, потому что стартовой вкладкой стала «Базы».
+  if (canManageUsers) await loadUsers();
+  else await loadDatabases();
   //++agent TASK-225 [26.09.2026 02:50:00] глубокая ссылка из «Почему скрыто» (Viewer):
   // открыть базу, вкладку настройки и нужное правило/источник.
   // Ссылка из Viewer в уже открытой админке меняет только hash — перечитываем страницу.
@@ -4894,6 +5024,10 @@ async function adminPage() {
       selectDb(target);
       const tabBtn = $(`#dbTabs button[data-dt="${link.tab === 'tools' ? 'tools' : 'setup'}"]`);
       if (tabBtn) tabBtn.click();
+    } else {
+      // RBAC: id из ссылки не входит в
+      // выданный набор — сервер отвечает 404, список уже отфильтрован.
+      showError($('#dbsErr'), { message: 'База из ссылки не найдена или недоступна вашей учётной записи.' });
     }
   }
   //++agent TASK-225

@@ -6,7 +6,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::auth::{Principal, Role, UserStatus};
+use crate::auth::{DatabaseScope, Principal, Role, UserStatus};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DatabaseSummary {
@@ -384,7 +384,13 @@ pub enum HumanDataError {
 //++agent TASK-224 [24.09.2026] итерация 3: reveal не аудируется — раскрытие
 // автоматическое при открытии записи, audit-событие выродилось бы в шум.
 pub trait HumanDataStore: Send + Sync {
-    fn list_databases(&self) -> Result<Vec<DatabaseSummary>, HumanDataError>;
+    /// Список баз, отфильтрованный по scope вызывающего: `All` — все
+    /// записи, `Only` — только явно выданные (пустой набор → пустая
+    /// выдача, запрос к таблице не выполняется).
+    fn list_databases(
+        &self,
+        scope: &DatabaseScope,
+    ) -> Result<Vec<DatabaseSummary>, HumanDataError>;
     fn list_chats(&self, database_id: Uuid) -> Result<Vec<ChatSummary>, HumanDataError>;
     fn list_history(
         &self,
@@ -392,9 +398,12 @@ pub trait HumanDataStore: Send + Sync {
         chat_id: &str,
         limit: u8,
     ) -> Result<Vec<HistoryItem>, HumanDataError>;
+    /// `actor` живёт столько же, сколько future: scope-проверка внутри
+    /// реализации (до расшифровки) — обход через чужой history id
+    /// невозможен извне.
     fn reveal_history<'a>(
         &'a self,
-        actor: &Principal,
+        actor: &'a Principal,
         history_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<NeutralReport, HumanDataError>> + Send + 'a>>;
     fn update_database(

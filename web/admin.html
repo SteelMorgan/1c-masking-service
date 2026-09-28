@@ -11,7 +11,7 @@
   <header class="top">
     <div class="logo">М</div><span class="title">Администрирование</span>
     <nav class="nav">
-      <button class="on" id="navUsers" type="button">Пользователи</button>
+      <button class="on" id="navUsers" type="button" hidden>Пользователи</button>
       <button id="navDbs" type="button">Базы</button>
     </nav>
     <span class="sp"></span>
@@ -25,12 +25,13 @@
     </div>
   </header>
 
-  <section class="screen on" id="s-users"><div class="page">
+  <section class="screen on" id="s-users" hidden><div class="page">
     <div class="row spread mb14"><h2 class="m0">Пользователи</h2><button class="btn primary" id="newUserBtn" type="button">Новый пользователь</button></div>
     <div class="note err" id="usersErr" hidden role="alert"></div>
     <div class="card flush"><div class="tablewrap"><table>
-      <thead><tr><th>Логин</th><th>Роль</th><th>Состояние</th><th class="hide-sm">Последний вход</th><th></th></tr></thead>
-      <tbody id="usersBody"><tr><td colspan="5" class="empty">Загрузка…</td></tr></tbody>
+      <!-- колонка «Базы» — выданный доступ-->
+      <thead><tr><th>Логин</th><th>Роль</th><th>Базы</th><th>Состояние</th><th class="hide-sm">Последний вход</th><th></th></tr></thead>
+      <tbody id="usersBody"><tr><td colspan="6" class="empty">Загрузка…</td></tr></tbody>
     </table></div></div>
   </div></section>
 
@@ -383,7 +384,12 @@
       <div class="field"><label for="newLogin">Логин</label><input class="input mono" id="newLogin" required maxlength="128"><div class="hint" id="newLoginHint"></div></div>
       <div class="field"><label>Роль</label>
         <label class="row"><input type="radio" name="newRole" value="Viewer" checked> Просмотр истории — видит отчёты и может раскрывать значения</label>
-        <label class="row"><input type="radio" name="newRole" value="Admin"> Администратор — пользователи и настройки баз, без раскрытия</label></div>
+        <label class="row"><input type="radio" name="newRole" value="Admin"> Администратор — настройки назначенных баз, без раскрытия и без пользователей</label>
+        <label class="row"><input type="radio" name="newRole" value="SuperAdmin"> Супер-администратор — все базы и управление пользователями</label>
+      </div>
+      <!-- набор баз для Admin/Viewer-->
+      <div class="field" id="newDbsField"><label>Доступ к базам</label><div id="newDbs" class="dbchecks"><p class="empty">Загрузка…</p></div>
+        <div class="hint">У супер-администратора — все базы, выбор не требуется.</div></div>
       <div class="row"><button class="btn primary" type="submit">Создать и выдать приглашение</button><button class="btn" id="newCancel" type="button">Отмена</button></div>
     </form>
   </div></div>
@@ -401,7 +407,10 @@
   <div class="overlay" id="dlgUser"><div class="card dialog">
     <h2 class="mono" id="userLogin"></h2>
     <div class="note err" id="userErr" hidden role="alert"></div>
-    <div class="field"><label>Роль</label><div class="seg" id="userRoleSeg"><button type="button" data-role="Viewer">Просмотр истории</button><button type="button" data-role="Admin">Администратор</button></div></div>
+    <div class="field"><label>Роль</label><div class="seg" id="userRoleSeg"><button type="button" data-role="Viewer">Просмотр истории</button><button type="button" data-role="Admin">Администратор баз</button><button type="button" data-role="SuperAdmin">Супер-администратор</button></div></div>
+    <!-- назначенные базы пользователя-->
+    <div class="field" id="userDbsField"><label>Доступ к базам</label><div id="userDbs" class="dbchecks"></div>
+      <div class="hint" id="userDbsHint" hidden>У супер-администратора — все базы, выбор не применяется.</div></div>
     <div class="field"><label>Доступ</label><div class="row"><span class="tag" id="userStatusTag"></span><button class="btn sm danger" id="userToggle" type="button"></button></div></div>
     <!--++agent TASK-224 [08.10.2026] итерация 4: при несохранённом статусе
          или отключённом пользователе приглашение/сброс блокируются — причина

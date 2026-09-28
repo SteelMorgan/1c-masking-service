@@ -4,15 +4,33 @@
 `__Host-mask_session` имеет `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`.
 Изменяющие запросы требуют точный `Origin` и `X-CSRF-Token`.
 
+## Роли и область доступа
+
+Роль пользователя трёхступенчатая, наследования нет:
+
+- `SuperAdmin` — все базы неявно и управление пользователями; набор баз не
+  хранится и не снимается отзывом.
+- `Admin` — административные маршруты только для явно назначенных баз
+  (`user_database_access`); пользователями не управляет.
+- `Viewer` — просмотр истории и reveal только назначенных баз.
+
+Область (scope) читается из БД на каждый запрос — отзыв доступа действует
+со следующего запроса. Маршрут с `{id}` базы для `Admin`/`Viewer` без
+доступа отвечает тем же `404 DATABASE_NOT_FOUND`, что и несуществующая
+запись: доступность чужой базы нераскрываема. Управление пользователями и
+`DELETE /admin/databases/{id}` — точный `SuperAdmin` (ограниченный `Admin`
+получает `403`).
+
 ## Authentication
 
 - `POST /auth/login` — `{login,password}`; возвращает `{user_id,role,login,
-  csrf_token}` и session cookie.
+  csrf_token,database_ids}` и session cookie. `database_ids` — `"all"` у
+  `SuperAdmin`, иначе отсортированный массив UUID назначенных баз.
 - `POST /auth/logout` — отзывает server-side session.
-- `GET /api/v1/session` — возвращает `{user_id,role,login,csrf_token}` живой
-  сессии; CSRF привязан к session token, поэтому тот же токен приходит при
-  повторном запросе. Клиент держит его только в памяти вкладки — не в
-  `localStorage`/`sessionStorage`.
+- `GET /api/v1/session` — возвращает `{user_id,role,login,csrf_token,
+  database_ids}` живой сессии; CSRF привязан к session token, поэтому тот же
+  токен приходит при повторном запросе. Клиент держит его только в памяти
+  вкладки — не в `localStorage`/`sessionStorage`.
 - `GET /api/v1/status` — публичный `{bootstrap_required,version}`; показывает
   только факт незавершённого bootstrap первого Admin.
 - `POST /api/v1/session/password` — аутентифицированная смена собственного
@@ -36,7 +54,11 @@ HTTP bootstrap route отсутствует намеренно.
 
 ## Viewer (только роль `Viewer`)
 
-- `GET /api/v1/databases`
+Роль проверяется точным совпадением: `Admin`/`SuperAdmin` доступа к этим
+маршрутам не имеют. Все выдачи ограничены назначенными базами — чужой
+`database_id`/`history_id` отвечает `404`, как несуществующий.
+
+- `GET /api/v1/databases` — только назначенные базы
 - `GET /api/v1/chats?database_id=<uuid>`
 - `GET /api/v1/history?database_id=<uuid>&chat_id=<id>&limit=30..50`
 - `POST /api/v1/history/{history_id}/reveal`
@@ -63,13 +85,26 @@ audit-событие выродилось бы в «запись просмот�
 таблицы `history` и `call_contexts` очищаются полностью — после перезапуска
 reveal старых записей в принципе невозможен.
 
-## Admin (только роль `Admin`)
+## Admin (роли `Admin` и `SuperAdmin`)
 
-- users: `GET/POST /api/v1/admin/users`, `PATCH /api/v1/admin/users/{id}`,
+Каждый маршрут с `{id}` базы проверяет членство в назначенном наборе:
+`SuperAdmin` проходит всегда (`"all"`), `Admin` — только для выданных баз;
+чужая база — `404 DATABASE_NOT_FOUND`, неотличимый от отсутствия записи.
+
+- users (только `SuperAdmin`, для `Admin` — `403`):
+  `GET/POST /api/v1/admin/users`, `PATCH /api/v1/admin/users/{id}`,
   `DELETE /api/v1/admin/users/{id}`,
   `POST /api/v1/admin/users/{id}/invitation`,
-  `POST /api/v1/admin/users/{id}/password-reset`;
-- DB: `GET /api/v1/admin/databases` (каждая запись — `id`, `label`,
+  `POST /api/v1/admin/users/{id}/password-reset`,
+  `GET /api/v1/admin/users/{id}/databases`,
+  `PUT /api/v1/admin/users/{id}/databases` — полная замена набора
+  `{database_ids:[…]}` в одной транзакции с аудитом `access.grant`/
+  `access.revoke` на каждое изменение; цель `SuperAdmin` →
+  `409 SUPERADMIN_HAS_ALL`; несуществующий id базы в наборе → `400`,
+  несуществующий пользователь → `404 USER_NOT_FOUND`. `GET` отвечает
+  `{"database_ids":"all"|[…]}`.
+- DB: `GET /api/v1/admin/databases` (отфильтровано по области вызывающего;
+  каждая запись — `id`, `label`,
   `display_label`, `mode`, TTL, `refresh_stage`),
   `PATCH /api/v1/admin/databases/{id}` — `mode`, `mapping_ttl_seconds`,
   `history_ttl_seconds`, `display_label`. `display_label` — отображаемое имя
@@ -79,7 +114,8 @@ reveal старых записей в принципе невозможен.
   имени из identity-binding менеджера у сервиса нет.
 - refresh: `POST /api/v1/admin/databases/{id}/refresh` → `202`, ставит
   durable intent полного pull (метаданные + словарь).
-- delete: `DELETE /api/v1/admin/databases/{id}` → `204` — снимает запись
+- delete: `DELETE /api/v1/admin/databases/{id}` → `204` — только
+  `SuperAdmin`; снимает запись
   базы из реестра: в одной транзакции удаляются все строки по `database_id`
   (политики и правила, классификации инструментов, словарные конфиги,
   поколения кэша, refresh intents, импорты и журнал настройки, история и
@@ -202,14 +238,31 @@ retired поднимается лишь через `setup/rollback` + `setup/act
 `PUT tools/{tool}` с `class:"no-mask"` требует
 `confirm_bypass:true` (`400 BYPASS_NOT_CONFIRMED`).
 
-`POST /admin/users` и оба invitation-маршрута возвращают
+`POST /admin/users` принимает `{login, role, database_ids?}` —
+`role` ∈ `SuperAdmin|Admin|Viewer`; `database_ids` — начальный набор баз
+(по умолчанию `[]`), у `SuperAdmin` обязан быть пустым/отсутствовать —
+иначе `409 SUPERADMIN_HAS_ALL`; несуществующий id → `400`. Ответ и ответы
+обоих invitation-маршрутов:
 `{user_id,login,role,activation_token,activation_url,expires_in_seconds}`;
 `activation_url` собирается сервером из `MASKING_EXPECTED_ORIGIN`. Перевыпуск
 (`.../invitation`) и сброс пароля (`.../password-reset`) атомарно гасят прежние
 коды; сброс дополнительно отзывает сеансы и обнуляет пароль. `DELETE`
 допустим только для пользователя, который ни разу не входил — логин
 освобождается; иначе `409`. `GET /admin/users` дополнительно возвращает
-`activated`, `invitation_expires_at`, `last_login_at`.
+`activated`, `invitation_expires_at`, `last_login_at`, `database_ids`
+(`"all"` у `SuperAdmin`, иначе массив UUID).
+
+`PATCH /admin/users/{id}` принимает `{role,status}` со всеми тремя ролями.
+Инвариант последнего **функционального** `SuperAdmin` (активен и задан
+пароль): его понижение, отключение, удаление и сброс пароля
+(`POST .../password-reset` обнуляет пароль и гасит сеансы — цель перестаёт
+быть входоспособной) отклоняются `409` — сервис не может остаться без
+полного администратора. Ожидающий активации `SuperAdmin` в инварианте не
+учитывается: его понижение/удаление свободно, но и опорой он не является.
+Несуществующий `{id}` в пользовательских маршрутах → `404 USER_NOT_FOUND`.
+При переводе пользователя в `SuperAdmin` его хранимый набор
+баз снимается той же операцией; обратный перевод в `Admin`/`Viewer` начинает
+с пустого набора — дальше его задаёт `PUT .../databases`.
 
 Для отключённого пользователя (`status:"disabled"`) `.../invitation` и
 `.../password-reset` возвращают `409` с `error.code="USER_DISABLED"` —
